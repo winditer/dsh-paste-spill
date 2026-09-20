@@ -790,8 +790,9 @@ window.__ModuleLoader__.load({
         tag.dataset.plugin = "dsh-paste-spill";
         tag.dataset.pluginCss = "dsh-paste-spill";
         tag.textContent =
-          // Geometry mirrors the stock dock occupant (ui-conversation TodoPanel.module.css)
-          // so the fold card lines up with it instead of overflowing it.
+          // Geometry mirrors the stock QueueDock (the other shipped occupant of this
+          // same slot, ui-conversation QueueDock.module.css) so the card lines up
+          // with the row above the input bar instead of overflowing it.
           ".dshps-fold-card{box-sizing:border-box;" +
           "width:calc(100% - var(--dsh-composer-side-clearance) - var(--dsh-composer-side-clearance) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset));" +
           "max-width:calc(var(--dsh-composer-card-max-width) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset));" +

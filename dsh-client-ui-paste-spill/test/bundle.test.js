@@ -812,3 +812,69 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
   assert.match(text, /"bytes":6000/, "and reports the real pasted size");
   assert.equal(draftStore.getSnapshot().draft, body, "a fold never mutates the draft");
 });
+
+test("a blank session still gets a watcher, so the hero composer folds", () => {
+  const { apply } = loadBundle().exports;
+  // The reported failure happened in a BLANK session, where composer.dock never
+  // renders. Two things must hold there: the watcher must install even though the
+  // shell may not resolve on the first attempt, and the card must be registered on
+  // the variant-independent slot.
+  const slots = [];
+  let entry = null;
+  const draftStore = createDraftStore("");
+  let shellCalls = 0;
+  const hostStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = hostStub;
+  let rafPending = null;
+  const previousRaf = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = (fn) => { rafPending = fn; return 1; };
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: {
+        inject: (key, register) => { slots.push(key); register(); },
+        register: (e) => { entry = e; },
+      },
+      sessions: { list: { getSnapshot: () => ({ current: "session-blank" }), subscribe: () => () => {} } },
+      // Throws the first time (scope not mounted yet), then resolves — the real
+      // lazily-materialized-shell behaviour.
+      conversation: {
+        input: {
+          shell: () => {
+            shellCalls += 1;
+            if (shellCalls === 1) throw new Error("scope not mounted");
+            return { state: draftStore, setDraft: (text) => draftStore.setDraft(text) };
+          },
+        },
+      },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+    if (previousRaf === undefined) delete globalThis.requestAnimationFrame;
+    else globalThis.requestAnimationFrame = previousRaf;
+  }
+
+  assert.deepEqual(slots, ["conversation.input.dock"], "must register on the variant-independent slot");
+  assert.equal(entry.name, "conversation.input.dock");
+  assert.equal(shellCalls, 1, "the first attempt legitimately fails");
+  // The bounded retry schedule drives the second attempt, which succeeds.
+  assert.equal(typeof rafPending, "function", "an unresolved shell must be retried, not abandoned");
+  rafPending();
+  assert.equal(shellCalls, 2, "the retry must re-attempt shell resolution");
+  const body = "z".repeat(6000);
+  draftStore.setDraft(body);
+  // The proof that matters: the record reaches the store the dock card reads.
+  const face = entry.inject("session-blank");
+  const record = face.hooks.pasteFold.getSnapshot()["session-blank"];
+  assert.ok(record !== undefined, "the retried watcher must fold the paste");
+  assert.equal(record.bytes, 6000, "and measure it in UTF-8 bytes");
+  assert.equal(draftStore.getSnapshot().draft, body, "a fold leaves the draft intact");
+});
