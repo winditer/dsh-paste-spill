@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "input-dock-2";
+    const BUILD_REV = "in-composer-fold-1";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -62,12 +62,18 @@ window.__ModuleLoader__.load({
     const zh = {
       foldTitle: "已折叠大文本",
       foldMeta: "{bytes} 字节 · {lines} 行",
-      foldHint: "全文仍在输入框中，提交时按原样发送",
+      // Shown while collapsed, when the editor is clamped. Says what the reader
+      // is looking at, since the visible lines are a truncated view.
+      foldHint: "输入框已折叠显示，点击展开全文 · 提交时按原样发送",
+      // Shown after expanding: the clamp is gone, so the promise is just about
+      // what gets submitted.
+      foldHintExpanded: "已展开全文，再次点击可折叠 · 提交时按原样发送",
     };
     const en = {
       foldTitle: "Large text folded",
       foldMeta: "{bytes} bytes · {lines} lines",
-      foldHint: "The full text stays in the composer and is sent as-is",
+      foldHint: "Composer collapsed — click to expand · sent as-is",
+      foldHintExpanded: "Expanded — click again to collapse · sent as-is",
     };
 
     /** UTF-8 byte length — the one measurement all thresholds use. */
@@ -134,6 +140,66 @@ window.__ModuleLoader__.load({
      */
     function foldApplies(record) {
       return record !== undefined && record !== null;
+    }
+
+    /**
+     * Should this session's composer show the COLLAPSED (clamped) editor style?
+     *
+     * False while the user has expanded it. Folded text that has left the draft
+     * has already had its record cleared by the watcher, so a missing record
+     * means "nothing is folded here" and the composer renders untouched.
+     */
+    function foldCollapsed(record, expanded) {
+      return foldApplies(record) && expanded !== true;
+    }
+
+    /**
+     * DOM attribute carrying the collapsed state on the composer card. The card
+     * (not our own subtree) is the only element that can clamp the editor, because
+     * the scroll container we need to shrink is a stock sibling we must not wrap
+     * or restyle selectively by hand.
+     */
+    const FOLD_ATTR = "data-dshps-folded";
+
+    /**
+     * Height of the faded band at the bottom of a collapsed editor, in px. Must
+     * match the mask gradient stop in the stylesheet. Only the band is a toggle
+     * target: the visible lines above it keep normal caret behaviour, so a user can
+     * paste a huge document, collapse, and still click in to append "summarize
+     * this" without the composer springing open.
+     */
+    const FADE_PX = 30;
+
+    /**
+     * Clamped height of the editor while folded, in px — about three lines plus
+     * the container's own top padding. Chosen so the folded state still shows
+     * enough text to recognise what was pasted, which is the reason this is a
+     * clamp rather than the single-line chip Codex uses.
+     */
+    const FOLD_CLAMP_PX = 84;
+
+    /** The stock scroll container that the collapsed style clamps. */
+    const SCROLL_SELECTOR = "[data-input-scroll]";
+
+    /**
+     * Apply or remove the collapsed attribute on ONE session's composer card.
+     *
+     * `[data-composer-card]` is marked by the stock InputBar on the element
+     * wrapping the whole composer, and the overlay anchor this component renders
+     * into sits inside that same card, so the nearest ancestor is this session's
+     * card and never another session's. Scoping by `sessionId` is therefore
+     * automatic — the element is only ever reached from inside itself.
+     *
+     * Returns true when the card was found, so the caller can retry: the card can
+     * legitimately be absent for a commit or two when a session is switching.
+     */
+    function applyFoldToCard(anchor, collapsed) {
+      if (anchor === null || anchor === undefined) return false;
+      const card = typeof anchor.closest === "function" ? anchor.closest("[data-composer-card]") : null;
+      if (card === null) return false;
+      if (collapsed) card.setAttribute(FOLD_ATTR, "");
+      else card.removeAttribute(FOLD_ATTR);
+      return true;
     }
 
     /**
@@ -346,14 +412,21 @@ window.__ModuleLoader__.load({
      *
      * @returns "inline" | "fold" | "file".
      */
-    function reactToDraft({ previous, current, run, recorded, sessionId, conversation, shell, foldStore, index = 1, onUploadSettled }) {
+    function reactToDraft({ previous, current, run, recorded, sessionId, conversation, shell, foldStore, expandStore, index = 1, onUploadSettled }) {
       // The watcher is the single authority for the fold record's lifetime: it is
       // the only place that sees every draft revision, so it can clear the record
       // the moment the padded text is gone. The card deliberately does NOT rely on
       // reading the draft to notice this (see foldApplies), because its own draft
       // hook can be a permanently absent store.
       const staleRecord = sessionId !== undefined ? foldStore.getSnapshot()[sessionId] : undefined;
-      if (staleRecord !== undefined && !foldTextPresent(staleRecord, current)) foldStore.clear(sessionId);
+      if (staleRecord !== undefined && !foldTextPresent(staleRecord, current)) {
+        foldStore.clear(sessionId);
+        // Keep the two stores in lockstep. Without this, expanding one fold and
+        // then clearing the draft would leave the flag set, so the NEXT large paste
+        // in this session would appear already expanded — a state the user never
+        // asked for and cannot explain from what is on screen.
+        if (expandStore !== undefined && expandStore !== null) expandStore.clear(sessionId);
+      }
       const candidate = measurableText({ recorded, run, previous, current });
       if (candidate === null) {
         return "inline";
@@ -419,7 +492,7 @@ window.__ModuleLoader__.load({
      *
      * @returns an unsubscribe function.
      */
-    function watchDraft({ shell, foldStore, sessionId, conversation, nextIndex, onRestore, inbox }) {
+    function watchDraft({ shell, foldStore, expandStore, sessionId, conversation, nextIndex, onRestore, inbox }) {
       if (shell === undefined || shell === null || shell.state === undefined) return () => {};
       const store = shell.state;
       const initial = store.getSnapshot();
@@ -455,6 +528,7 @@ window.__ModuleLoader__.load({
           conversation,
           shell,
           foldStore,
+          expandStore,
           index: nextIndex(),
           onUploadSettled: (ok) => {
             if (ok !== true) return;
@@ -568,9 +642,14 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Dock card for the fold layer. It is a HINT, never a replacement: the full
-     * text stays in the editor and is submitted verbatim, which is what keeps
-     * slash-command and goal parsing identical to a plugin-free install.
+     * Card for the fold layer, rendered in the composer dock directly ABOVE the
+     * input box. It is a HINT, never a replacement: the full text stays in the
+     * editor and is submitted verbatim, which is what keeps slash-command and goal
+     * parsing identical to a plugin-free install.
+     *
+     * It is also the toggle for the collapsed editor style. Collapsing is a
+     * presentational state on the composer card (see FOLD_ATTR); the text itself
+     * is never touched, so expanding/collapsing cannot change what is submitted.
      *
      * `usePasteFold` arrives as a SELECTOR hook bound by the renderer
      * (`observableHook` -> useSyncExternalStoreWithSelector), so it must be called
@@ -578,10 +657,12 @@ window.__ModuleLoader__.load({
      * data source: the watcher clears the record when the folded text leaves the
      * draft, which is what hides the card.
      */
-    function PasteFoldCard({ sessionId, usePasteFold, t }) {
-      const record = usePasteFold((state) => (state === undefined || state === null ? undefined : state[sessionId]));
+    function PasteFoldCard({ sessionId, usePasteFold, useFoldExpanded, setFoldExpanded, t }) {
+      const record = readSessionSlice(usePasteFold, sessionId);
+      const expanded = readSessionSlice(useFoldExpanded, sessionId);
       if (!foldApplies(record)) return null;
       const label = t === undefined ? (key) => key : t;
+      const open = expanded === true;
       return React.createElement(
         "div",
         {
@@ -589,17 +670,121 @@ window.__ModuleLoader__.load({
           "data-paste-spill-fold": true,
         },
         React.createElement(
-          "div",
-          { className: "dshps-fold-row" },
+          "button",
+          {
+            type: "button",
+            className: "dshps-fold-row",
+            "data-paste-spill-toggle": open ? "expanded" : "collapsed",
+            "aria-expanded": open,
+            onClick: () => {
+              if (typeof setFoldExpanded === "function") setFoldExpanded(sessionId, !open);
+            },
+          },
           React.createElement("span", { className: "dshps-fold-title" }, label("foldTitle")),
           React.createElement(
             "span",
             { className: "dshps-fold-meta" },
             label("foldMeta", { bytes: record.bytes, lines: record.lines }),
           ),
+          React.createElement(
+            "span",
+            { className: "dshps-fold-chevron", "aria-hidden": true },
+            open ? "\u25BE" : "\u25B8",
+          ),
         ),
-        React.createElement("div", { className: "dshps-fold-hint" }, label("foldHint")),
+        React.createElement(
+          "div",
+          { className: "dshps-fold-hint" },
+          label(open ? "foldHintExpanded" : "foldHint"),
+        ),
       );
+    }
+
+    /**
+     * Read one session's slice out of a selector hook, tolerating an absent hook.
+     *
+     * A hook that is missing or not a function must NOT throw here: these
+     * components render inside the composer, so an exception would take down the
+     * user's ability to type at all — a far worse failure than a missing card. A
+     * missing expanded-store hook therefore degrades to "not expanded" (the folded
+     * view, which is the safe state), and a missing fold hook to "no record" (the
+     * composer renders untouched).
+     */
+    function readSessionSlice(hook, sessionId) {
+      if (typeof hook !== "function") return undefined;
+      const value = hook((state) => (state === undefined || state === null ? undefined : state[sessionId]));
+      return value === null ? undefined : value;
+    }
+
+    /**
+     * Zero-size marker rendered INSIDE the composer card.
+     *
+     * Registered on `conversation.input.overlay` (kind "list", scope "session"),
+     * which the stock InputBar renders inside `[data-composer-card]`, before the
+     * editor. That position is what makes this the honest fix for "collapse the
+     * input box": the marker reaches its own session's card with `closest()`,
+     * without querying the document (which would hit whichever composer happens
+     * to be first) and without modifying any stock file.
+     *
+     * It renders nothing: it only syncs one DOM attribute, which the stylesheet
+     * turns into the clamped, faded editor style.
+     */
+    function FoldMarker({ sessionId, usePasteFold, useFoldExpanded, setFoldExpanded }) {
+      const record = readSessionSlice(usePasteFold, sessionId);
+      const expanded = readSessionSlice(useFoldExpanded, sessionId);
+      const collapsed = foldCollapsed(record, expanded);
+      const anchorRef = React.useRef(null);
+      // useLayoutEffect, not useEffect: the attribute must be on the card in the
+      // same commit that reveals the fold, otherwise the first paint shows the
+      // full 40k paste and then snaps shut.
+      React.useLayoutEffect(() => {
+        applyFoldToCard(anchorRef.current, collapsed);
+      }, [collapsed]);
+
+      // Expand when the user clicks the faded band at the bottom of the clamped
+      // editor. Bound in the CAPTURE phase on the scroll container so the caret is
+      // never placed first (which would scroll the container and move the band out
+      // from under the pointer between mousedown and mouseup).
+      //
+      // Only the band toggles: a click anywhere in the visible lines falls through
+      // untouched. `preventDefault` is called only once the hit-test has already
+      // decided this is the band, so normal clicking is never affected.
+      React.useEffect(() => {
+        if (!collapsed) return undefined;
+        try {
+          const anchor = anchorRef.current;
+          const card = anchor === null ? null : anchor.closest("[data-composer-card]");
+          const scroll = card === null ? null : card.querySelector(SCROLL_SELECTOR);
+          if (scroll === null) return undefined;
+          const onMouseDown = (event) => {
+            const rect = scroll.getBoundingClientRect();
+            // The band is the bottom FADE_PX of the container, which at 84px
+            // clamped height is also where the mask has already faded to nothing.
+            if (event.clientY < rect.bottom - FADE_PX) return;
+            event.preventDefault();
+            if (typeof setFoldExpanded === "function") setFoldExpanded(sessionId, true);
+          };
+          scroll.addEventListener("mousedown", onMouseDown, true);
+          return () => scroll.removeEventListener("mousedown", onMouseDown, true);
+        } catch {
+          return undefined;
+        }
+      }, [collapsed, sessionId, setFoldExpanded]);
+      // Cleanup is separate so it also runs on unmount/teardown, when the session
+      // switches away: leaving the attribute behind would clamp the NEXT session's
+      // composer with nothing painted to explain it.
+      React.useEffect(
+        () => () => {
+          applyFoldToCard(anchorRef.current, false);
+        },
+        [],
+      );
+      return React.createElement("div", {
+        ref: anchorRef,
+        className: "dshps-fold-anchor",
+        "data-paste-spill-anchor": true,
+        "aria-hidden": true,
+      });
     }
 
     /**
@@ -607,6 +792,16 @@ window.__ModuleLoader__.load({
      */
     exports.apply = function apply(ctx) {
       const foldStore = createSessionStore();
+      // Separate store from the fold record on purpose: "is text folded here" and
+      // "has the user opened it up" have different lifetimes. Collapsing must not
+      // be resurrected when the watcher rewrites the record on a later keystroke,
+      // and clearing the fold must not leave a stale expanded flag behind.
+      const expandStore = createSessionStore();
+      const setFoldExpanded = (sessionId, next) => {
+        if (sessionId === undefined || sessionId === null) return;
+        if (next) expandStore.set(sessionId, true);
+        else expandStore.clear(sessionId);
+      };
       let counter = 0;
       const nextIndex = () => {
         counter += 1;
@@ -719,6 +914,7 @@ window.__ModuleLoader__.load({
           watchDraft({
             shell,
             foldStore,
+            expandStore,
             sessionId,
             conversation: ctx.conversation,
             nextIndex,
@@ -809,7 +1005,27 @@ window.__ModuleLoader__.load({
           ".dshps-fold-title{font-weight:500}" +
           ".dshps-fold-meta{color:var(--dsw-alias-label-tertiary)}" +
           ".dshps-fold-hint{margin-top:2px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}" +
-          ".dshps-fold-card + *{margin-top:0}"
+          ".dshps-fold-card + *{margin-top:0}" +
+          ".dshps-fold-row{width:100%;border:0;background:0 0;padding:0;font:inherit;text-align:left;" +
+          "color:inherit;cursor:pointer;align-items:center;display:flex;gap:10px}" +
+          ".dshps-fold-row:focus-visible{outline:2px solid var(--dsw-alias-label-tertiary);outline-offset:-2px}" +
+          ".dshps-fold-chevron{margin-left:auto;color:var(--dsw-alias-label-tertiary);font-size:11px}" +
+          // The anchor itself must occupy no space and never intercept a click; it
+          // exists only to locate the composer card from inside it.
+          ".dshps-fold-anchor{height:0;width:0;pointer-events:none}" +
+          // Collapsed editor: clamp the stock scroll container to ~3 lines and fade
+          // the cut edge into the card so it reads as "there is more below" rather
+          // than as a rendering bug. The 84px includes the container's own top
+          // padding, so the visible text is 3 lines.
+          "[data-composer-card][data-dshps-folded] [data-input-scroll]{" +
+          "max-height:" + FOLD_CLAMP_PX + "px;" +
+          "mask-image:linear-gradient(to bottom,#000 calc(100% - " + FADE_PX + "px),transparent);" +
+          "-webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - " + FADE_PX + "px),transparent)}" +
+          // The faded band is the expand target. Its cursor is set here so it reads
+          // as clickable; the hit-test itself is JS (see FoldMarker) because the
+          // band's offset depends on the accessory/attachment rows above the editor
+          // and cannot be expressed as a fixed distance from the card edge.
+          "[data-composer-card][data-dshps-folded] [data-input-scroll]{cursor:pointer}"
         document.head.appendChild(tag);
         return () => tag.remove();
       }, "dsh-paste-spill: styles");
@@ -841,10 +1057,39 @@ window.__ModuleLoader__.load({
               // a permanently absent store and hide the card even with a valid
               // record. The draft watcher, which demonstrably sees every revision,
               // clears the record instead.
-              hooks: { pasteFold: foldStore },
+              hooks: { pasteFold: foldStore, foldExpanded: expandStore },
+              setFoldExpanded,
             }),
           },
           PasteFoldCard,
+        ),
+      );
+
+      // The collapsing half. `conversation.input.overlay` is rendered INSIDE
+      // `[data-composer-card]`, above the editor, scoped to one session — exactly
+      // what "collapse the input box" needs and what the dock (a sibling above the
+      // whole card) cannot reach.
+      //
+      // Chosen after checking the alternatives: `input.attachments` is kind
+      // "single" and already owned by dsh-client-ui-attachment, so registering
+      // there would displace the stock attachment UI; and the editor is private to
+      // SessionInputShell, so a real in-editor chip would mean hand-editing
+      // another package's Lexical instance and rebuilding the submitted text
+      // (which is what breaks slash/goal parsing). A list-kind, session-scoped
+      // slot needs neither.
+      ctx.slots.inject("conversation.input.overlay", () =>
+        ctx.slots.register(
+          {
+            name: "conversation.input.overlay",
+            id: "paste-spill",
+            order: 0,
+            inject: (sessionId) => ({
+              sessionId,
+              hooks: { pasteFold: foldStore, foldExpanded: expandStore },
+              setFoldExpanded,
+            }),
+          },
+          FoldMarker,
         ),
       );
     };
@@ -859,6 +1104,10 @@ window.__ModuleLoader__.load({
       pasteFileName,
       foldTextPresent,
       foldApplies,
+      foldCollapsed,
+      readSessionSlice,
+      applyFoldToCard,
+      FOLD_ATTR,
       createSessionStore,
       insertedRun,
       measurableText,
@@ -869,6 +1118,7 @@ window.__ModuleLoader__.load({
       reactToDraft,
       watchDraft,
       PasteFoldCard,
+      FoldMarker,
     };
     return module.exports;
   },

@@ -24,6 +24,10 @@ function loadBundle() {
     memo: (component) => component,
     useState: () => [undefined, () => {}],
     useEffect: () => {},
+    // Real react has both; the marker uses useLayoutEffect so the collapsed style
+    // is applied in the SAME commit that reveals the fold, rather than one paint
+    // later (which would flash the full 40k paste before snapping shut).
+    useLayoutEffect: () => {},
     useMemo: (factory) => factory(),
     useRef: () => ({ current: null }),
     useSyncExternalStore: () => undefined,
@@ -647,7 +651,7 @@ test("the dock card renders from the fold record alone, without a draft hook", (
 
 test("the dock entry exposes store-shaped hooks, not plain functions", () => {
   const { apply } = loadBundle().exports;
-  const capture = { entry: null, component: null, effects: [] };
+  const capture = { entry: null, component: null, effects: [], dock: null, overlay: null };
   const stateStore = { getSnapshot: () => ({ draft: "hi" }), subscribe: () => () => {} };
   const documentStub = {
     addEventListener() {},
@@ -665,7 +669,12 @@ test("the dock entry exposes store-shaped hooks, not plain functions", () => {
       effect: (fn) => { capture.effects.push(fn); return () => {}; },
       slots: {
         inject: (_key, register) => register(),
-        register: (entry, component) => { capture.entry = entry; capture.component = component; },
+        register: (entry, component) => {
+          capture.entry = entry;
+          capture.component = component;
+          if (entry.name === "conversation.input.dock") capture.dock = { entry, component };
+          if (entry.name === "conversation.input.overlay") capture.overlay = { entry, component };
+        },
       },
       conversation: { input: { shell: () => ({ state: stateStore }) } },
     };
@@ -675,18 +684,57 @@ test("the dock entry exposes store-shaped hooks, not plain functions", () => {
     else globalThis.document = previousDocument;
   }
 
-  assert.equal(capture.entry.name, "conversation.input.dock");
-  assert.equal(capture.entry.id, "paste-spill");
-  assert.equal(typeof capture.component, "function");
+  assert.equal(capture.dock.entry.name, "conversation.input.dock");
+  assert.equal(capture.dock.entry.id, "paste-spill");
+  assert.equal(typeof capture.dock.component, "function");
 
-  const face = capture.entry.inject("sess-1");
+  const face = capture.dock.entry.inject("sess-1");
   // The renderer wraps every `hooks` value in useSyncExternalStore, so each one
   // MUST be a store. A plain function here silently never re-renders.
   for (const [name, source] of Object.entries(face.hooks)) {
     assert.equal(typeof source.subscribe, "function", `hook ${name} must expose subscribe`);
     assert.equal(typeof source.getSnapshot, "function", `hook ${name} must expose getSnapshot`);
   }
-  assert.deepEqual(Object.keys(face.hooks), ["pasteFold"]);
+  assert.deepEqual(Object.keys(face.hooks), ["pasteFold", "foldExpanded"]);
+});
+
+test("the collapse marker registers inside the composer card, not beside it", () => {
+  const { apply } = loadBundle().exports;
+  // The whole point of the collapsing half: `conversation.input.overlay` is
+  // rendered INSIDE [data-composer-card], which is the only way to reach the
+  // editor we must clamp, and it is session-scoped so the attribute lands on the
+  // right composer when two sessions are open.
+  const slots = new Map();
+  const documentStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null, querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = documentStub;
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: () => () => {},
+      slots: { inject: (_k, register) => register(), register: (e, c) => slots.set(e.name, { entry: e, component: c }) },
+      conversation: { input: { shell: () => undefined } },
+      sessions: { list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} } },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+  assert.deepEqual([...slots.keys()].sort(), ["conversation.input.dock", "conversation.input.overlay"]);
+  const overlay = slots.get("conversation.input.overlay");
+  assert.equal(overlay.entry.id, "paste-spill", "must not collide with the stock overlay occupants");
+  const face = overlay.entry.inject("sess-1");
+  assert.equal(typeof face.setFoldExpanded, "function", "the marker needs the toggle setter");
+  for (const [name, source] of Object.entries(face.hooks)) {
+    assert.equal(typeof source.subscribe, "function", `hook ${name} must expose subscribe`);
+    assert.equal(typeof source.getSnapshot, "function", `hook ${name} must expose getSnapshot`);
+  }
+  assert.deepEqual(Object.keys(face.hooks), ["pasteFold", "foldExpanded"]);
 });
 
 test("the pasted text leaving the draft clears the record, which hides the card", () => {
@@ -743,7 +791,7 @@ test("the dock inject never touches the session shell, so a missing binding cann
     else globalThis.document = previousDocument;
   }
   const face = entry.inject("sess-1");
-  assert.deepEqual(Object.keys(face.hooks), ["pasteFold"]);
+  assert.deepEqual(Object.keys(face.hooks), ["pasteFold", "foldExpanded"]);
   assert.equal(typeof face.hooks.pasteFold.getSnapshot, "function");
 });
 
@@ -775,7 +823,12 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
     effect: (fn) => { fn(); return () => {}; },
     slots: {
       inject: (_key, register) => register(),
-      register: (e, c) => { entry = e; component = c; },
+      register: (e, c) => {
+        // The plugin now registers twice (dock card + in-card collapse marker);
+        // this test is about the CARD, so pick the dock by name rather than
+        // whichever registration happened to land last.
+        if (e.name === "conversation.input.dock") { entry = e; component = c; }
+      },
     },
     sessions: { list: { getSnapshot: () => ({ current: "session-abc" }), subscribe: () => () => {} } },
     conversation: { input: { shell: () => shell } },
@@ -799,6 +852,7 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
   const tree = component({
     sessionId: "session-abc",
     usePasteFold: (select) => select(face.hooks.pasteFold.getSnapshot()),
+    useFoldExpanded: (select) => select(face.hooks.foldExpanded.getSnapshot()),
     t: (key, params) => `${key}:${JSON.stringify(params ?? {})}`,
   });
   assert.notEqual(tree, null, "the fold card must render for a 6000-byte paste");
@@ -844,7 +898,9 @@ test("a blank session still gets a watcher, so the hero composer folds", () => {
       effect: (fn) => { fn(); return () => {}; },
       slots: {
         inject: (key, register) => { slots.push(key); register(); },
-        register: (e) => { entry = e; },
+        register: (e) => {
+          if (e.name === "conversation.input.dock") entry = e;
+        },
       },
       sessions: { list: { getSnapshot: () => ({ current: "session-blank" }), subscribe: () => () => {} } },
       // Throws the first time (scope not mounted yet), then resolves — the real
@@ -866,7 +922,11 @@ test("a blank session still gets a watcher, so the hero composer folds", () => {
     else globalThis.requestAnimationFrame = previousRaf;
   }
 
-  assert.deepEqual(slots, ["conversation.input.dock"], "must register on the variant-independent slot");
+  assert.deepEqual(
+    slots.slice().sort(),
+    ["conversation.input.dock", "conversation.input.overlay"],
+    "the card goes on the variant-independent dock; the clamp marker inside the card",
+  );
   assert.equal(entry.name, "conversation.input.dock");
   assert.equal(shellCalls, 1, "the first attempt legitimately fails");
   // The bounded retry schedule drives the second attempt, which succeeds.
@@ -914,4 +974,59 @@ test("applying the plugin replaces a stale stylesheet from a previous build", ()
   }
   assert.equal(removed.length, 1, "the stale sheet must be removed");
   assert.equal(appended.length, 1, "and exactly one fresh sheet installed");
+});
+
+test("foldCollapsed: a fold collapses the composer until the user expands it", () => {
+  const { foldCollapsed } = loadBundle().exports.__internals;
+  const record = { bytes: 6000, lines: 5, sentinels: ["x"] };
+  assert.equal(foldCollapsed(record, undefined), true, "a fresh fold starts collapsed");
+  assert.equal(foldCollapsed(record, false), true);
+  assert.equal(foldCollapsed(record, true), false, "expanded means the editor is not clamped");
+  assert.equal(foldCollapsed(undefined, undefined), false, "nothing folded: composer untouched");
+  assert.equal(foldCollapsed(null, false), false);
+});
+
+test("applyFoldToCard stamps only the card it is anchored inside", () => {
+  const { applyFoldToCard, FOLD_ATTR } = loadBundle().exports.__internals;
+  // Two composers exist (two open sessions). The marker must reach the card it
+  // renders inside — never the first card in the document, which would clamp the
+  // wrong session's composer.
+  const mine = { attrs: new Set(), setAttribute(n) { this.attrs.add(n); }, removeAttribute(n) { this.attrs.delete(n); } };
+  const other = { attrs: new Set(), setAttribute(n) { this.attrs.add(n); }, removeAttribute(n) { this.attrs.delete(n); } };
+  const anchor = { closest: (sel) => (sel === "[data-composer-card]" ? mine : null) };
+  assert.equal(applyFoldToCard(anchor, true), true);
+  assert.ok(mine.attrs.has(FOLD_ATTR), "my card is clamped");
+  assert.equal(other.attrs.size, 0, "the other session's card is untouched");
+  assert.equal(applyFoldToCard(anchor, false), true);
+  assert.equal(mine.attrs.size, 0, "expanding releases the clamp");
+  // An unmounted/absent card must report failure so the caller can retry.
+  assert.equal(applyFoldToCard(null, true), false);
+  assert.equal(applyFoldToCard({ closest: () => null }, true), false);
+});
+
+test("the fold record and the expanded flag are cleared together", () => {
+  const { watchDraft, createSessionStore, createPasteInbox } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const expandStore = createSessionStore();
+  const draftStore = createDraftStore("");
+  const stop = watchDraft({
+    shell: { state: draftStore, setDraft: (text) => draftStore.setDraft(text) },
+    foldStore,
+    expandStore,
+    sessionId: "sess-1",
+    conversation: {},
+    nextIndex: () => 1,
+    inbox: createPasteInbox(),
+  });
+  const body = "y".repeat(6000);
+  draftStore.setDraft(body);
+  assert.equal(foldStore.getSnapshot()["sess-1"].bytes, 6000, "the paste folds");
+  // The user opens it up...
+  expandStore.set("sess-1", true);
+  // ...then selects-all and deletes: BOTH must clear, or the next paste in this
+  // session would appear already expanded.
+  draftStore.setDraft("");
+  assert.equal(foldStore.getSnapshot()["sess-1"], undefined, "the fold record clears");
+  assert.equal(expandStore.getSnapshot()["sess-1"], undefined, "and so does the expanded flag");
+  stop();
 });
