@@ -455,6 +455,35 @@ test("removePastedText refuses a whole-draft candidate that has a pre-existing p
   );
 });
 
+test("a 60k paste into an empty composer spills even with no observer", () => {
+  // The real reported case, replayed on the real fixture: a large paste into an
+  // empty composer must spill on the diff alone, with no clipboard observer
+  // involved at all. This is the path that matters most, because it is the one
+  // that works regardless of whether beforeinput/paste deliver.
+  const { reactToDraft, createSessionStore, insertedRun, measurableText } = loadBundle().exports.__internals;
+  const fixture = readFileSync(new URL("../../fixtures/paste-60k.json", import.meta.url), "utf8");
+  assert.ok(fixture.length > 60000, "fixture is a 60k document");
+  const previous = "";
+  const current = fixture;
+  const run = insertedRun(previous, current);
+  const candidate = measurableText({ recorded: null, run, previous, current });
+  const added = [];
+  const conversation = {
+    createDrafts(sessionId, files) { added.push(files[0].name); return [{ id: "draft-1", kind: "file" }]; },
+    releaseDraftAttachments() {},
+    releaseDraftAttachment() {},
+    fileUploads: { subscribe: () => () => {}, getSnapshot: () => ({ "draft-1": { status: "uploading" } }) },
+  };
+  const shell = { addAttachments: () => true };
+  const decision = reactToDraft({
+    previous, current, run, recorded: null,
+    sessionId: "sess-1", conversation, shell, foldStore: createSessionStore(),
+  });
+  assert.equal(decision, "file", "a 60k paste into an empty composer must become a file");
+  assert.equal(added.length, 1);
+  assert.match(added[0], /^pasted-text-/);
+});
+
 test("the paste inbox keeps only the newest paste and expires stale ones", () => {
   const { createPasteInbox } = loadBundle().exports.__internals;
   const inbox = createPasteInbox();
