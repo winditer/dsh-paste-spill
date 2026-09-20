@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "fold-one-store-1";
+    const BUILD_REV = "input-dock-1";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -793,25 +793,37 @@ window.__ModuleLoader__.load({
           // Geometry mirrors the stock dock occupant (ui-conversation TodoPanel.module.css)
           // so the fold card lines up with it instead of overflowing it.
           ".dshps-fold-card{box-sizing:border-box;" +
-          "width:calc(100% - var(--dsh-composer-side-clearance) - var(--dsh-composer-side-clearance) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset));" +
-          "max-width:calc(var(--dsh-composer-card-max-width) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset));" +
-          "margin:0 auto;padding:6px 12px;border:.5px solid var(--dsw-alias-border-l1);" +
-          "border-radius:12px;background:var(--dsw-specific-tip);color:var(--dsw-alias-label-primary);" +
-          "font-size:13px;line-height:20px;flex:none;overflow:hidden}" +
+          "width:calc(100% - var(--dsh-composer-side-clearance) - var(--dsh-composer-side-clearance) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset));" +
+          "max-width:calc(var(--dsh-composer-card-max-width) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset));" +
+          "margin:0 auto calc(0px - var(--dsh-composer-stack-gap) - 3px);padding:6px 12px;flex:none;" +
+          "border:.5px solid var(--dsw-alias-border-l1);border-radius:12px 12px 0 0;" +
+          "background:var(--dsw-specific-tip);color:var(--dsw-alias-label-primary);" +
+          "font-size:13px;line-height:20px;overflow:hidden}" +
           ".dshps-fold-row{display:flex;align-items:center;gap:10px}" +
           ".dshps-fold-title{font-weight:500}" +
           ".dshps-fold-meta{color:var(--dsw-alias-label-tertiary)}" +
-          ".dshps-fold-hint{margin-top:2px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}";
+          ".dshps-fold-hint{margin-top:2px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}" +
+          ".dshps-fold-card + *{margin-top:0}"
         document.head.appendChild(tag);
         return () => tag.remove();
       }, "dsh-paste-spill: styles");
 
-      ctx.slots.inject("conversation.composer.dock", () =>
+      // Registered on `conversation.input.dock`, NOT `conversation.composer.dock`.
+      //
+      // Verified in the shipped bundle: composer.dock is rendered only under
+      // `variant === "composer" && input !== void 0 && sessionId !== void 0`, and
+      // the variant is "hero" whenever `sessionId === void 0 || shellPhase ===
+      // "blank" && ...` — so in a BLANK session (exactly where a big paste is
+      // first tried) that slot never renders at all, and the card could not
+      // appear no matter what the store held. input.dock is rendered on
+      // `zone !== void 0`, independent of the variant, which is why the
+      // attachment chip and the stock todo/queue docks all show up there.
+      ctx.slots.inject("conversation.input.dock", () =>
         ctx.slots.register(
           {
-            name: "conversation.composer.dock",
+            name: "conversation.input.dock",
             id: "paste-spill",
-            order: 0,
+            order: 10,
             locale: NS,
             inject: (sessionId) => ({
               sessionId,

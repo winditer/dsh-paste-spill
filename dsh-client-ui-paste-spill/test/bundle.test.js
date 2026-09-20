@@ -674,7 +674,7 @@ test("the dock entry exposes store-shaped hooks, not plain functions", () => {
     else globalThis.document = previousDocument;
   }
 
-  assert.equal(capture.entry.name, "conversation.composer.dock");
+  assert.equal(capture.entry.name, "conversation.input.dock");
   assert.equal(capture.entry.id, "paste-spill");
   assert.equal(typeof capture.component, "function");
 
