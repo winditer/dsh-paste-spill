@@ -785,7 +785,12 @@ window.__ModuleLoader__.load({
 
       ctx.effect(() => {
         const selector = 'style[data-plugin-css="dsh-paste-spill"]';
-        if (document.querySelector(selector) !== null) return () => {};
+        // Replace rather than skip-if-present. A hot reload can re-apply this
+        // plugin while the previous build's stylesheet is still in the head, and
+        // returning early there would leave geometry from the OLD build in force
+        // for the new one — which is a silent, very confusing failure when the
+        // slot itself just changed.
+        for (const stale of document.querySelectorAll(selector)) stale.remove();
         const tag = document.createElement("style");
         tag.dataset.plugin = "dsh-paste-spill";
         tag.dataset.pluginCss = "dsh-paste-spill";

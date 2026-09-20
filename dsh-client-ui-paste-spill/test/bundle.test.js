@@ -653,6 +653,7 @@ test("the dock entry exposes store-shaped hooks, not plain functions", () => {
     addEventListener() {},
     removeEventListener() {},
     querySelector: () => null,
+    querySelectorAll: () => [],
     createElement: () => ({ dataset: {}, remove() {} }),
     head: { appendChild() {} },
   };
@@ -721,6 +722,7 @@ test("the dock inject never touches the session shell, so a missing binding cann
   const documentStub = {
     addEventListener() {}, removeEventListener() {},
     querySelector: () => null,
+    querySelectorAll: () => [],
     createElement: () => ({ dataset: {}, remove() {} }),
     head: { appendChild() {} },
   };
@@ -756,6 +758,7 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
   const hostStub = {
     addEventListener() {}, removeEventListener() {},
     querySelector: () => null,
+    querySelectorAll: () => [],
     createElement: () => ({ dataset: {}, remove() {} }),
     head: { appendChild() {} },
   };
@@ -826,6 +829,7 @@ test("a blank session still gets a watcher, so the hero composer folds", () => {
   const hostStub = {
     addEventListener() {}, removeEventListener() {},
     querySelector: () => null,
+    querySelectorAll: () => [],
     createElement: () => ({ dataset: {}, remove() {} }),
     head: { appendChild() {} },
   };
@@ -877,4 +881,37 @@ test("a blank session still gets a watcher, so the hero composer folds", () => {
   assert.ok(record !== undefined, "the retried watcher must fold the paste");
   assert.equal(record.bytes, 6000, "and measure it in UTF-8 bytes");
   assert.equal(draftStore.getSnapshot().draft, body, "a fold leaves the draft intact");
+});
+
+test("applying the plugin replaces a stale stylesheet from a previous build", () => {
+  const { apply } = loadBundle().exports;
+  // A hot reload re-applies apply() while the old build's <style> is still in the
+  // head. Geometry changed between builds, so keeping the old sheet would silently
+  // style the card with superseded rules.
+  const removed = [];
+  const stale = { removed: false, remove() { this.removed = true; removed.push(this); } };
+  const appended = [];
+  const hostStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    querySelectorAll: () => [stale],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild: (node) => appended.push(node) },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = hostStub;
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_k, register) => register(), register: () => {} },
+      sessions: { list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} } },
+      conversation: { input: { shell: () => undefined } },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+  assert.equal(removed.length, 1, "the stale sheet must be removed");
+  assert.equal(appended.length, 1, "and exactly one fresh sheet installed");
 });
