@@ -35,6 +35,27 @@ function loadBundle() {
   return { record, exports: record.factory(fakeRequire) };
 }
 
+/**
+ * A minimal stand-in for the shell's InputState store: same shape the renderer
+ * consumes (`getSnapshot`/`subscribe`) plus the `draftRev` counter the real
+ * `compose()` publishes, which watchDraft uses to skip no-op notifications.
+ */
+function createDraftStore(initial) {
+  let state = { draft: initial, draftRev: 0 };
+  const listeners = new Set();
+  return {
+    getSnapshot: () => state,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    setDraft(text) {
+      state = { draft: text, draftRev: state.draftRev + 1 };
+      for (const listener of [...listeners]) listener();
+    },
+  };
+}
+
 test("the bundle registers under the package name and exports a plugin", () => {
   const { record, exports } = loadBundle();
   assert.equal(record.id, "dsh-client-ui-paste-spill");
@@ -124,139 +145,266 @@ test("spillFile builds a plain-text File with the synthesized name", () => {
   assert.equal(file.size, 50000);
 });
 
-test("handlePasteEvent leaves small pastes alone", () => {
-  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
-  let prevented = false;
-  const outcome = handlePasteEvent({
-    text: "just a short note",
-    sessionId: "sess-1",
-    conversation: {},
-    shell: {},
-    foldStore: createSessionStore(),
-    preventDefault: () => { prevented = true; },
-  });
-  assert.equal(outcome, "inline");
-  assert.equal(prevented, false);
+test("insertedRun isolates the inserted text from a pure insertion", () => {
+  const { insertedRun } = loadBundle().exports.__internals;
+  assert.equal(insertedRun("", "abc"), "abc");
+  assert.equal(insertedRun("hello ", "hello world"), "world");
+  assert.equal(insertedRun("keep", "pre keep"), "pre ");
+  // A paste in the middle: the surrounding text is untouched, so prefix/suffix
+  // trimming recovers exactly the inserted run.
+  assert.equal(insertedRun("head tail", "head MIDDLE tail"), "MIDDLE ");
 });
 
-test("handlePasteEvent records fold state and does not prevent the default", () => {
-  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
+test("insertedRun reports no run for non-insertions", () => {
+  const { insertedRun } = loadBundle().exports.__internals;
+  assert.equal(insertedRun("same", "same"), null, "no change is not an insertion");
+  assert.equal(insertedRun("abc", ""), null, "a clear is not an insertion");
+  assert.equal(insertedRun("abc", undefined), null, "a missing draft is not an insertion");
+  assert.equal(insertedRun("a long draft", "a long"), null, "a deletion produces no run");
+});
+
+test("reactToDraft leaves small insertions alone", () => {
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
   const foldStore = createSessionStore();
-  let prevented = false;
-  const text = "x".repeat(5000);
-  const outcome = handlePasteEvent({
-    text,
+  const outcome = reactToDraft({
+    previous: "note: ",
+    current: "note: short",
+    run: "short",
     sessionId: "sess-1",
     conversation: {},
     shell: {},
     foldStore,
-    preventDefault: () => { prevented = true; },
   });
-  assert.equal(outcome, "fold");
-  assert.equal(prevented, false, "fold layer must never swallow the paste");
-  assert.deepEqual(foldStore.getSnapshot()["sess-1"], { bytes: 5000, lines: 1, text });
+  assert.equal(outcome, "inline");
+  assert.deepEqual(foldStore.getSnapshot(), {});
 });
 
-test("handlePasteEvent uploads a large paste and prevents the default", () => {
-  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
-  const calls = { drafts: [], added: [], released: [], uploadListeners: 0 };
+test("reactToDraft records fold state for a large insertion without uploading", () => {
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const run = "x".repeat(5000);
+  const outcome = reactToDraft({
+    previous: "",
+    current: run,
+    run,
+    sessionId: "sess-1",
+    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+    shell: {},
+    foldStore,
+  });
+  assert.equal(outcome, "fold");
+  assert.deepEqual(foldStore.getSnapshot()["sess-1"], { bytes: 5000, lines: 1, text: run });
+});
+
+test("reactToDraft uploads a spill-sized insertion", () => {
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
+  const calls = { drafts: [], added: [], uploadListeners: 0 };
   const conversation = {
     createDrafts(sessionId, files) {
       calls.drafts.push({ sessionId, name: files[0].name });
       return [{ id: "draft-1", kind: "file" }];
     },
-    releaseDraftAttachments(descriptors) {
-      calls.released.push(descriptors.map((d) => d.id));
-    },
+    releaseDraftAttachments() {},
     fileUploads: {
       subscribe() { calls.uploadListeners += 1; return () => {}; },
       getSnapshot() { return { "draft-1": { status: "uploading" } }; },
     },
   };
   const shell = { addAttachments(ids) { calls.added.push(ids); return true; } };
-  let prevented = false;
-  const outcome = handlePasteEvent({
-    text: "y".repeat(50000),
+  const run = "y".repeat(50000);
+  const outcome = reactToDraft({
+    previous: "",
+    current: run,
+    run,
     sessionId: "sess-1",
     conversation,
     shell,
     foldStore: createSessionStore(),
-    preventDefault: () => { prevented = true; },
   });
   assert.equal(outcome, "file");
-  assert.equal(prevented, true);
   assert.deepEqual(calls.drafts, [{ sessionId: "sess-1", name: "pasted-text-1.txt" }]);
   assert.deepEqual(calls.added, [["draft-1"]]);
   assert.equal(calls.uploadListeners, 1);
 });
 
-test("handlePasteEvent falls back to inline when the composer refuses the attachment", () => {
-  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
+test("reactToDraft falls back to inline when the composer refuses the attachment", () => {
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
   const calls = { released: [] };
   const conversation = {
     createDrafts() { return [{ id: "draft-1", kind: "file" }]; },
     releaseDraftAttachments(descriptors) { calls.released.push(descriptors.map((d) => d.id)); },
     fileUploads: { subscribe: () => () => {}, getSnapshot: () => ({}) },
   };
-  const shell = { addAttachments: () => false };
-  let prevented = false;
-  const outcome = handlePasteEvent({
-    text: "y".repeat(50000),
+  const run = "y".repeat(50000);
+  const outcome = reactToDraft({
+    previous: "",
+    current: run,
+    run,
     sessionId: "sess-1",
     conversation,
-    shell,
+    shell: { addAttachments: () => false },
     foldStore: createSessionStore(),
-    preventDefault: () => { prevented = true; },
   });
   assert.equal(outcome, "inline");
-  assert.equal(prevented, false, "a refused attachment must leave the text in the editor");
   assert.deepEqual(calls.released, [["draft-1"]]);
 });
 
-test("handlePasteEvent falls back to inline when the session has no shell", () => {
-  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
-  let prevented = false;
-  const outcome = handlePasteEvent({
-    text: "y".repeat(50000),
+test("reactToDraft falls back to inline when the session has no shell", () => {
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
+  const run = "y".repeat(50000);
+  const outcome = reactToDraft({
+    previous: "",
+    current: run,
+    run,
     sessionId: undefined,
     conversation: { createDrafts() { throw new Error("should not be called"); } },
     shell: undefined,
     foldStore: createSessionStore(),
-    preventDefault: () => { prevented = true; },
   });
   assert.equal(outcome, "inline");
-  assert.equal(prevented, false);
 });
 
-test("handlePasteEvent restores the text when the upload reports an error", () => {
-  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
-  let listener = null;
+test("reactToDraft drops the fold record when the draft is cleared", () => {
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  foldStore.set("sess-1", { bytes: 5000, lines: 1, text: "x".repeat(5000) });
+  const outcome = reactToDraft({
+    previous: "x".repeat(5000),
+    current: "",
+    run: null,
+    sessionId: "sess-1",
+    conversation: {},
+    shell: {},
+    foldStore,
+  });
+  assert.equal(outcome, "inline");
+  assert.deepEqual(foldStore.getSnapshot(), {}, "a cleared draft must remove the card");
+});
+
+test("watchDraft reacts to draft transitions and stops on unsubscribe", () => {
+  const { watchDraft, createSessionStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const draftStore = createDraftStore("");
+  const restores = [];
+  const shell = {
+    state: draftStore,
+    setDraft(text) { draftStore.setDraft(text); },
+  };
+  const stop = watchDraft({
+    shell,
+    foldStore,
+    sessionId: "sess-1",
+    ctx: {},
+    conversation: {},
+    nextIndex: () => 1,
+    onRestore: () => restores.push(true),
+  });
+  const run = "x".repeat(5000);
+  draftStore.setDraft(run);
+  assert.equal(foldStore.getSnapshot()["sess-1"].bytes, 5000, "the watcher must fold a large insertion");
+  stop();
+  draftStore.setDraft("y".repeat(5000));
+  assert.equal(foldStore.getSnapshot()["sess-1"].text, run, "after unsubscribe nothing more is recorded");
+  assert.deepEqual(restores, [], "a fold never restores the draft");
+});
+
+test("watchDraft removes the text only after the upload reports ready", async () => {
+  const { watchDraft, createSessionStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const draftStore = createDraftStore("keep me");
+  let ready = false;
   const conversation = {
     createDrafts() { return [{ id: "draft-1", kind: "file" }]; },
+    releaseDraftAttachment() {},
     releaseDraftAttachments() {},
     fileUploads: {
-      subscribe(fn) { listener = fn; return () => { listener = null; }; },
-      getSnapshot() { return { "draft-1": { status: "error", message: "boom" } }; },
+      subscribe(fn) { listeners.push(fn); return () => {}; },
+      getSnapshot: () => ({ "draft-1": { status: ready ? "ready" : "uploading" } }),
     },
   };
-  const restored = [];
-  const shell = {
-    addAttachments: () => true,
-    paste(text) { restored.push(text); },
-  };
-  const outcome = handlePasteEvent({
-    text: "z".repeat(50000),
+  const listeners = [];
+  const restores = [];
+  const stop = watchDraft({
+    shell: { state: draftStore, addAttachments: () => true, setDraft: (text) => draftStore.setDraft(text) },
+    foldStore,
     sessionId: "sess-1",
+    ctx: {},
     conversation,
-    shell,
-    foldStore: createSessionStore(),
-    preventDefault: () => {},
+    nextIndex: () => 1,
+    onRestore: () => restores.push(true),
   });
-  assert.equal(outcome, "file");
-  assert.equal(typeof listener, "function");
-  listener();
-  assert.equal(restored.length, 1);
-  assert.equal(restored[0], "z".repeat(50000));
+  draftStore.setDraft("keep me" + "y".repeat(50000));
+  assert.equal(
+    draftStore.getSnapshot().draft,
+    "keep me" + "y".repeat(50000),
+    "while uploading, the text must stay in the editor so a failure cannot lose it",
+  );
+  ready = true;
+  for (const fn of listeners) fn();
+  assert.equal(draftStore.getSnapshot().draft, "keep me", "ready must take the spilled text out");
+  assert.deepEqual(restores, [true]);
+  stop();
+});
+
+test("watchDraft keeps the text inline when the upload fails", async () => {
+  const { watchDraft, createSessionStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const draftStore = createDraftStore("");
+  const listeners = [];
+  const removed = [];
+  const conversation = {
+    createDrafts() { return [{ id: "draft-1", kind: "file" }]; },
+    releaseDraftAttachment(id) { removed.push(id); },
+    releaseDraftAttachments() {},
+    fileUploads: {
+      subscribe(fn) { listeners.push(fn); return () => {}; },
+      getSnapshot: () => ({ "draft-1": { status: "error", message: "boom" } }),
+    },
+  };
+  const restores = [];
+  const stop = watchDraft({
+    shell: {
+      state: draftStore,
+      addAttachments: () => true,
+      setDraft: (text) => draftStore.setDraft(text),
+      removeAttachment: () => true,
+    },
+    foldStore,
+    sessionId: "sess-1",
+    ctx: {},
+    conversation,
+    nextIndex: () => 1,
+    onRestore: () => restores.push(true),
+  });
+  const text = "z".repeat(50000);
+  draftStore.setDraft(text);
+  for (const fn of listeners) fn();
+  assert.equal(draftStore.getSnapshot().draft, text, "a failed upload must leave the text untouched");
+  assert.deepEqual(restores, [], "a failure never reports a restore");
+  assert.deepEqual(removed, ["draft-1"], "the failed chip is withdrawn");
+  stop();
+});
+
+test("a folded run is always a substring of the draft it was diffed from", () => {
+  // This invariant is what makes the fold card's visibility check exact: the run
+  // comes out of the draft itself, so keepFoldFor's `draft.includes(record.text)`
+  // holds by construction. The previous clipboard-event design compared the raw
+  // clipboard string against the editor's normalized projection text — two
+  // different sources that could legitimately disagree.
+  const { insertedRun, keepFoldFor } = loadBundle().exports.__internals;
+  const cases = [
+    ["", "x".repeat(5000)],
+    ["pasted earlier ", "pasted earlier " + "y".repeat(5000)],
+    ["head tail", "head " + "z".repeat(5000) + " tail"],
+  ];
+  for (const [before, after] of cases) {
+    const run = insertedRun(before, after);
+    assert.ok(run !== null, "each case is an insertion");
+    assert.ok(after.includes(run), "the run must be a substring of the resulting draft");
+    const record = { bytes: 5000, lines: 1, text: run };
+    assert.equal(keepFoldFor(record, after), true, "so the card stays visible");
+    assert.equal(keepFoldFor(record, before), false, "and hides once the text is gone");
+  }
 });
 
 test("the dock card renders nothing without a fold record", () => {

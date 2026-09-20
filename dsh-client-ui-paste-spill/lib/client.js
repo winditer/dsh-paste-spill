@@ -24,8 +24,8 @@ window.__ModuleLoader__.load({
     /** Filename prefix the host half recognizes. Keep in sync with dsh-paste-spill. */
     const PASTE_NAME_PREFIX = "pasted-text-";
     const NS = "dsh-paste-spill";
-    /** The composer's contenteditable surface — the only paste target we handle. */
-    const COMPOSER_SELECTOR = "[data-composer-input]";
+    /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
+    const BUILD_REV = "draft-watcher-1";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -39,6 +39,22 @@ window.__ModuleLoader__.load({
       } catch {
         /* diagnostics must never break the paste path */
       }
+    }
+
+    /**
+     * Record only transitions worth investigating.
+     *
+     * Deliberately NOT a per-keystroke diagnostic: Local Storage writes are
+     * synchronous and this runs inside the draft subscriber, so writing on every
+     * character would add real typing latency. Only fold/spill verdicts and
+     * spill-sized insertions are news; anything else is dropped. Once this code
+     * path is confirmed working the whole diagnostic layer can be deleted.
+     */
+    let transitionCount = 0;
+    function noteTransition(decision, runBytes) {
+      if (decision === "inline" && runBytes < SPILL_BYTES) return;
+      transitionCount += 1;
+      diag({ transitionCount, lastDecision: decision, lastRunBytes: runBytes, lastTransitionAt: Date.now() });
     }
 
     const zh = {
@@ -152,6 +168,143 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * Diff two consecutive drafts and return the pasted run, or null.
+     *
+     * Why a diff instead of a `paste` DOM listener: the editor is Lexical, whose
+     * PASTE_COMMAND runs inside its own state machine and is neither reachable
+     * from a document-level capture listener nor suppressible by
+     * `preventDefault()` there. Focus-dependent event delivery also made the
+     * listener miss pastes entirely (verified in-app: the listener was installed
+     * and the draft changed, yet no paste event ever arrived). Watching the draft
+     * store is focus-independent and cannot miss an insertion.
+     *
+     * The inserted run is located by trimming the common prefix and suffix of the
+     * two drafts. A paste is a pure insertion, so that is exactly the new text.
+     *
+     * @returns the inserted substring, or null when nothing was inserted.
+     */
+    function insertedRun(previous, current) {
+      if (typeof current !== "string" || current === "") return null;
+      const before = typeof previous === "string" ? previous : "";
+      if (before === current) return null;
+      let head = 0;
+      const maxHead = Math.min(before.length, current.length);
+      while (head < maxHead && before[head] === current[head]) head += 1;
+      let tail = 0;
+      const maxTail = Math.min(before.length - head, current.length - head);
+      while (tail < maxTail && before[before.length - 1 - tail] === current[current.length - 1 - tail]) tail += 1;
+      const run = current.slice(head, current.length - tail);
+      return run === "" ? null : run;
+    }
+
+    /**
+     * Decide what one draft transition means and perform it. This is the whole
+     * detection layer, kept pure enough to test without a DOM.
+     *
+     * @returns "inline" | "fold" | "file".
+     */
+    function reactToDraft({ previous, current, run, sessionId, conversation, shell, foldStore, index = 1, onUploadSettled }) {
+      if (run === null) {
+        // A deletion (or a rewrite) can drop the folded text; the card hides
+        // itself through keepFoldFor, so only bookkeeping is left.
+        if (sessionId !== undefined && current === "") foldStore.clear(sessionId);
+        return "inline";
+      }
+      const verdict = decidePaste(run);
+      if (verdict.action === "inline") return "inline";
+      if (verdict.action === "fold") {
+        if (sessionId !== undefined) {
+          foldStore.set(sessionId, { bytes: verdict.bytes, lines: countLines(run), text: run });
+        }
+        return "fold";
+      }
+      if (sessionId === undefined || conversation === undefined || conversation === null || shell === undefined || shell === null) {
+        return "inline";
+      }
+      let started;
+      try {
+        started = uploadPaste({
+          conversation,
+          sessionId,
+          shell,
+          text: run,
+          index,
+          onReady: () => {
+            if (onUploadSettled !== undefined) onUploadSettled(true);
+          },
+          onFailure: () => {
+            if (onUploadSettled !== undefined) onUploadSettled(false);
+          },
+        });
+      } catch {
+        return "inline";
+      }
+      return started === false ? "inline" : "file";
+    }
+
+    /**
+     * Subscribe to one session's draft store and react to every transition.
+     *
+     * The spill layer's contract is "the text becomes a file". By the time we
+     * observe the insertion Lexical has already put the text in the editor, so a
+     * spill must take it back out again — but ONLY once the upload reports
+     * `ready`. Removing it up front and restoring on error would lose the text
+     * outright if the upload failed, so the editor keeps it for the brief
+     * uploading window and a failure then needs no recovery at all.
+     *
+     * @returns an unsubscribe function.
+     */
+    function watchDraft({ shell, foldStore, sessionId, ctx, conversation, nextIndex, onRestore }) {
+      if (shell === undefined || shell === null || shell.state === undefined) return () => {};
+      const store = shell.state;
+      const initial = store.getSnapshot();
+      let previous = typeof initial?.draft === "string" ? initial.draft : "";
+      let lastRev = initial?.draftRev;
+      // Set while we write to the draft ourselves, so our own publish does not
+      // re-enter this subscriber as if the user had typed.
+      let restoring = false;
+      return store.subscribe(() => {
+        if (restoring) return;
+        const snapshot = store.getSnapshot();
+        if (snapshot === undefined || snapshot === null) return;
+        const current = typeof snapshot.draft === "string" ? snapshot.draft : "";
+        if (snapshot.draftRev !== undefined && snapshot.draftRev === lastRev) return;
+        lastRev = snapshot.draftRev;
+        const beforePaste = previous;
+        const run = insertedRun(beforePaste, current);
+        const decision = reactToDraft({
+          previous: beforePaste,
+          current,
+          run,
+          sessionId,
+          conversation,
+          shell,
+          foldStore,
+          index: nextIndex(),
+          onUploadSettled: (ok) => {
+            if (ok !== true) return;
+            try {
+              restoring = true;
+              previous = beforePaste;
+              shell.setDraft(beforePaste);
+              // Our own write publishes a new revision; absorb it so the next
+              // callback does not mistake it for a user edit.
+              lastRev = store.getSnapshot()?.draftRev;
+              if (onRestore !== undefined) onRestore();
+            } catch {
+              /* the attachment chip is already in place, so a failed cleanup
+                 only leaves the text inline as well, which is harmless */
+            } finally {
+              restoring = false;
+            }
+          },
+        });
+        previous = current;
+        noteTransition(decision, run === null ? 0 : utf8Bytes(run));
+      });
+    }
+
     /** Synthesize the File a spill paste becomes. */
     function spillFile(text, index) {
       return new File([text], pasteFileName(text, index), { type: "text/plain" });
@@ -159,14 +312,17 @@ window.__ModuleLoader__.load({
 
     /**
      * Start an upload for one synthesized paste file and watch it settle.
-     * A file that never reaches `ready` leaves the submission stuck, so an
-     * `error` restores the original text into the composer rather than losing it.
+     *
+     * Failure handling is deliberately asymmetric: the text is still in the editor
+     * throughout, so on `error` the synthesized chip is simply withdrawn and the
+     * inline text remains as a complete fallback (nothing to restore). Only
+     * `ready` reports success, which is what lets the caller remove the text.
      *
      * @returns true when the attachment was admitted, false when the composer
      *   refused it (busy submit plane), in which case the caller keeps the text
      *   inline.
      */
-    function uploadPaste({ conversation, sessionId, shell, text, index, onFailure }) {
+    function uploadPaste({ conversation, sessionId, shell, text, index, onReady, onFailure }) {
       const file = spillFile(text, index);
       const drafts = conversation.createDrafts(sessionId, [file]);
       if (shell.addAttachments(drafts.map((draft) => draft.id)) === false) {
@@ -183,117 +339,25 @@ window.__ModuleLoader__.load({
           if (status.status === "error") {
             settled = true;
             stop();
-            onFailure();
+            diag({ uploadFailed: draft.id });
+            try {
+              if (shell.removeAttachment(draft.id) !== false) conversation.releaseDraftAttachment(draft.id);
+            } catch {
+              /* the failed chip stays visible; the text is still inline too */
+            }
+            if (onFailure !== undefined) onFailure();
             return;
           }
           if (status.status === "ready") {
             settled = true;
             stop();
+            diag({ uploadReady: draft.id });
+            if (onReady !== undefined) onReady();
             return;
           }
         }
       });
       return true;
-    }
-
-    /**
-     * Testable core of the paste handler, with the DOM plumbing kept outside.
-     * @returns "inline" | "fold" | "file" — what the handler decided to do.
-     */
-    function handlePasteEvent({ text, sessionId, conversation, shell, foldStore, preventDefault, index = 1 }) {
-      const verdict = decidePaste(text);
-      if (verdict.action === "inline") return "inline";
-      if (verdict.action === "fold") {
-        if (sessionId !== undefined) {
-          foldStore.set(sessionId, { bytes: verdict.bytes, lines: countLines(text), text });
-        }
-        return "fold";
-      }
-      if (sessionId === undefined || conversation === undefined || conversation === null || shell === undefined || shell === null) {
-        return "inline";
-      }
-      let started;
-      try {
-        started = uploadPaste({
-          conversation,
-          sessionId,
-          shell,
-          text,
-          index,
-          onFailure: () => {
-            try {
-              shell.paste(text);
-            } catch {
-              /* restoring is best-effort; the failed attachment chip stays visible */
-            }
-          },
-        });
-      } catch {
-        return "inline";
-      }
-      if (started === false) return "inline";
-      preventDefault();
-      return "file";
-    }
-
-    /**
-     * The DOM-facing paste handler. Capture phase so it runs before the editor's
-     * PASTE_COMMAND and can suppress the default insertion.
-     */
-    function onDocumentPaste(event, ctx, foldStore, nextIndex) {
-      diag({ sawPasteEvent: true, lastPasteAt: Date.now(), defaultPreventedOnEntry: event.defaultPrevented === true });
-      if (event.defaultPrevented) {
-        diag({ bailed: "defaultPrevented-on-entry" });
-        return;
-      }
-      const target = event.target;
-      if (typeof Element !== "undefined" && target instanceof Element) {
-        if (target.closest(COMPOSER_SELECTOR) === null) {
-          diag({ bailed: "not-composer", targetTag: target.tagName });
-          return;
-        }
-      } else {
-        diag({ bailed: "target-not-element" });
-        return;
-      }
-      const clipboard = event.clipboardData;
-      if (clipboard === null || clipboard === undefined) {
-        diag({ bailed: "no-clipboardData" });
-        return;
-      }
-      // A real file on the clipboard is stock's business, not ours.
-      const items = [];
-      for (let i = 0; i < clipboard.items.length; i += 1) items.push(clipboard.items[i]);
-      if (items.some((item) => item.kind === "file")) {
-        diag({ bailed: "clipboard-has-file-item", kinds: items.map((i) => i.kind).join(",") });
-        return;
-      }
-      const text = clipboard.getData("text/plain");
-      if (typeof text !== "string" || text === "") {
-        diag({ bailed: "no-text-plain", textLen: typeof text === "string" ? text.length : -1 });
-        return;
-      }
-      const sessionId = ctx.sessions.list.getSnapshot().current;
-      diag({ textBytes: utf8Bytes(text), sessionIdIsUndefined: sessionId === undefined, sessionIdType: typeof sessionId });
-      let shell;
-      if (sessionId !== undefined) {
-        try {
-          shell = ctx.conversation.input.shell(sessionId);
-        } catch (error) {
-          shell = undefined;
-          diag({ shellThrew: String(error && error.message) });
-        }
-      }
-      const verdict = handlePasteEvent({
-        text,
-        sessionId,
-        conversation: ctx.conversation,
-        shell,
-        foldStore,
-        index: nextIndex(),
-        preventDefault: () => event.preventDefault(),
-      });
-      diag({ verdict, shellResolved: shell !== undefined && shell !== null, storeKeys: Object.keys(foldStore.getSnapshot()) });
     }
 
     /**
@@ -308,15 +372,6 @@ window.__ModuleLoader__.load({
     function PasteFoldCard({ sessionId, usePasteFold, useDraft, t }) {
       const record = usePasteFold((state) => (state === undefined || state === null ? undefined : state[sessionId]));
       const draft = useDraft((state) => (state === undefined || state === null ? undefined : state.draft));
-      diag({
-        cardRendered: true,
-        cardSessionId: sessionId === undefined ? null : String(sessionId),
-        cardHasRecord: record !== undefined && record !== null,
-        cardDraftType: typeof draft,
-        cardDraftLen: typeof draft === "string" ? draft.length : -1,
-        cardKept: keepFoldFor(record, draft),
-        cardRecordTextLen: record && typeof record.text === "string" ? record.text.length : -1,
-      });
       if (!keepFoldFor(record, draft)) return null;
       const label = t === undefined ? (key) => key : t;
       return React.createElement(
@@ -349,26 +404,110 @@ window.__ModuleLoader__.load({
         counter += 1;
         return counter;
       };
-      diag({
-        applyRanAt: Date.now(),
-        hasSlots: ctx.slots !== undefined,
-        hasConversation: ctx.conversation !== undefined,
-        hasConversationInput: ctx.conversation !== undefined && ctx.conversation.input !== undefined,
-        hasSessions: ctx.sessions !== undefined,
-      });
+      // Boot marker: proves the running renderer holds THIS build, which is what
+      // made "the plugin was never loaded" distinguishable from "it loaded and
+      // silently did nothing". Cheap, once per page load.
+      diag({ build: BUILD_REV, applyRanAt: Date.now() });
 
       if (ctx.locale !== undefined) {
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-paste-spill: dictionaries");
       }
 
-      // Capture phase: runs before the editor's PASTE_COMMAND handler, which is
-      // what makes preventDefault() able to suppress the default insertion.
+      // Detection watches the draft store rather than the `paste` DOM event.
+      //
+      // Verified in-app: a document-level capture listener WAS installed and the
+      // draft DID change, yet no paste event ever reached the listener, so the
+      // fold store stayed empty. The editor is Lexical, whose PASTE_COMMAND runs
+      // in its own state machine; a capture listener neither reliably sees the
+      // event (delivery follows focus) nor suppresses the insertion via
+      // preventDefault(). Watching the draft is focus-independent and cannot miss
+      // an insertion, and the spill layer's "text becomes a file" step is then a
+      // setDraft() back to the pre-paste value.
+      //
+      // One watcher per session, created lazily and reused, so switching sessions
+      // back and forth never re-baselines a draft mid-edit.
+      //
+      // Shells are materialized lazily (InputHub.shellFor), so `shell(id)` can
+      // legitimately throw for a session whose scope has not mounted yet — and it
+      // stays unresolved until the UI renders that session. Failing once and never
+      // retrying would leave the feature silently dead for exactly those sessions,
+      // so an unresolved session goes on a short bounded retry schedule.
+      const watchers = new Map();
+      const pending = new Set();
+      let retryFrame = null;
+      let retriesLeft = 0;
+
+      const tryInstall = (sessionId) => {
+        if (watchers.has(sessionId)) return true;
+        const shell = shellOf(ctx, sessionId);
+        if (shell === null) return false;
+        watchers.set(
+          sessionId,
+          watchDraft({
+            shell,
+            foldStore,
+            sessionId,
+            conversation: ctx.conversation,
+            nextIndex,
+            onRestore: () => diag({ spilledTextRemoved: true }),
+          }),
+        );
+        return true;
+      };
+
+      const scheduleRetry = () => {
+        if (typeof requestAnimationFrame !== "function") return;
+        retriesLeft = Math.max(retriesLeft, 120); // ~2s at 60fps
+        if (retryFrame !== null) return;
+        const tick = () => {
+          retryFrame = null;
+          for (const id of [...pending]) {
+            if (tryInstall(id)) pending.delete(id);
+          }
+          if (pending.size > 0 && retriesLeft > 0) {
+            retriesLeft -= 1;
+            retryFrame = requestAnimationFrame(tick);
+          }
+        };
+        retryFrame = requestAnimationFrame(tick);
+      };
+
+      const ensureWatcher = (sessionId) => {
+        if (sessionId === undefined || sessionId === null) return;
+        if (tryInstall(sessionId)) {
+          pending.delete(sessionId);
+          return;
+        }
+        pending.add(sessionId);
+        scheduleRetry();
+      };
+
       ctx.effect(() => {
-        const listener = (event) => onDocumentPaste(event, ctx, foldStore, nextIndex);
-        document.addEventListener("paste", listener, { capture: true });
-        diag({ listenerInstalled: true, installedAt: Date.now() });
-        return () => document.removeEventListener("paste", listener, { capture: true });
-      }, "dsh-paste-spill: paste listener");
+        let current = ctx.sessions.list.getSnapshot().current;
+        ensureWatcher(current);
+        const dispose = ctx.sessions.list.subscribe(() => {
+          const next = ctx.sessions.list.getSnapshot().current;
+          if (next === current) return;
+          current = next;
+          ensureWatcher(next);
+        });
+        return () => {
+          dispose();
+          if (retryFrame !== null && typeof cancelAnimationFrame === "function") {
+            cancelAnimationFrame(retryFrame);
+            retryFrame = null;
+          }
+          pending.clear();
+          for (const stop of watchers.values()) {
+            try {
+              stop();
+            } catch {
+              /* teardown is best-effort */
+            }
+          }
+          watchers.clear();
+        };
+      }, "dsh-paste-spill: draft watcher");
 
       ctx.effect(() => {
         const selector = 'style[data-plugin-css="dsh-paste-spill"]';
@@ -402,13 +541,6 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: (sessionId) => {
               const shell = shellOf(ctx, sessionId);
-              diag({
-                injectCalled: true,
-                injectSessionId: sessionId === undefined ? null : String(sessionId),
-                injectShellResolved: shell !== null,
-                injectShellHasState: shell !== null && shell.state !== undefined,
-                injectShellStateHasDraft: shell !== null && shell.state !== undefined && typeof shell.state.getSnapshot === "function" ? typeof shell.state.getSnapshot().draft : "n/a",
-              });
               return {
                 sessionId,
                 hooks: {
@@ -437,10 +569,11 @@ window.__ModuleLoader__.load({
       pasteFileName,
       keepFoldFor,
       createSessionStore,
+      insertedRun,
       spillFile,
       uploadPaste,
-      handlePasteEvent,
-      onDocumentPaste,
+      reactToDraft,
+      watchDraft,
       PasteFoldCard,
     };
     return module.exports;

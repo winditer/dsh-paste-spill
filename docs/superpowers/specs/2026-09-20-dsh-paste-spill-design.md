@@ -1,10 +1,32 @@
 # dsh-paste-spill — 设计文档
 
 > 日期：2026-09-20
-> 状态：待评审
+> 状态：已实施（§0 记录了实施期对检测机制的更正）
 > 插件名：`dsh-paste-spill`（SPEC §10 已定）
 > 目标环境：DSH Desktop `0.1.5-rc.2`，checkout `/Applications/DSH Desktop.app/Contents/Resources/app/`
 > 依据：`dsh-paste-spill-investigation.md`（SPEC），本设计**更正了 SPEC 中三处不成立的机制**（见 §9）
+
+---
+
+## 0. 实施期更正：检测机制从 `paste` 事件改为草稿订阅
+
+原设计（§4）在 `document` 上装捕获阶段 `paste` 监听器，命中输入框时 `preventDefault()` 并合成文件。**该机制经应用内实测证伪**，已整体替换。
+
+**实测证据**（诊断写入渲染进程 Local Storage，宿主侧读取）：
+
+- 监听器确实安装成功、`apply()` 四个服务全部就绪；
+- 草稿确实变了（长度 2 → 15 → 18）；
+- 但**没有任何一次 `paste` 事件到达该监听器**，`foldStore` 始终为空，卡片始终 `cardHasRecord: false`。
+
+**根因**：输入框是 Lexical 的 contenteditable。`paste` 事件按焦点派发，浏览器只保证送给当前聚焦元素；且 Lexical 的 `PASTE_COMMAND`（`ui-conversation` 的 `insertFromPaste` 分支）走自己的编辑器状态机，捕获阶段的 `preventDefault()` 并不能压住它。因此"监听 paste 事件"既不保证收到、也不保证拦得住。
+
+**替换机制**：订阅 `shell.state`（InputState store，`compose()` 发布的快照），用**前后两次草稿的 diff** 识别插入内容。优势：
+
+1. 与焦点无关，不可能漏掉插入；
+2. 一次粘贴在 Lexical 里是**单个 `editor.update`**，因此只触发一次 `rev += 1`，diff 必然拿到完整粘贴内容，不会被分片；
+3. **不需要 `preventDefault()`**：转文件层改为"上传 `ready` 后再 `setDraft()` 还原到粘贴前的值"。失败时文本仍原样留在编辑器中，本身就是完整兜底，无需恢复逻辑；上传中不做移除，因此上传失败**不可能丢文本**。
+
+**由此得到的一个关键不变量**：折叠层记录的文本**直接来自草稿自身**，所以 `keepFoldFor` 的 `draft.includes(record.text)` 按构造必然成立。原设计比较的是"剪贴板原始字符串"与"编辑器归一化投影文本"两个不同来源，可能合理地不相等；该隐患随之消失（`test/bundle.test.js` 有测试固定此不变量）。
 
 ---
 
