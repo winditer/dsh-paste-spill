@@ -1030,3 +1030,45 @@ test("the fold record and the expanded flag are cleared together", () => {
   assert.equal(expandStore.getSnapshot()["sess-1"], undefined, "and so does the expanded flag");
   stop();
 });
+
+test("the collapse rule outranks the stock scroll rule it overrides", () => {
+  // The clamp overrides `.p_FcLG_scroll{max-height:var(--dsh-composer-text-max-height)}`
+  // from the stock stylesheet. That rule is a single class with no !important, so
+  // specificity alone decides - and if our selector were ever simplified to a
+  // single class, the clamp would silently stop working with no error anywhere.
+  // Verified against the shipped bundle: maximum specificity here must stay
+  // strictly above (0,1,0).
+  let css = "";
+  const documentStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null, querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild: (tag) => { css = tag.textContent; } },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = documentStub;
+  try {
+    loadBundle().exports.apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_k, register) => register(), register: () => {} },
+      conversation: { input: { shell: () => undefined } },
+      sessions: { list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} } },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  const rule = /\[data-composer-card\]\[data-dshps-folded\]\s*\[data-input-scroll\]\{([^}]*)\}/.exec(css);
+  assert.ok(rule, "the collapsed scroll rule must be installed");
+  assert.match(rule[1], /max-height:\d+px/, "and must actually clamp the height");
+  assert.match(rule[1], /mask-image/, "and fade the cut edge");
+  // Specificity: attributes count like classes, so count them in the selector.
+  const selector = rule[0].slice(0, rule[0].indexOf("{"));
+  const attributes = selector.match(/\[[^\]]+\]/g) ?? [];
+  assert.ok(
+    attributes.length >= 3,
+    `selector ${selector} must carry >=3 attribute tests to outrank a single class, got ${attributes.length}`,
+  );
+});
