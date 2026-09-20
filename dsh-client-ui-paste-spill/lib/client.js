@@ -326,9 +326,14 @@ window.__ModuleLoader__.load({
         tag.dataset.plugin = "dsh-paste-spill";
         tag.dataset.pluginCss = "dsh-paste-spill";
         tag.textContent =
-          ".dshps-fold-card{box-sizing:border-box;width:calc(100% - var(--dsh-composer-side-clearance) - var(--dsh-composer-side-clearance));" +
-          "max-width:var(--dsh-composer-card-max-width);margin:0 auto;padding:6px 12px;border:.5px solid var(--dsw-alias-border-l1);" +
-          "border-radius:12px;background:var(--dsw-specific-tip);color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}" +
+          // Geometry mirrors the stock dock occupant (ui-conversation TodoPanel.module.css)
+          // so the fold card lines up with it instead of overflowing it.
+          ".dshps-fold-card{box-sizing:border-box;" +
+          "width:calc(100% - var(--dsh-composer-side-clearance) - var(--dsh-composer-side-clearance) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset));" +
+          "max-width:calc(var(--dsh-composer-card-max-width) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset));" +
+          "margin:0 auto;padding:6px 12px;border:.5px solid var(--dsw-alias-border-l1);" +
+          "border-radius:12px;background:var(--dsw-specific-tip);color:var(--dsw-alias-label-primary);" +
+          "font-size:13px;line-height:20px;flex:none;overflow:hidden}" +
           ".dshps-fold-row{display:flex;align-items:center;gap:10px}" +
           ".dshps-fold-title{font-weight:500}" +
           ".dshps-fold-meta{color:var(--dsw-alias-label-tertiary)}" +
