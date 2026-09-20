@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "upload-trace-1";
+    const BUILD_REV = "fold-one-store-1";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -104,11 +104,36 @@ window.__ModuleLoader__.load({
       return `${PASTE_NAME_PREFIX}${index}.${ext}`;
     }
 
-    /** Keep the fold card only while the pasted text is still in the draft. */
-    function keepFoldFor(record, draft) {
+    /**
+     * Is the folded text still in the draft, judged by the record's own sentinels?
+     *
+     * A record is stale once NONE of its sentinels appear in the draft any more.
+     * Requiring any-one-of rather than all-of keeps the record alive through
+     * editor normalization (which may drop one sentinel) while still clearing it
+     * when the text is genuinely gone.
+     */
+    function foldTextPresent(record, draft) {
       if (record === undefined || record === null) return false;
       if (typeof draft !== "string" || draft === "") return false;
-      return draft.includes(record.text);
+      const sentinels = Array.isArray(record.sentinels) ? record.sentinels : [];
+      if (sentinels.length === 0) return false;
+      return sentinels.some((candidate) => typeof candidate === "string" && candidate !== "" && draft.includes(candidate));
+    }
+
+    /**
+     * Decide whether a fold record still applies to a draft, given that the draft
+     * may be unreadable.
+     *
+     * The card must survive an unreadable draft: the dock's `draft` hook is bound
+     * once per session binding and cached, so if the session's shell had not been
+     * materialized yet it holds a permanently absent store. Treating that as "the
+     * text is gone" would hide the card forever, which is exactly the failure this
+     * replaces. The watcher, which does see every draft change, is responsible for
+     * clearing the record when the text actually leaves, so absence of evidence is
+     * not evidence of absence here.
+     */
+    function foldApplies(record) {
+      return record !== undefined && record !== null;
     }
 
     /**
@@ -153,12 +178,6 @@ window.__ModuleLoader__.load({
         },
       };
     }
-
-    /** A store that always reads as absent — used when the session has no shell. */
-    const ABSENT_STORE = {
-      getSnapshot: () => undefined,
-      subscribe: () => () => {},
-    };
 
     /** Resolve the composer shell for one session, or null when it has no binding. */
     function shellOf(ctx, sessionId) {
@@ -328,25 +347,38 @@ window.__ModuleLoader__.load({
      * @returns "inline" | "fold" | "file".
      */
     function reactToDraft({ previous, current, run, recorded, sessionId, conversation, shell, foldStore, index = 1, onUploadSettled }) {
-      const candidate = measurableText({ recorded, run });
+      // The watcher is the single authority for the fold record's lifetime: it is
+      // the only place that sees every draft revision, so it can clear the record
+      // the moment the padded text is gone. The card deliberately does NOT rely on
+      // reading the draft to notice this (see foldApplies), because its own draft
+      // hook can be a permanently absent store.
+      const staleRecord = sessionId !== undefined ? foldStore.getSnapshot()[sessionId] : undefined;
+      if (staleRecord !== undefined && !foldTextPresent(staleRecord, current)) foldStore.clear(sessionId);
+      const candidate = measurableText({ recorded, run, previous, current });
       if (candidate === null) {
-        // A deletion (or a rewrite) can drop the folded text; the card hides
-        // itself through keepFoldFor, so only bookkeeping is left.
-        if (sessionId !== undefined && current === "") foldStore.clear(sessionId);
         return "inline";
       }
       const verdict = decidePaste(candidate);
       if (verdict.action === "inline") return "inline";
       if (verdict.action === "fold") {
         if (sessionId !== undefined) {
-          // `text` must be a substring of the draft for the card's visibility
-          // check; the recorded text always is (it is exactly what was inserted),
-          // whereas `current` is the safer choice than `candidate` if the editor
-          // normalized the paste on the way in.
+          // `sentinels` are the substrings whose absence means the folded text has
+          // left the draft; the watcher clears the record on that. Both the
+          // measured run and the whole draft are registered, because the two can
+          // differ: the run is a fragment when the paste replaced similar text,
+          // and the draft is the safer signal when the editor normalized the
+          // insertion on the way in. Keeping them as a list rather than one
+          // "best guess" is what makes the card's lifetime robust to either case.
+          const sentinels = candidate === current ? [current] : [candidate, current];
           foldStore.set(sessionId, {
             bytes: verdict.bytes,
             lines: countLines(candidate),
-            text: current.includes(candidate) ? candidate : current,
+            sentinels,
+          });
+          diag({
+            foldStoredSessionId: sessionId,
+            foldStoredBytes: verdict.bytes,
+            foldStoredFromPaste: recorded !== null && recorded !== undefined,
           });
         }
         return "fold";
@@ -540,14 +572,15 @@ window.__ModuleLoader__.load({
      * text stays in the editor and is submitted verbatim, which is what keeps
      * slash-command and goal parsing identical to a plugin-free install.
      *
-     * `usePasteFold` / `useDraft` arrive as SELECTOR hooks bound by the renderer
-     * (`observableHook` -> useSyncExternalStoreWithSelector), so both must be
-     * called with a selector and both hooks must be called on every render.
+     * `usePasteFold` arrives as a SELECTOR hook bound by the renderer
+     * (`observableHook` -> useSyncExternalStoreWithSelector), so it must be called
+     * with a selector and it must be called on every render. It is the card's only
+     * data source: the watcher clears the record when the folded text leaves the
+     * draft, which is what hides the card.
      */
-    function PasteFoldCard({ sessionId, usePasteFold, useDraft, t }) {
+    function PasteFoldCard({ sessionId, usePasteFold, t }) {
       const record = usePasteFold((state) => (state === undefined || state === null ? undefined : state[sessionId]));
-      const draft = useDraft((state) => (state === undefined || state === null ? undefined : state.draft));
-      if (!keepFoldFor(record, draft)) return null;
+      if (!foldApplies(record)) return null;
       const label = t === undefined ? (key) => key : t;
       return React.createElement(
         "div",
@@ -780,20 +813,18 @@ window.__ModuleLoader__.load({
             id: "paste-spill",
             order: 0,
             locale: NS,
-            inject: (sessionId) => {
-              const shell = shellOf(ctx, sessionId);
-              return {
-                sessionId,
-                hooks: {
-                  // Stores, NOT plain functions: the renderer wraps every hook
-                  // source in observableHook -> useSyncExternalStoreWithSelector.
-                  pasteFold: foldStore,
-                  // The shell's own state store carries the live draft, so the card
-                  // hides itself the moment the pasted text leaves the editor.
-                  draft: shell === null || shell.state === undefined ? ABSENT_STORE : shell.state,
-                },
-              };
-            },
+            inject: (sessionId) => ({
+              sessionId,
+              // A store, NOT a plain function: the renderer wraps every hook source
+              // in observableHook -> useSyncExternalStoreWithSelector. The fold store
+              // is the card's ONLY source. It deliberately does not also read the
+              // session's draft: that hook is materialized once per session binding
+              // and cached, so a binding created before the shell existed would hold
+              // a permanently absent store and hide the card even with a valid
+              // record. The draft watcher, which demonstrably sees every revision,
+              // clears the record instead.
+              hooks: { pasteFold: foldStore },
+            }),
           },
           PasteFoldCard,
         ),
@@ -808,7 +839,8 @@ window.__ModuleLoader__.load({
       decidePaste,
       countLines,
       pasteFileName,
-      keepFoldFor,
+      foldTextPresent,
+      foldApplies,
       createSessionStore,
       insertedRun,
       measurableText,

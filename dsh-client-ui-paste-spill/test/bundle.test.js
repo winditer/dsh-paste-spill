@@ -112,13 +112,24 @@ test("countLines counts newline-separated lines", () => {
   assert.equal(countLines("one\ntwo\n"), 3);
 });
 
-test("keepFoldFor keeps the card only while the pasted text is still in the draft", () => {
-  const { keepFoldFor } = loadBundle().exports.__internals;
-  const record = { bytes: 5000, lines: 2, text: "big pasted text" };
-  assert.equal(keepFoldFor(record, "prefix big pasted text suffix"), true);
-  assert.equal(keepFoldFor(record, "big pasted tex"), false);
-  assert.equal(keepFoldFor(record, ""), false);
-  assert.equal(keepFoldFor(record, undefined), false);
+test("foldTextPresent keeps the record alive while any sentinel remains", () => {
+  const { foldTextPresent } = loadBundle().exports.__internals;
+  const record = { bytes: 5000, lines: 2, sentinels: ["big pasted text"] };
+  assert.equal(foldTextPresent(record, "prefix big pasted text suffix"), true);
+  assert.equal(foldTextPresent(record, "big pasted tex"), false);
+  assert.equal(foldTextPresent(record, ""), false);
+  assert.equal(foldTextPresent(record, undefined), false);
+});
+
+test("foldTextPresent survives editor normalization that drops one sentinel", () => {
+  const { foldTextPresent } = loadBundle().exports.__internals;
+  // The run and the whole draft are both registered; losing either one alone
+  // must not clear the record, which is the case that used to hide the card.
+  const record = { bytes: 5000, lines: 2, sentinels: ["the pasted run", "the pasted run\nwith a trailing hard break"] };
+  assert.equal(foldTextPresent(record, "the pasted run"), true);
+  assert.equal(foldTextPresent(record, "the pasted run\nwith a trailing hard break"), true);
+  assert.equal(foldTextPresent(record, "unrelated"), false);
+  assert.equal(foldTextPresent({ bytes: 1, lines: 1, sentinels: [] }, "anything"), false);
 });
 
 test("createSessionStore notifies subscribers and clears per session", () => {
@@ -127,14 +138,14 @@ test("createSessionStore notifies subscribers and clears per session", () => {
   let notifications = 0;
   const dispose = store.subscribe(() => { notifications += 1; });
   assert.deepEqual(store.getSnapshot(), {});
-  store.set("sess-1", { bytes: 5000, lines: 2, text: "x" });
+  store.set("sess-1", { bytes: 5000, lines: 2, sentinels: ["x"] });
   assert.equal(notifications, 1);
-  assert.deepEqual(store.getSnapshot()["sess-1"], { bytes: 5000, lines: 2, text: "x" });
+  assert.deepEqual(store.getSnapshot()["sess-1"], { bytes: 5000, lines: 2, sentinels: ["x"] });
   store.clear("sess-1");
   assert.equal(notifications, 2);
   assert.deepEqual(store.getSnapshot(), {});
   dispose();
-  store.set("sess-2", { bytes: 1, lines: 1, text: "y" });
+  store.set("sess-2", { bytes: 1, lines: 1, sentinels: ["y"] });
   assert.equal(notifications, 2);
 });
 test("spillFile builds a plain-text File with the synthesized name", () => {
@@ -193,7 +204,7 @@ test("reactToDraft records fold state for a large insertion without uploading", 
     foldStore,
   });
   assert.equal(outcome, "fold");
-  assert.deepEqual(foldStore.getSnapshot()["sess-1"], { bytes: 5000, lines: 1, text: run });
+  assert.deepEqual(foldStore.getSnapshot()["sess-1"], { bytes: 5000, lines: 1, sentinels: [run] });
 });
 
 test("reactToDraft uploads a spill-sized insertion", () => {
@@ -305,7 +316,7 @@ test("watchDraft reacts to draft transitions and stops on unsubscribe", () => {
   assert.equal(foldStore.getSnapshot()["sess-1"].bytes, 5000, "the watcher must fold a large insertion");
   stop();
   draftStore.setDraft("y".repeat(5000));
-  assert.equal(foldStore.getSnapshot()["sess-1"].text, run, "after unsubscribe nothing more is recorded");
+  assert.deepEqual(foldStore.getSnapshot()["sess-1"].sentinels, [run], "after unsubscribe nothing more is recorded");
   assert.deepEqual(restores, [], "a fold never restores the draft");
 });
 
@@ -575,7 +586,7 @@ test("a folded run is always a substring of the draft it was diffed from", () =>
   // holds by construction. The previous clipboard-event design compared the raw
   // clipboard string against the editor's normalized projection text — two
   // different sources that could legitimately disagree.
-  const { insertedRun, keepFoldFor } = loadBundle().exports.__internals;
+  const { insertedRun, foldTextPresent } = loadBundle().exports.__internals;
   const cases = [
     ["", "x".repeat(5000)],
     ["pasted earlier ", "pasted earlier " + "y".repeat(5000)],
@@ -585,9 +596,10 @@ test("a folded run is always a substring of the draft it was diffed from", () =>
     const run = insertedRun(before, after);
     assert.ok(run !== null, "each case is an insertion");
     assert.ok(after.includes(run), "the run must be a substring of the resulting draft");
-    const record = { bytes: 5000, lines: 1, text: run };
-    assert.equal(keepFoldFor(record, after), true, "so the card stays visible");
-    assert.equal(keepFoldFor(record, before), false, "and hides once the text is gone");
+    // Sentinels are recorded exactly as the fold branch builds them.
+    const record = { bytes: 5000, lines: 1, sentinels: after === run ? [run] : [run, after] };
+    assert.equal(foldTextPresent(record, after), true, "so the record survives the insertion");
+    assert.equal(foldTextPresent(record, before), false, "and is dropped once the text is gone");
   }
 });
 
@@ -596,33 +608,24 @@ test("the dock card renders nothing without a fold record", () => {
   const tree = PasteFoldCard({
     sessionId: "sess-1",
     usePasteFold: (select) => select({}),
-    useDraft: (select) => select({ draft: "" }),
     t: (key) => key,
   });
   assert.equal(tree, null);
 });
 
-test("the dock card renders nothing once the draft no longer holds the text", () => {
+test("the dock card renders from the fold record alone, without a draft hook", () => {
   const { PasteFoldCard } = loadBundle().exports.__internals;
-  const record = { bytes: 5000, lines: 2, text: "big pasted text" };
+  // The card deliberately has NO draft hook: the session binding's draft store is
+  // materialized once and cached, so a binding born before the shell existed would
+  // hand the card a permanently empty store and hide it forever. The watcher owns
+  // clearing the record instead, so rendering depends on exactly one store.
+  const record = { bytes: 5000, lines: 2, sentinels: ["big pasted text"] };
   const tree = PasteFoldCard({
     sessionId: "sess-1",
     usePasteFold: (select) => select({ "sess-1": record }),
-    useDraft: (select) => select({ draft: "cleared" }),
-    t: (key) => key,
-  });
-  assert.equal(tree, null);
-});
-
-test("the dock card renders the fold metadata while the text is present", () => {
-  const { PasteFoldCard } = loadBundle().exports.__internals;
-  const record = { bytes: 5000, lines: 2, text: "big pasted text" };
-  const tree = PasteFoldCard({
-    sessionId: "sess-1",
-    usePasteFold: (select) => select({ "sess-1": record }),
-    useDraft: (select) => select({ draft: "big pasted text and more" }),
     t: (key, params) => `${key}:${JSON.stringify(params ?? {})}`,
   });
+  assert.notEqual(tree, null, "a record alone must be enough to render");
   // Collect leaf strings rather than matching the whole serialized tree: the
   // JSON form escapes the quotes inside the interpolated label arguments.
   const leaves = [];
@@ -682,11 +685,37 @@ test("the dock entry exposes store-shaped hooks, not plain functions", () => {
     assert.equal(typeof source.subscribe, "function", `hook ${name} must expose subscribe`);
     assert.equal(typeof source.getSnapshot, "function", `hook ${name} must expose getSnapshot`);
   }
-  assert.deepEqual(Object.keys(face.hooks).sort(), ["draft", "pasteFold"]);
-  assert.equal(face.hooks.draft, stateStore, "the draft hook must be the shell's own state store");
+  assert.deepEqual(Object.keys(face.hooks), ["pasteFold"]);
 });
 
-test("the draft hook degrades to a harmless store when the session has no shell", () => {
+test("the pasted text leaving the draft clears the record, which hides the card", () => {
+  const { watchDraft, createSessionStore, createPasteInbox, PasteFoldCard } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const draftStore = createDraftStore("");
+  const stop = watchDraft({
+    shell: { state: draftStore, setDraft: (text) => draftStore.setDraft(text) },
+    foldStore,
+    sessionId: "sess-1",
+    conversation: {},
+    nextIndex: () => 1,
+    inbox: createPasteInbox(),
+    onRestore: () => {},
+  });
+  const run = "x".repeat(5000);
+  draftStore.setDraft(run);
+  const visible = () => PasteFoldCard({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select(foldStore.getSnapshot()),
+    t: (key) => key,
+  });
+  assert.notEqual(visible(), null, "the card shows while the folded text is in the draft");
+  draftStore.setDraft("");
+  assert.equal(foldStore.getSnapshot()["sess-1"], undefined, "clearing the draft must drop the record");
+  assert.equal(visible(), null, "and the card must then render nothing");
+  stop();
+});
+
+test("the dock inject never touches the session shell, so a missing binding cannot hide the card", () => {
   const { apply } = loadBundle().exports;
   let entry = null;
   const documentStub = {
@@ -702,6 +731,9 @@ test("the draft hook degrades to a harmless store when the session has no shell"
       locale: { register: () => {} },
       effect: () => () => {},
       slots: { inject: (_k, register) => register(), register: (e) => { entry = e; } },
+      // Hostile: resolving the shell throws. The card must still be injectable,
+      // because a session whose shell is not ready yet is exactly the state that
+      // used to leave the card permanently hidden.
       conversation: { input: { shell: () => { throw new Error("no binding"); } } },
     });
   } finally {
@@ -709,6 +741,74 @@ test("the draft hook degrades to a harmless store when the session has no shell"
     else globalThis.document = previousDocument;
   }
   const face = entry.inject("sess-1");
-  assert.equal(typeof face.hooks.draft.getSnapshot, "function");
-  assert.equal(face.hooks.draft.getSnapshot(), undefined);
+  assert.deepEqual(Object.keys(face.hooks), ["pasteFold"]);
+  assert.equal(typeof face.hooks.pasteFold.getSnapshot, "function");
+});
+
+test("REGRESSION: a 6000-byte paste folds even when the session binding predates the shell", () => {
+  const { apply } = loadBundle().exports;
+  // Reproduces the reported failure ("超过4000，低于50000，没有折叠") end to end:
+  // the dock entry is injected for a session whose shell is ALREADY materialized,
+  // then the draft changes. Because the card's hook is the plugin's own fold store
+  // rather than the framework-cached session binding, the record reaches it.
+  let entry = null;
+  let component = null;
+  const hostStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = hostStub;
+  const draftStore = createDraftStore("");
+  const shell = {
+    state: draftStore,
+    setDraft: (text) => draftStore.setDraft(text),
+    addAttachments: () => true,
+  };
+  const ctx = {
+    locale: { register: () => {} },
+    effect: (fn) => { fn(); return () => {}; },
+    slots: {
+      inject: (_key, register) => register(),
+      register: (e, c) => { entry = e; component = c; },
+    },
+    sessions: { list: { getSnapshot: () => ({ current: "session-abc" }), subscribe: () => () => {} } },
+    conversation: { input: { shell: () => shell } },
+  };
+  try {
+    apply(ctx);
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  // The dock asks for its hooks before any paste happens (the binding is made
+  // once, cached, and reused) — the case that used to freeze an empty store.
+  const face = entry.inject("session-abc");
+  assert.equal(face.sessionId, "session-abc");
+
+  const body = "x".repeat(6000);
+  draftStore.setDraft(body);
+
+  // The card must render from the store the dock already holds.
+  const tree = component({
+    sessionId: "session-abc",
+    usePasteFold: (select) => select(face.hooks.pasteFold.getSnapshot()),
+    t: (key, params) => `${key}:${JSON.stringify(params ?? {})}`,
+  });
+  assert.notEqual(tree, null, "the fold card must render for a 6000-byte paste");
+
+  const leaves = [];
+  const walk = (node) => {
+    if (typeof node === "string") { leaves.push(node); return; }
+    if (node === null || typeof node !== "object") return;
+    for (const child of node.children ?? []) walk(child);
+  };
+  walk(tree);
+  const text = leaves.join("|");
+  assert.match(text, /foldTitle/, "the card shows in the composer dock");
+  assert.match(text, /"bytes":6000/, "and reports the real pasted size");
+  assert.equal(draftStore.getSnapshot().draft, body, "a fold never mutates the draft");
 });
