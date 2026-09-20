@@ -8,6 +8,46 @@
 
 **Tech Stack:** Node.js 26 (`node --test` built in), Cordis plugin system (`apply(ctx)`), browser `window.__ModuleLoader__` factory bundles (plain JS + `require("react")`), no build step.
 
+---
+
+## ⚠️ AMENDMENT — read this before the tasks below
+
+**This document was written before implementation and is now WRONG in three places. The tasks below are kept as the historical record; the shipped design is the authority.** Both bugs it caused were found only after shipping, and this amendment exists so nobody re-implements the broken version.
+
+### 1. Detection is a DRAFT SUBSCRIPTION, not a capture-phase `paste` listener
+
+The original design installed a `document` capture-phase `paste` listener and called `preventDefault()`. **This cannot work.** Verified in-app: the listener *was* installed and the draft *did* change, yet no `paste` event was ever delivered to it, so the store stayed empty. The editor is Lexical, whose `PASTE_COMMAND` runs in its own state machine; a capture listener neither reliably sees the event (delivery follows focus, and Lexical binds to the root element) nor suppresses the insertion via `preventDefault()`.
+
+**Shipped:** the client subscribes to each session's `shell.state` draft store and diffs consecutive drafts (`insertedRun`). A one-slot inbox fed by `beforeinput`/`paste` observers supplies the authoritative pasted text for the cases a diff cannot measure (a paste that *replaces* similar text). Both feed `measurableText`.
+
+### 2. The card lives on `conversation.input.dock`, NOT `conversation.composer.dock`
+
+`composer.dock` is rendered only under
+
+```js
+variant === "composer" && input !== void 0 && sessionId !== void 0
+```
+
+and the variant is `"hero"` whenever `sessionId === void 0 || shellPhase === "blank" && ...`. So **in a blank session — exactly where a large paste is first tried — that slot never renders at all**, and no store contents can ever surface a card. This is what produced the reported "超过4000，低于50000，没有折叠" while the ≥50,000 attachment chip kept working (the input bar is outside that gate).
+
+**Shipped:** registered on `conversation.input.dock` (stock occupants `todo` order 0, `queue` order 20; ours is order 10), which renders on `zone !== void 0` with no variant condition.
+
+### 3. The card reads ONE store; the watcher owns the record's lifetime
+
+The card originally needed two stores to agree — its fold record *and* the session's draft — and hid itself when `draft.includes(record.text)` was false. That draft hook is materialized **once per session binding and cached** (`standardProps` → WeakMap keyed by scope binding), so a binding created before the session's shell existed holds a permanently absent store: the card then read "the text is gone" and hid itself forever.
+
+**Shipped:** the fold record is the card's only source. Records carry `sentinels` (the measured run, plus the whole draft when it differs) and the **draft watcher** — the one place that sees every revision — clears the record once none of the sentinels remain. Visibility is `foldApplies(record)` = record presence.
+
+Also fixed while tracing: `reactToDraft` called `measurableText` without `previous`/`current`, so the whole-draft backstop never ran on the live path.
+
+### Where the authoritative description lives
+
+- `docs/superpowers/specs/2026-09-20-dsh-paste-spill-design.md` §0 — the two corrected findings, in full.
+- `dsh-client-ui-paste-spill/lib/client.js` — the shipped code, with the reasoning in comments at each decision point.
+- `dsh-client-ui-paste-spill/test/bundle.test.js` — 38 tests, including an end-to-end regression for the fold-card failure.
+
+Tasks 2 and 6 below (which build the `paste` listener and the `composer.dock` registration) are **superseded** and must not be re-run.
+
 ## Global Constraints
 
 - **Thresholds are UTF-8 BYTES, not characters.** Fold = 4000, spill = 50000. Count with `new TextEncoder().encode(text).byteLength`. The two layers are independent — never merge them into one switch.
