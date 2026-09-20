@@ -1,7 +1,7 @@
 # dsh-paste-spill — 设计文档
 
 > 日期：2026-09-20
-> 状态：已实施（§0 记录了实施期对检测机制的更正）
+> 状态：已实施（§0 记录实施期更正；§4.3 记录折叠层从"仅提示"改为"输入框内折叠"）
 > 插件名：`dsh-paste-spill`（SPEC §10 已定）
 > 目标环境：DSH Desktop `0.1.5-rc.2`，checkout `/Applications/DSH Desktop.app/Contents/Resources/app/`
 > 依据：`dsh-paste-spill-investigation.md`（SPEC），本设计**更正了 SPEC 中三处不成立的机制**（见 §9）
@@ -137,20 +137,69 @@ stock 里**没有 paste 钩子**：`PASTE_COMMAND` 是包内闭包注册的（`u
 
 **上传失败的降级**（SPEC §7.1）：失败的正确降级是"保留原始内联文本"。但上传是**异步**的，其结果不在 `createDrafts`/`addAttachments` 的返回值里（见 §12-1）。因此实现时二选一：能可靠观测失败则失败时把原文补回编辑器；**观测不可靠则保守地始终保留内联原文**（不 `preventDefault()`）。两种都绝不静默丢内容。
 
-### 4.3 折叠层（4,000 ≤ bytes < 50,000）—— dock 卡片
+### 4.3 折叠层（4,000 ≤ bytes < 50,000）—— 输入框内折叠
 
-在 `conversation.composer.dock` 注册一个 `list` 槽位条目（形状照抄 stock 的 `ui-chat:8351-8356`：`{ name, id, order, locale }`）：
+> **本节已修订。** 初版只在 `conversation.composer.dock` 加一张"提示卡"，输入框里仍是全文；用户反馈"只有提示，希望在输入框中直接显示折叠样式"，因此折叠层现在分为**两半**。两个已不成立的做法记录如下，勿再实现：
+>
+> 1. **`conversation.composer.dock` 在空白会话不渲染。** 它只在 `variant === "composer" && input !== void 0 && sessionId !== void 0` 下渲染，而 `variant` 在 `sessionId === void 0 || shellPhase === "blank" && …` 时为 `"hero"`。空白会话（也就是粘贴大文本的第一现场）该槽位根本不渲染 —— 卡片无论如何都不会出现。改为 `conversation.input.dock`（渲染条件只有 `zone !== void 0`，与 variant 无关）。
+> 2. **卡片不能同时依赖两个 store。** 初版卡片要求"折叠记录 + 会话草稿"同时成立，但 draft hook 由 `standardProps` **按 session binding 只物化一次并缓存**（WeakMap keyed by scopeBinding），早于 shell 创建的 binding 会永久持有空 store，卡片据此判定"文本已消失"而永久隐藏。现在折叠记录是卡片唯一数据源，生命周期由 draft watcher（唯一能看到每次修订的地方）通过 `sentinels` 掌握。
+
+#### 4.3.1 上半：输入框上方的卡片（`conversation.input.dock`）
 
 ```js
-ctx.slots.inject("conversation.composer.dock", () => ctx.slots.register({
-  name: "conversation.composer.dock",
+ctx.slots.inject("conversation.input.dock", () => ctx.slots.register({
+  name: "conversation.input.dock",
   id: "paste-spill",
-  order: 0,
+  order: 10,          // stock 占位：todo=0、queue=20
   locale: NS,
+  inject: (sessionId) => ({ sessionId, hooks: { pasteFold: foldStore, foldExpanded: expandStore }, setFoldExpanded }),
 }, PasteFoldCard));
 ```
 
-**语义（关键）**：卡片是**提示**，不是替换。
+卡片本身是**展开/收起的按钮**（`aria-expanded`，键盘可达）。
+
+#### 4.3.2 下半：输入框内的折叠样式（`conversation.input.overlay`）
+
+真正的"折叠"施加在编辑区上，由一个**零尺寸标记**组件完成：
+
+```js
+ctx.slots.inject("conversation.input.overlay", () => ctx.slots.register({
+  name: "conversation.input.overlay",
+  id: "paste-spill",
+  order: 0,
+  inject: (sessionId) => ({ sessionId, hooks: { pasteFold: foldStore, foldExpanded: expandStore }, setFoldExpanded }),
+}, FoldMarker));
+```
+
+为什么是 `input.overlay`（三个候选都已逐个核对）：
+
+| 候选 | 结论 |
+| --- | --- |
+| `conversation.input.attachments`（也在卡片内） | `kind: "single"`，已被 `dsh-client-ui-attachment` 独占；注册会顶掉原生附件 UI。**不可用** |
+| 编辑器内的真 chip | `editor` 是 `SessionInputShell` 私有字段，插件拿不到；要往别人的 Lexical 实例注册 node 并**重建提交内容**，正是破坏 `/goal` 解析的做法（Codex #25346）。**不做** |
+| `conversation.input.overlay` | `kind: "list"`、`scope: "session"`，空闲可共用；渲染点在 `[data-composer-card]` **内部**、编辑区之上。**采用** |
+
+标记组件通过 ``anchorRef.current.closest("[data-composer-card]")`` 找到**自己所在会话**的卡片并打上 `data-dshps-folded`——这是"多会话同时打开时不会压错输入框"的关键：它只沿自身祖先链向上，绝不 `document.querySelector`。
+
+样式（纯 CSS，不包裹/不复制任何 stock 节点）：
+
+```css
+[data-composer-card][data-dshps-folded] [data-input-scroll]{
+  max-height:84px;                       /* ≈3 行 */
+  mask-image:linear-gradient(to bottom,#000 calc(100% - 30px),transparent);
+  cursor:pointer}
+```
+
+`[data-input-scroll]` 是 stock 的滚动容器（原 `max-height:var(--dsh-composer-text-max-height)`），只覆盖高度。`mask-image` 让切边渐隐进卡片背景，读起来是"下面还有"而不是渲染错误。`FADE_PX=30` 与 `FOLD_CLAMP_PX=84` 是 JS 常量并**插值进**样式串，避免与命中判定各写一份而失步。
+
+展开入口有两个：
+
+1. 上方卡片（按钮）；
+2. 折叠区底部渐隐带 —— 用 `mousedown` **捕获阶段**命中判定（`clientY >= rect.bottom - FADE_PX`）后 `preventDefault()` 再展开。用捕获阶段是因为等到冒泡时插入点已被放置、容器已滚动，渐隐带会从指针下移开。**只有渐隐带可点**：可见文字行的点击完全照旧，因此折叠后仍能点进输入框追加"总结一下"，不会误展开。
+
+#### 4.3.3 折叠的语义：仅表现层
+
+**语义（关键）**：折叠**只改表现，不改文本**。
 
 - 全文**照常**进编辑器（不清空、不改写、不替换）；
 - 卡片显示"已粘贴大文本 · N 行 / N 字节"，可展开预览、可关闭；
@@ -161,7 +210,9 @@ ctx.slots.inject("conversation.composer.dock", () => ctx.slots.register({
 - **斜杠命令 / goal 不被绕过**：文本原样在草稿，slash 与 goal 解析器看到的与没装插件时完全一致（对比 Codex #25346：它把文本替换成附件，导致 `/goal` 判空）；
 - **无需 `sinkSerialized` 展开**，也就没有 SPEC §6.6.1 警告的"两次改写互相打架"问题。
 
-卡片状态按 `(sessionId, draftRev)` 跟踪：草稿被清空/提交后卡片自动消失（订阅 `conversation.input` 的草稿快照，见 §4.4）。
+卡片与折叠状态都按 `sessionId` 跟踪：全文离开草稿后，watcher 清掉折叠记录，卡片消失、折叠样式解除（见 §4.3.1 的更正 2）。`expanded`（用户是否手动展开）存在**独立的 session store** 里，并与折叠记录**同步清除** —— 否则"展开过一次 → 清空草稿 → 再次粘贴"会让新文本一出现就是展开态。
+
+**已知取舍**：折叠态下被裁掉的文字不能直接用鼠标选中 —— 这是"折叠"的固有语义，展开即恢复。整块编辑区不做点击展开，否则会牺牲"折叠后仍可追加输入"。
 
 ### 4.4 客户端依赖与取用（已核对的 API 路径）
 
