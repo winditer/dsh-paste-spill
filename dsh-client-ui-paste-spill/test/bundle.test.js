@@ -385,6 +385,39 @@ test("watchDraft keeps the text inline when the upload fails", async () => {
   stop();
 });
 
+test("reactToDraft still uploads when the upload settled before we subscribed", () => {
+  // Regression: the attachment can reach `ready` before uploadPaste gets to
+  // subscribe. Relying on the subscription alone would then leave the spilled
+  // text in the editor forever, since no further notification ever arrives.
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
+  const calls = { addAttachments: 0 };
+  const conversation = {
+    createDrafts() { return [{ id: "draft-1", kind: "file" }]; },
+    releaseDraftAttachment() {},
+    releaseDraftAttachments() {},
+    fileUploads: {
+      // Never notifies; the state is already terminal at subscribe time.
+      subscribe() { return () => {}; },
+      getSnapshot: () => ({ "draft-1": { status: "ready" } }),
+    },
+  };
+  let ready = 0;
+  const run = "y".repeat(50000);
+  const outcome = reactToDraft({
+    previous: "",
+    current: run,
+    run,
+    sessionId: "sess-1",
+    conversation,
+    shell: { addAttachments() { calls.addAttachments += 1; return true; } },
+    foldStore: createSessionStore(),
+    onUploadSettled: (ok) => { if (ok === true) ready += 1; },
+  });
+  assert.equal(outcome, "file");
+  assert.equal(calls.addAttachments, 1);
+  assert.equal(ready, 1, "an already-ready upload must still report success");
+});
+
 test("a folded run is always a substring of the draft it was diffed from", () => {
   // This invariant is what makes the fold card's visibility check exact: the run
   // comes out of the draft itself, so keepFoldFor's `draft.includes(record.text)`

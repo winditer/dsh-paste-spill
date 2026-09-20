@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
     const PASTE_NAME_PREFIX = "pasted-text-";
     const NS = "dsh-paste-spill";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "draft-watcher-1";
+    const BUILD_REV = "draft-watcher-2";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -255,7 +255,7 @@ window.__ModuleLoader__.load({
      *
      * @returns an unsubscribe function.
      */
-    function watchDraft({ shell, foldStore, sessionId, ctx, conversation, nextIndex, onRestore }) {
+    function watchDraft({ shell, foldStore, sessionId, conversation, nextIndex, onRestore }) {
       if (shell === undefined || shell === null || shell.state === undefined) return () => {};
       const store = shell.state;
       const initial = store.getSnapshot();
@@ -330,33 +330,44 @@ window.__ModuleLoader__.load({
         return false;
       }
       let settled = false;
-      const stop = conversation.fileUploads.subscribe(() => {
+      // Assigned after subscribe() returns; finish() may be reached from the
+      // one-shot settleFrom() below, so it must tolerate stop being unset.
+      let stop = () => {};
+      const finish = (status, id) => {
         if (settled) return;
-        const uploads = conversation.fileUploads.getSnapshot();
+        settled = true;
+        stop();
+        if (status === "ready") {
+          diag({ uploadReady: id });
+          if (onReady !== undefined) onReady();
+          return;
+        }
+        diag({ uploadFailed: id });
+        try {
+          if (shell.removeAttachment(id) !== false) conversation.releaseDraftAttachment(id);
+        } catch {
+          /* the failed chip stays visible; the text is still inline too */
+        }
+        if (onFailure !== undefined) onFailure();
+      };
+      const settleFrom = (uploads) => {
         for (const draft of drafts) {
           const status = uploads[draft.id];
           if (status === undefined) continue;
-          if (status.status === "error") {
-            settled = true;
-            stop();
-            diag({ uploadFailed: draft.id });
-            try {
-              if (shell.removeAttachment(draft.id) !== false) conversation.releaseDraftAttachment(draft.id);
-            } catch {
-              /* the failed chip stays visible; the text is still inline too */
-            }
-            if (onFailure !== undefined) onFailure();
-            return;
-          }
-          if (status.status === "ready") {
-            settled = true;
-            stop();
-            diag({ uploadReady: draft.id });
-            if (onReady !== undefined) onReady();
-            return;
+          if (status.status === "ready" || status.status === "error") {
+            finish(status.status, draft.id);
+            return true;
           }
         }
+        return false;
+      };
+      stop = conversation.fileUploads.subscribe(() => {
+        if (!settled) settleFrom(conversation.fileUploads.getSnapshot());
       });
+      // An upload can already have settled before this subscription existed (a
+      // small file on a fast disk), and subscribing would then never fire again —
+      // the text would stay inline forever. So check the current state once too.
+      settleFrom(conversation.fileUploads.getSnapshot());
       return true;
     }
 
