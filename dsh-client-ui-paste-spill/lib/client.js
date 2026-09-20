@@ -26,6 +26,20 @@ window.__ModuleLoader__.load({
     const NS = "dsh-paste-spill";
     /** The composer's contenteditable surface — the only paste target we handle. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
+    /** Debug channel. The renderer partition's Local Storage is readable from the
+     * host, so this is the only way to get in-app ground truth without a console. */
+    const DIAG_KEY = "dsh.paste-spill.diag";
+
+    function diag(patch) {
+      try {
+        const raw = window.localStorage.getItem(DIAG_KEY);
+        const next = raw === null ? {} : JSON.parse(raw);
+        Object.assign(next, patch);
+        window.localStorage.setItem(DIAG_KEY, JSON.stringify(next));
+      } catch {
+        /* diagnostics must never break the paste path */
+      }
+    }
 
     const zh = {
       foldTitle: "已折叠大文本",
@@ -227,31 +241,50 @@ window.__ModuleLoader__.load({
      * PASTE_COMMAND and can suppress the default insertion.
      */
     function onDocumentPaste(event, ctx, foldStore, nextIndex) {
-      if (event.defaultPrevented) return;
+      diag({ sawPasteEvent: true, lastPasteAt: Date.now(), defaultPreventedOnEntry: event.defaultPrevented === true });
+      if (event.defaultPrevented) {
+        diag({ bailed: "defaultPrevented-on-entry" });
+        return;
+      }
       const target = event.target;
       if (typeof Element !== "undefined" && target instanceof Element) {
-        if (target.closest(COMPOSER_SELECTOR) === null) return;
+        if (target.closest(COMPOSER_SELECTOR) === null) {
+          diag({ bailed: "not-composer", targetTag: target.tagName });
+          return;
+        }
       } else {
+        diag({ bailed: "target-not-element" });
         return;
       }
       const clipboard = event.clipboardData;
-      if (clipboard === null || clipboard === undefined) return;
+      if (clipboard === null || clipboard === undefined) {
+        diag({ bailed: "no-clipboardData" });
+        return;
+      }
       // A real file on the clipboard is stock's business, not ours.
       const items = [];
       for (let i = 0; i < clipboard.items.length; i += 1) items.push(clipboard.items[i]);
-      if (items.some((item) => item.kind === "file")) return;
+      if (items.some((item) => item.kind === "file")) {
+        diag({ bailed: "clipboard-has-file-item", kinds: items.map((i) => i.kind).join(",") });
+        return;
+      }
       const text = clipboard.getData("text/plain");
-      if (typeof text !== "string" || text === "") return;
+      if (typeof text !== "string" || text === "") {
+        diag({ bailed: "no-text-plain", textLen: typeof text === "string" ? text.length : -1 });
+        return;
+      }
       const sessionId = ctx.sessions.list.getSnapshot().current;
+      diag({ textBytes: utf8Bytes(text), sessionIdIsUndefined: sessionId === undefined, sessionIdType: typeof sessionId });
       let shell;
       if (sessionId !== undefined) {
         try {
           shell = ctx.conversation.input.shell(sessionId);
-        } catch {
+        } catch (error) {
           shell = undefined;
+          diag({ shellThrew: String(error && error.message) });
         }
       }
-      handlePasteEvent({
+      const verdict = handlePasteEvent({
         text,
         sessionId,
         conversation: ctx.conversation,
@@ -260,6 +293,7 @@ window.__ModuleLoader__.load({
         index: nextIndex(),
         preventDefault: () => event.preventDefault(),
       });
+      diag({ verdict, shellResolved: shell !== undefined && shell !== null, storeKeys: Object.keys(foldStore.getSnapshot()) });
     }
 
     /**
@@ -274,6 +308,15 @@ window.__ModuleLoader__.load({
     function PasteFoldCard({ sessionId, usePasteFold, useDraft, t }) {
       const record = usePasteFold((state) => (state === undefined || state === null ? undefined : state[sessionId]));
       const draft = useDraft((state) => (state === undefined || state === null ? undefined : state.draft));
+      diag({
+        cardRendered: true,
+        cardSessionId: sessionId === undefined ? null : String(sessionId),
+        cardHasRecord: record !== undefined && record !== null,
+        cardDraftType: typeof draft,
+        cardDraftLen: typeof draft === "string" ? draft.length : -1,
+        cardKept: keepFoldFor(record, draft),
+        cardRecordTextLen: record && typeof record.text === "string" ? record.text.length : -1,
+      });
       if (!keepFoldFor(record, draft)) return null;
       const label = t === undefined ? (key) => key : t;
       return React.createElement(
@@ -306,6 +349,13 @@ window.__ModuleLoader__.load({
         counter += 1;
         return counter;
       };
+      diag({
+        applyRanAt: Date.now(),
+        hasSlots: ctx.slots !== undefined,
+        hasConversation: ctx.conversation !== undefined,
+        hasConversationInput: ctx.conversation !== undefined && ctx.conversation.input !== undefined,
+        hasSessions: ctx.sessions !== undefined,
+      });
 
       if (ctx.locale !== undefined) {
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-paste-spill: dictionaries");
@@ -316,6 +366,7 @@ window.__ModuleLoader__.load({
       ctx.effect(() => {
         const listener = (event) => onDocumentPaste(event, ctx, foldStore, nextIndex);
         document.addEventListener("paste", listener, { capture: true });
+        diag({ listenerInstalled: true, installedAt: Date.now() });
         return () => document.removeEventListener("paste", listener, { capture: true });
       }, "dsh-paste-spill: paste listener");
 
@@ -351,6 +402,13 @@ window.__ModuleLoader__.load({
             locale: NS,
             inject: (sessionId) => {
               const shell = shellOf(ctx, sessionId);
+              diag({
+                injectCalled: true,
+                injectSessionId: sessionId === undefined ? null : String(sessionId),
+                injectShellResolved: shell !== null,
+                injectShellHasState: shell !== null && shell.state !== undefined,
+                injectShellStateHasDraft: shell !== null && shell.state !== undefined && typeof shell.state.getSnapshot === "function" ? typeof shell.state.getSnapshot().draft : "n/a",
+              });
               return {
                 sessionId,
                 hooks: {
