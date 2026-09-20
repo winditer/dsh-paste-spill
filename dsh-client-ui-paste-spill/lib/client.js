@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "measure-2";
+    const BUILD_REV = "upload-trace-1";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -470,8 +470,17 @@ window.__ModuleLoader__.load({
      */
     function uploadPaste({ conversation, sessionId, shell, text, index, onReady, onFailure }) {
       const file = spillFile(text, index);
-      const drafts = conversation.createDrafts(sessionId, [file]);
+      diag({ uploadStartBytes: utf8Bytes(text), uploadFileName: file.name });
+      let drafts;
+      try {
+        drafts = conversation.createDrafts(sessionId, [file]);
+      } catch (error) {
+        diag({ createDraftsThrew: String(error && error.message) });
+        return false;
+      }
+      diag({ createDraftsCount: Array.isArray(drafts) ? drafts.length : -1 });
       if (shell.addAttachments(drafts.map((draft) => draft.id)) === false) {
+        diag({ addAttachmentsRefused: true });
         conversation.releaseDraftAttachments(drafts);
         return false;
       }
@@ -489,6 +498,15 @@ window.__ModuleLoader__.load({
           return;
         }
         diag({ uploadFailed: id });
+        // Why it failed matters more than that it failed: the entry carries the
+        // reason, and without it a failed spill is indistinguishable from a spill
+        // that never started.
+        try {
+          const entry = conversation.fileUploads.getSnapshot()?.[id];
+          if (entry !== undefined) diag({ uploadFailureDetail: JSON.stringify(entry) });
+        } catch {
+          /* diagnostics only */
+        }
         try {
           if (shell.removeAttachment(id) !== false) conversation.releaseDraftAttachment(id);
         } catch {
