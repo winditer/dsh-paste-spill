@@ -24,8 +24,10 @@ window.__ModuleLoader__.load({
     /** Filename prefix the host half recognizes. Keep in sync with dsh-paste-spill. */
     const PASTE_NAME_PREFIX = "pasted-text-";
     const NS = "dsh-paste-spill";
+    /** The composer's contenteditable surface — how we recognize paste targets. */
+    const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "draft-watcher-2";
+    const BUILD_REV = "paste-source-1";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -199,23 +201,120 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Remove the pasted text from the resulting draft, leaving everything else.
+     *
+     * NOT simply `setDraft("")`: a paste can equally be an append after existing
+     * text or a replacement of a selection, and clearing would silently discard
+     * unrelated text in the append case. The occurrence removed is the one nearest
+     * where the two drafts diverge, which is where the editor put the paste; that
+     * resolves the replacement case correctly too, since there the pasted text is
+     * what now sits at that boundary.
+     *
+     * @returns the draft with the paste taken out.
+     */
+    function removePastedText(current, candidate, previous) {
+      if (typeof current !== "string") return "";
+      if (typeof candidate !== "string" || candidate === "") return "";
+      const before = typeof previous === "string" ? previous : "";
+      let diverge = 0;
+      const max = Math.min(before.length, current.length);
+      while (diverge < max && before[diverge] === current[diverge]) diverge += 1;
+      let best = -1;
+      for (let from = 0; ; ) {
+        const at = current.indexOf(candidate, from);
+        if (at < 0) break;
+        if (best < 0 || Math.abs(at - diverge) < Math.abs(best - diverge)) best = at;
+        from = at + 1;
+      }
+      // Not found means the editor normalized the paste on the way in, so there is
+      // nothing to remove precisely; empty is the honest fallback.
+      if (best < 0) return "";
+      return current.slice(0, best) + current.slice(best + candidate.length);
+    }
+
+    /**
+     * A one-slot inbox for the text of the most recent paste.
+     *
+     * Why this exists in addition to the diff: a diff cannot recover the size of a
+     * paste that REPLACES similar text. Verified in-app: pasting a JSON document
+     * over an existing, structurally similar JSON document left only the differing
+     * middle (8877 bytes) after prefix/suffix trimming, so a ~50,000-byte paste was
+     * measured as 8877 and never reached the spill threshold. The amount of text
+     * that arrived is simply not derivable from before/after drafts in that case.
+     *
+     * `beforeinput` with inputType `insertFromPaste` carries a DataTransfer holding
+     * the real pasted text, and it fires before the insertion, so it is recorded
+     * here and consumed by the next draft transition.
+     */
+    const PASTE_INPUT_TYPES = { insertFromPaste: true, insertFromPasteAsQuotation: true };
+
+    function createPasteInbox() {
+      let pending = null;
+      return {
+        record(text, source) {
+          if (typeof text !== "string" || text === "") return;
+          pending = { text, bytes: utf8Bytes(text), at: Date.now(), source };
+          if (source !== undefined) diag({ lastPasteSource: source, lastPasteBytes: utf8Bytes(text) });
+        },
+        /**
+         * Consume the pending paste, or null when there is none.
+         *
+         * The age limit is what keeps a stale entry from being blamed for an
+         * unrelated later edit: an entry is only ever meant for the very next
+         * draft transition, which follows the insertion by a frame at most.
+         */
+        take(maxAgeMs = 4000) {
+          const entry = pending;
+          pending = null;
+          if (entry === null) return null;
+          if (Date.now() - entry.at > maxAgeMs) return null;
+          return entry;
+        },
+      };
+    }
+
+    /**
+     * Pick the text to measure for one transition.
+     *
+     * A recorded paste is authoritative: it is the actual text that arrived, so it
+     * cannot be fooled by a replacement of similar text. The diff is only a
+     * fallback for insertions we did not observe (typing, IME, drag-drop), where
+     * prefix/suffix trimming is a sound way to isolate the new run.
+     *
+     * @returns the text to measure, or null when nothing was inserted.
+     */
+    function measurableText({ recorded, run }) {
+      if (recorded !== null && recorded !== undefined) return recorded.text;
+      return run;
+    }
+
+    /**
      * Decide what one draft transition means and perform it. This is the whole
      * detection layer, kept pure enough to test without a DOM.
      *
      * @returns "inline" | "fold" | "file".
      */
-    function reactToDraft({ previous, current, run, sessionId, conversation, shell, foldStore, index = 1, onUploadSettled }) {
-      if (run === null) {
+    function reactToDraft({ previous, current, run, recorded, sessionId, conversation, shell, foldStore, index = 1, onUploadSettled }) {
+      const candidate = measurableText({ recorded, run });
+      if (candidate === null) {
         // A deletion (or a rewrite) can drop the folded text; the card hides
         // itself through keepFoldFor, so only bookkeeping is left.
         if (sessionId !== undefined && current === "") foldStore.clear(sessionId);
         return "inline";
       }
-      const verdict = decidePaste(run);
+      const verdict = decidePaste(candidate);
       if (verdict.action === "inline") return "inline";
       if (verdict.action === "fold") {
         if (sessionId !== undefined) {
-          foldStore.set(sessionId, { bytes: verdict.bytes, lines: countLines(run), text: run });
+          // `text` must be a substring of the draft for the card's visibility
+          // check; the recorded text always is (it is exactly what was inserted),
+          // whereas `current` is the safer choice than `candidate` if the editor
+          // normalized the paste on the way in.
+          foldStore.set(sessionId, {
+            bytes: verdict.bytes,
+            lines: countLines(candidate),
+            text: current.includes(candidate) ? candidate : current,
+          });
         }
         return "fold";
       }
@@ -228,7 +327,7 @@ window.__ModuleLoader__.load({
           conversation,
           sessionId,
           shell,
-          text: run,
+          text: candidate,
           index,
           onReady: () => {
             if (onUploadSettled !== undefined) onUploadSettled(true);
@@ -255,7 +354,7 @@ window.__ModuleLoader__.load({
      *
      * @returns an unsubscribe function.
      */
-    function watchDraft({ shell, foldStore, sessionId, conversation, nextIndex, onRestore }) {
+    function watchDraft({ shell, foldStore, sessionId, conversation, nextIndex, onRestore, inbox }) {
       if (shell === undefined || shell === null || shell.state === undefined) return () => {};
       const store = shell.state;
       const initial = store.getSnapshot();
@@ -273,10 +372,13 @@ window.__ModuleLoader__.load({
         lastRev = snapshot.draftRev;
         const beforePaste = previous;
         const run = insertedRun(beforePaste, current);
+        const recorded = inbox.take();
+        const candidate = measurableText({ recorded, run });
         const decision = reactToDraft({
           previous: beforePaste,
           current,
           run,
+          recorded,
           sessionId,
           conversation,
           shell,
@@ -286,8 +388,12 @@ window.__ModuleLoader__.load({
             if (ok !== true) return;
             try {
               restoring = true;
-              previous = beforePaste;
-              shell.setDraft(beforePaste);
+              // Remove just the pasted text: a spill can equally have been an
+              // append or a replacement, and clearing the whole draft would
+              // discard unrelated text in the append case.
+              const cleaned = removePastedText(current, candidate, beforePaste);
+              previous = cleaned;
+              shell.setDraft(cleaned);
               // Our own write publishes a new revision; absorb it so the next
               // callback does not mistake it for a user edit.
               lastRev = store.getSnapshot()?.draftRev;
@@ -301,7 +407,7 @@ window.__ModuleLoader__.load({
           },
         });
         previous = current;
-        noteTransition(decision, run === null ? 0 : utf8Bytes(run));
+        noteTransition(decision, candidate === null ? 0 : utf8Bytes(candidate));
       });
     }
 
@@ -432,9 +538,60 @@ window.__ModuleLoader__.load({
       // in its own state machine; a capture listener neither reliably sees the
       // event (delivery follows focus) nor suppresses the insertion via
       // preventDefault(). Watching the draft is focus-independent and cannot miss
-      // an insertion, and the spill layer's "text becomes a file" step is then a
-      // setDraft() back to the pre-paste value.
+      // an insertion.
       //
+      // `beforeinput` is observed ONLY to learn the pasted text itself, never to
+      // gate or cancel anything: it fires before the insertion, so it is the one
+      // place the real clipboard payload is available. The draft diff alone cannot
+      // measure a paste that replaced similar text (verified in-app: a JSON
+      // document pasted over a similar one looked like an 8877-byte insertion).
+      const inbox = createPasteInbox();
+      ctx.effect(() => {
+        const inComposer = (event) => {
+          if (typeof Element === "undefined") return false;
+          const target = event.target;
+          return target instanceof Element && target.closest(COMPOSER_SELECTOR) !== null;
+        };
+        // Both sources are observed because either alone can miss:
+        //   * `beforeinput` is the only one that also covers insertFromPaste's
+        //     siblings and fires before the insertion, but its DataTransfer is
+        //     not guaranteed to be populated for a paste in every engine.
+        //   * `paste` carries clipboardData reliably, but was observed never to
+        //     reach this listener in-app at all.
+        // Whichever arrives first wins; the inbox keeps only the newest.
+        const onBeforeInput = (event) => {
+          try {
+            if (!inComposer(event)) return;
+            if (event.inputType === undefined || PASTE_INPUT_TYPES[event.inputType] !== true) return;
+            const transfer = event.dataTransfer;
+            if (transfer === null || transfer === undefined) return;
+            inbox.record(transfer.getData("text/plain"), "beforeinput");
+          } catch {
+            /* observing must never disturb the editor */
+          }
+        };
+        const onPaste = (event) => {
+          try {
+            if (!inComposer(event)) return;
+            const clipboard = event.clipboardData;
+            if (clipboard === null || clipboard === undefined) return;
+            // A real file on the clipboard is stock's business, not ours.
+            for (let i = 0; i < clipboard.items.length; i += 1) {
+              if (clipboard.items[i].kind === "file") return;
+            }
+            inbox.record(clipboard.getData("text/plain"), "paste");
+          } catch {
+            /* observing must never disturb the editor */
+          }
+        };
+        document.addEventListener("beforeinput", onBeforeInput, { capture: true });
+        document.addEventListener("paste", onPaste, { capture: true });
+        return () => {
+          document.removeEventListener("beforeinput", onBeforeInput, { capture: true });
+          document.removeEventListener("paste", onPaste, { capture: true });
+        };
+      }, "dsh-paste-spill: paste text observer");
+
       // One watcher per session, created lazily and reused, so switching sessions
       // back and forth never re-baselines a draft mid-edit.
       //
@@ -460,6 +617,7 @@ window.__ModuleLoader__.load({
             sessionId,
             conversation: ctx.conversation,
             nextIndex,
+            inbox,
             onRestore: () => diag({ spilledTextRemoved: true }),
           }),
         );
@@ -581,6 +739,9 @@ window.__ModuleLoader__.load({
       keepFoldFor,
       createSessionStore,
       insertedRun,
+      measurableText,
+      removePastedText,
+      createPasteInbox,
       spillFile,
       uploadPaste,
       reactToDraft,

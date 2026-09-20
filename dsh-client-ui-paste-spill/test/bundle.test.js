@@ -282,7 +282,7 @@ test("reactToDraft drops the fold record when the draft is cleared", () => {
 });
 
 test("watchDraft reacts to draft transitions and stops on unsubscribe", () => {
-  const { watchDraft, createSessionStore } = loadBundle().exports.__internals;
+  const { watchDraft, createSessionStore, createPasteInbox } = loadBundle().exports.__internals;
   const foldStore = createSessionStore();
   const draftStore = createDraftStore("");
   const restores = [];
@@ -297,6 +297,7 @@ test("watchDraft reacts to draft transitions and stops on unsubscribe", () => {
     ctx: {},
     conversation: {},
     nextIndex: () => 1,
+    inbox: createPasteInbox(),
     onRestore: () => restores.push(true),
   });
   const run = "x".repeat(5000);
@@ -309,7 +310,7 @@ test("watchDraft reacts to draft transitions and stops on unsubscribe", () => {
 });
 
 test("watchDraft removes the text only after the upload reports ready", async () => {
-  const { watchDraft, createSessionStore } = loadBundle().exports.__internals;
+  const { watchDraft, createSessionStore, createPasteInbox } = loadBundle().exports.__internals;
   const foldStore = createSessionStore();
   const draftStore = createDraftStore("keep me");
   let ready = false;
@@ -328,9 +329,9 @@ test("watchDraft removes the text only after the upload reports ready", async ()
     shell: { state: draftStore, addAttachments: () => true, setDraft: (text) => draftStore.setDraft(text) },
     foldStore,
     sessionId: "sess-1",
-    ctx: {},
     conversation,
     nextIndex: () => 1,
+    inbox: createPasteInbox(),
     onRestore: () => restores.push(true),
   });
   draftStore.setDraft("keep me" + "y".repeat(50000));
@@ -341,13 +342,13 @@ test("watchDraft removes the text only after the upload reports ready", async ()
   );
   ready = true;
   for (const fn of listeners) fn();
-  assert.equal(draftStore.getSnapshot().draft, "keep me", "ready must take the spilled text out");
+  assert.equal(draftStore.getSnapshot().draft, "keep me", "ready must take only the spilled text out");
   assert.deepEqual(restores, [true]);
   stop();
 });
 
 test("watchDraft keeps the text inline when the upload fails", async () => {
-  const { watchDraft, createSessionStore } = loadBundle().exports.__internals;
+  const { watchDraft, createSessionStore, createPasteInbox } = loadBundle().exports.__internals;
   const foldStore = createSessionStore();
   const draftStore = createDraftStore("");
   const listeners = [];
@@ -374,6 +375,7 @@ test("watchDraft keeps the text inline when the upload fails", async () => {
     ctx: {},
     conversation,
     nextIndex: () => 1,
+    inbox: createPasteInbox(),
     onRestore: () => restores.push(true),
   });
   const text = "z".repeat(50000);
@@ -416,6 +418,91 @@ test("reactToDraft still uploads when the upload settled before we subscribed", 
   assert.equal(outcome, "file");
   assert.equal(calls.addAttachments, 1);
   assert.equal(ready, 1, "an already-ready upload must still report success");
+});
+
+test("the paste inbox keeps only the newest paste and expires stale ones", () => {
+  const { createPasteInbox } = loadBundle().exports.__internals;
+  const inbox = createPasteInbox();
+  assert.equal(inbox.take(), null, "an empty inbox yields nothing");
+  inbox.record("first");
+  inbox.record("first and then a longer second"); 
+  const got = inbox.take();
+  assert.equal(got.text, "first and then a longer second", "the newest paste wins");
+  assert.equal(inbox.take(), null, "taking consumes the entry");
+  // An entry older than the limit must not be blamed for an unrelated later edit.
+  inbox.record("stale");
+  const t = Date.now();
+  assert.equal(inbox.take(-1), null, "an expired entry is discarded");
+  assert.ok(Date.now() - t < 1000);
+});
+
+test("measurableText prefers the recorded paste over the unreliable diff", () => {
+  const { measurableText } = loadBundle().exports.__internals;
+  // The blind spot this pins down: the diff reports the NET change, so when the
+  // pasted text is nearly identical to what it replaced it reports almost
+  // nothing -- even though tens of thousands of bytes just arrived. Here the two
+  // drafts differ by one word, so the diff sees a handful of bytes for a
+  // 40,000-byte paste.
+  const base = '{"readings":{"backward":{"1m":"https://fms"';
+  const before = base + '"telemetry":true' + "z".repeat(40000);
+  const after = base + '"status":true' + "z".repeat(40000);
+  // emulate the prefix/suffix trim
+  let head = 0;
+  while (head < Math.min(before.length, after.length) && before[head] === after[head]) head += 1;
+  let tail = 0;
+  while (before[before.length - 1 - tail] === after[after.length - 1 - tail]) tail += 1;
+  const run = after.slice(head, after.length - tail);
+  assert.ok(
+    run.length <= 8,
+    `the raw diff under-reports a near-identical replacement (got ${run.length})`,
+  );
+  const recorded = { text: after, bytes: 40000, at: Date.now() };
+  assert.equal(
+    measurableText({ recorded, run }),
+    after,
+    "the recorded clipboard text must win so the spill threshold is judged on the real paste",
+  );
+  assert.equal(measurableText({ recorded: null, run }), run, "the diff is still the fallback");
+});
+
+test("a recorded paste still spills even when the diff under-reports it", () => {
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
+  const shared = '{"readings":{"backward":{"1m":"https://fms"';
+  const before = shared + '"telemetry":true}}}';
+  const pasted = shared + '"status":true}}}' + "z".repeat(50000);
+  const run = "z".repeat(3); // what a naive prefix/suffix trim would guess
+  const calls = { added: 0 };
+  const conversation = {
+    createDrafts() { return [{ id: "draft-1", kind: "file" }]; },
+    releaseDraftAttachments() {},
+    releaseDraftAttachment() {},
+    fileUploads: { subscribe: () => () => {}, getSnapshot: () => ({ "draft-1": { status: "uploading" } }) },
+  };
+  const outcome = reactToDraft({
+    previous: before,
+    current: pasted,
+    run,
+    recorded: { text: pasted, bytes: 50000, at: Date.now() },
+    sessionId: "sess-1",
+    conversation,
+    shell: { addAttachments() { calls.added += 1; return true; } },
+    foldStore: createSessionStore(),
+  });
+  assert.equal(outcome, "file", "the real paste size decides, not the diff");
+  assert.equal(calls.added, 1);
+});
+
+test("removePastedText takes out only the paste, preserving surrounding text", () => {
+  const { removePastedText } = loadBundle().exports.__internals;
+  const big = "y".repeat(50000);
+  // append after existing text
+  assert.equal(removePastedText("keep me" + big, big, "keep me"), "keep me");
+  // a replacement of similar text must not wipe the whole draft
+  const before = '{"a":"telemetry","end":1}';
+  const after = '{"a":"status","end":1}';
+  assert.equal(removePastedText(after, after, before), "", "a full replacement removes the whole draft");
+  // pasted text not present at all (editor normalized it) falls back to empty
+  assert.equal(removePastedText("something else", "\u0000absent", "x"), "");
 });
 
 test("a folded run is always a substring of the draft it was diffed from", () => {
