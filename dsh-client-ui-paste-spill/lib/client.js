@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "paste-source-1";
+    const BUILD_REV = "measure-2";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -210,12 +210,25 @@ window.__ModuleLoader__.load({
      * resolves the replacement case correctly too, since there the pasted text is
      * what now sits at that boundary.
      *
+     * A match that equals the whole draft is refused: that only happens when the
+     * caller measured the draft itself rather than the pasted run, and honoring it
+     * would delete unrelated text. Refusing degrades to "leave the text inline
+     * next to the attachment", which is harmless, whereas deleting is not.
+     *
      * @returns the draft with the paste taken out.
      */
     function removePastedText(current, candidate, previous) {
       if (typeof current !== "string") return "";
       if (typeof candidate !== "string" || candidate === "") return "";
       const before = typeof previous === "string" ? previous : "";
+      // Refuse the append-under-a-whole-draft-measurement signature: the candidate
+      // spans the entire draft while the pre-existing text is still its prefix,
+      // which means the caller measured the draft instead of the pasted run and
+      // honoring it would delete the user's own text. Note the two legitimate
+      // whole-draft cases -- pasting into an empty draft, and replacing the whole
+      // draft -- do not match this signature (no pre-existing prefix), so they
+      // still clear correctly.
+      if (candidate === current && before.length > 0 && current.startsWith(before)) return current;
       let diverge = 0;
       const max = Math.min(before.length, current.length);
       while (diverge < max && before[diverge] === current[diverge]) diverge += 1;
@@ -281,10 +294,30 @@ window.__ModuleLoader__.load({
      * fallback for insertions we did not observe (typing, IME, drag-drop), where
      * prefix/suffix trimming is a sound way to isolate the new run.
      *
+     * The diff has one documented blind spot beyond replacements: trimming can
+     * consume up to `previous.length` at each end, so when the composer already
+     * held a lot of text a genuinely huge insertion can still trim down to less
+     * than the spill threshold (`run.length >= current.length - 2 * previous.length`).
+     * That is caught here by measuring the whole draft whenever a single
+     * transition grew it by at least a spill — no keystroke can insert 50,000
+     * bytes at once, so such a jump is always a paste, and the whole draft is
+     * certain to be present and at least that large.
+     *
      * @returns the text to measure, or null when nothing was inserted.
      */
-    function measurableText({ recorded, run }) {
+    function measurableText({ recorded, run, previous, current }) {
       if (recorded !== null && recorded !== undefined) return recorded.text;
+      if (
+        typeof current === "string" &&
+        // Cheap pre-checks: every code unit encodes to at least one byte, so a
+        // short string cannot reach the threshold, and an already-threshold-sized
+        // diff needs no second opinion. Keeps the encoding work off the hot path.
+        current.length >= SPILL_BYTES &&
+        (run === null || run.length < SPILL_BYTES) &&
+        typeof previous === "string"
+      ) {
+        if (utf8Bytes(current) - utf8Bytes(previous) >= SPILL_BYTES) return current;
+      }
       return run;
     }
 
@@ -373,7 +406,14 @@ window.__ModuleLoader__.load({
         const beforePaste = previous;
         const run = insertedRun(beforePaste, current);
         const recorded = inbox.take();
-        const candidate = measurableText({ recorded, run });
+        const candidate = measurableText({ recorded, run, previous: beforePaste, current });
+        // What may later be REMOVED from the draft is not the same thing as what
+        // was MEASURED. The whole-draft backstop inside measurableText is a sound
+        // size estimate but a terrible excision target: it equals `current`, so
+        // removing it would delete the user's pre-existing text along with the
+        // paste. Removal targets the recorded paste, or the located diff run,
+        // both of which are genuine substrings of what is in the editor.
+        const removable = recorded === null || recorded === undefined ? run : recorded.text;
         const decision = reactToDraft({
           previous: beforePaste,
           current,
@@ -391,7 +431,7 @@ window.__ModuleLoader__.load({
               // Remove just the pasted text: a spill can equally have been an
               // append or a replacement, and clearing the whole draft would
               // discard unrelated text in the append case.
-              const cleaned = removePastedText(current, candidate, beforePaste);
+              const cleaned = removePastedText(current, removable, beforePaste);
               previous = cleaned;
               shell.setDraft(cleaned);
               // Our own write publishes a new revision; absorb it so the next
@@ -553,33 +593,47 @@ window.__ModuleLoader__.load({
           return target instanceof Element && target.closest(COMPOSER_SELECTOR) !== null;
         };
         // Both sources are observed because either alone can miss:
-        //   * `beforeinput` is the only one that also covers insertFromPaste's
-        //     siblings and fires before the insertion, but its DataTransfer is
-        //     not guaranteed to be populated for a paste in every engine.
-        //   * `paste` carries clipboardData reliably, but was observed never to
-        //     reach this listener in-app at all.
+        //   * `beforeinput` fires before the insertion and also covers
+        //     insertFromPaste's siblings, but its DataTransfer is not guaranteed
+        //     to be populated for a paste in every engine.
+        //   * `paste` carries clipboardData reliably, but was never observed to
+        //     produce a usable measurement in-app.
         // Whichever arrives first wins; the inbox keeps only the newest.
+        //
+        // Delivery is recorded BEFORE any filtering, because "the event never
+        // arrived" and "the event arrived but our guard rejected its target" look
+        // identical in a diagnostic that is only written past the guard — and
+        // telling those two apart is exactly what went wrong last time.
         const onBeforeInput = (event) => {
           try {
-            if (!inComposer(event)) return;
-            if (event.inputType === undefined || PASTE_INPUT_TYPES[event.inputType] !== true) return;
-            const transfer = event.dataTransfer;
-            if (transfer === null || transfer === undefined) return;
-            inbox.record(transfer.getData("text/plain"), "beforeinput");
+            if (event.inputType !== undefined && PASTE_INPUT_TYPES[event.inputType] === true) {
+              diag({ lastBeforeInputPasteAt: Date.now() });
+              if (!inComposer(event)) diag({ beforeInputPasteTargetRejected: true });
+              else {
+                const transfer = event.dataTransfer;
+                if (transfer === null || transfer === undefined) diag({ beforeInputPasteNoData: true });
+                else inbox.record(transfer.getData("text/plain"), "beforeinput");
+              }
+            }
           } catch {
             /* observing must never disturb the editor */
           }
         };
         const onPaste = (event) => {
           try {
-            if (!inComposer(event)) return;
+            diag({ lastPasteEventAt: Date.now() });
             const clipboard = event.clipboardData;
-            if (clipboard === null || clipboard === undefined) return;
-            // A real file on the clipboard is stock's business, not ours.
-            for (let i = 0; i < clipboard.items.length; i += 1) {
-              if (clipboard.items[i].kind === "file") return;
+            if (!inComposer(event)) diag({ pasteTargetRejected: true });
+            else if (clipboard === null || clipboard === undefined) diag({ pasteEventNoData: true });
+            else {
+              // A real file on the clipboard is stock's business, not ours.
+              let hasFile = false;
+              for (let i = 0; i < clipboard.items.length; i += 1) {
+                if (clipboard.items[i].kind === "file") hasFile = true;
+              }
+              if (hasFile) diag({ pasteWasFile: true });
+              else inbox.record(clipboard.getData("text/plain"), "paste");
             }
-            inbox.record(clipboard.getData("text/plain"), "paste");
           } catch {
             /* observing must never disturb the editor */
           }

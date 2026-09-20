@@ -420,6 +420,41 @@ test("reactToDraft still uploads when the upload settled before we subscribed", 
   assert.equal(ready, 1, "an already-ready upload must still report success");
 });
 
+test("measurableText backstops a huge insertion the trim under-reports", () => {
+  const { measurableText } = loadBundle().exports.__internals;
+  // Trimming consumes up to previous.length at each end, so a big draft plus a
+  // bigger paste can trim to a run below the threshold even for a pure append.
+  const previous = "p".repeat(40000);
+  const current = previous + "q".repeat(60000);
+  const run = "q".repeat(1); // trimming can reduce the residue to nearly nothing
+  assert.ok(run.length < 50000);
+  const out = measurableText({ recorded: null, run, previous, current });
+  assert.equal(out, current, "a single >=spill jump must be measured on the whole draft");
+  // A modest growth is still judged by the diff, not by the whole draft.
+  const small = measurableText({ recorded: null, run: "hello", previous: "x", current: "xhello" });
+  assert.equal(small, "hello", "ordinary edits keep using the trimmed diff");
+});
+
+test("removePastedText refuses a whole-draft candidate that has a pre-existing prefix", () => {
+  const { removePastedText } = loadBundle().exports.__internals;
+  // The data-loss trap: the size backstop may measure the WHOLE draft. Passing
+  // that as the excision target for an append would delete the user's own text.
+  const before = "p".repeat(40000);
+  const current = before + "q".repeat(60000);
+  assert.equal(
+    removePastedText(current, current, before),
+    current,
+    "a whole-draft candidate with a pre-existing prefix must not excise anything",
+  );
+  // The two legitimate whole-draft cases still clear the composer.
+  assert.equal(removePastedText("a".repeat(60000), "a".repeat(60000), ""), "", "pasting into an empty draft clears it");
+  assert.equal(
+    removePastedText("b".repeat(60000), "b".repeat(60000), "a".repeat(5000)),
+    "",
+    "replacing the whole draft clears it",
+  );
+});
+
 test("the paste inbox keeps only the newest paste and expires stale ones", () => {
   const { createPasteInbox } = loadBundle().exports.__internals;
   const inbox = createPasteInbox();
