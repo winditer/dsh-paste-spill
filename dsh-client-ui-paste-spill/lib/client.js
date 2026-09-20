@@ -119,7 +119,174 @@ window.__ModuleLoader__.load({
       };
     }
 
-    exports.apply = function apply() {};
+    /** Synthesize the File a spill paste becomes. */
+    function spillFile(text, index) {
+      return new File([text], pasteFileName(text, index), { type: "text/plain" });
+    }
+
+    /**
+     * Start an upload for one synthesized paste file and watch it settle.
+     * A file that never reaches `ready` leaves the submission stuck, so an
+     * `error` restores the original text into the composer rather than losing it.
+     *
+     * @returns true when the attachment was admitted, false when the composer
+     *   refused it (busy submit plane), in which case the caller keeps the text
+     *   inline.
+     */
+    function uploadPaste({ conversation, sessionId, shell, text, index, onFailure }) {
+      const file = spillFile(text, index);
+      const drafts = conversation.createDrafts(sessionId, [file]);
+      if (shell.addAttachments(drafts.map((draft) => draft.id)) === false) {
+        conversation.releaseDraftAttachments(drafts);
+        return false;
+      }
+      let settled = false;
+      const stop = conversation.fileUploads.subscribe(() => {
+        if (settled) return;
+        const uploads = conversation.fileUploads.getSnapshot();
+        for (const draft of drafts) {
+          const status = uploads[draft.id];
+          if (status === undefined) continue;
+          if (status.status === "error") {
+            settled = true;
+            stop();
+            onFailure();
+            return;
+          }
+          if (status.status === "ready") {
+            settled = true;
+            stop();
+            return;
+          }
+        }
+      });
+      return true;
+    }
+
+    /**
+     * Testable core of the paste handler, with the DOM plumbing kept outside.
+     * @returns "inline" | "fold" | "file" — what the handler decided to do.
+     */
+    function handlePasteEvent({ text, sessionId, conversation, shell, foldStore, preventDefault, index = 1 }) {
+      const verdict = decidePaste(text);
+      if (verdict.action === "inline") return "inline";
+      if (verdict.action === "fold") {
+        if (sessionId !== undefined) {
+          foldStore.set(sessionId, { bytes: verdict.bytes, lines: countLines(text), text });
+        }
+        return "fold";
+      }
+      if (sessionId === undefined || conversation === undefined || conversation === null || shell === undefined || shell === null) {
+        return "inline";
+      }
+      let started;
+      try {
+        started = uploadPaste({
+          conversation,
+          sessionId,
+          shell,
+          text,
+          index,
+          onFailure: () => {
+            try {
+              shell.paste(text);
+            } catch {
+              /* restoring is best-effort; the failed attachment chip stays visible */
+            }
+          },
+        });
+      } catch {
+        return "inline";
+      }
+      if (started === false) return "inline";
+      preventDefault();
+      return "file";
+    }
+
+    /**
+     * The DOM-facing paste handler. Capture phase so it runs before the editor's
+     * PASTE_COMMAND and can suppress the default insertion.
+     */
+    function onDocumentPaste(event, ctx, foldStore, nextIndex) {
+      if (event.defaultPrevented) return;
+      const target = event.target;
+      if (typeof Element !== "undefined" && target instanceof Element) {
+        if (target.closest(COMPOSER_SELECTOR) === null) return;
+      } else {
+        return;
+      }
+      const clipboard = event.clipboardData;
+      if (clipboard === null || clipboard === undefined) return;
+      // A real file on the clipboard is stock's business, not ours.
+      const items = [];
+      for (let i = 0; i < clipboard.items.length; i += 1) items.push(clipboard.items[i]);
+      if (items.some((item) => item.kind === "file")) return;
+      const text = clipboard.getData("text/plain");
+      if (typeof text !== "string" || text === "") return;
+      const sessionId = ctx.sessions.list.getSnapshot().current;
+      let shell;
+      if (sessionId !== undefined) {
+        try {
+          shell = ctx.conversation.input.shell(sessionId);
+        } catch {
+          shell = undefined;
+        }
+      }
+      handlePasteEvent({
+        text,
+        sessionId,
+        conversation: ctx.conversation,
+        shell,
+        foldStore,
+        index: nextIndex(),
+        preventDefault: () => event.preventDefault(),
+      });
+    }
+
+    /** Replaced by the real card in the next task. */
+    function PasteFoldCard() {
+      return null;
+    }
+
+    /**
+     * @param ctx - client plugin context.
+     */
+    exports.apply = function apply(ctx) {
+      const foldStore = createSessionStore();
+      let counter = 0;
+      const nextIndex = () => {
+        counter += 1;
+        return counter;
+      };
+
+      if (ctx.locale !== undefined) {
+        ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-paste-spill: dictionaries");
+      }
+
+      // Capture phase: runs before the editor's PASTE_COMMAND handler, which is
+      // what makes preventDefault() able to suppress the default insertion.
+      ctx.effect(() => {
+        const listener = (event) => onDocumentPaste(event, ctx, foldStore, nextIndex);
+        document.addEventListener("paste", listener, { capture: true });
+        return () => document.removeEventListener("paste", listener, { capture: true });
+      }, "dsh-paste-spill: paste listener");
+
+      ctx.slots.inject("conversation.composer.dock", () =>
+        ctx.slots.register(
+          {
+            name: "conversation.composer.dock",
+            id: "paste-spill",
+            order: 0,
+            locale: NS,
+            inject: (sessionId) => ({
+              sessionId,
+              hooks: { pasteFold: foldStore },
+            }),
+          },
+          PasteFoldCard,
+        ),
+      );
+    };
     exports.inject = ["slots", "conversation", "sessions", "locale"];
     exports.__internals = {
       FOLD_BYTES,
@@ -131,6 +298,10 @@ window.__ModuleLoader__.load({
       pasteFileName,
       keepFoldFor,
       createSessionStore,
+      spillFile,
+      uploadPaste,
+      handlePasteEvent,
+      onDocumentPaste,
     };
     return module.exports;
   },

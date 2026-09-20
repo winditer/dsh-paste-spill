@@ -110,3 +110,145 @@ test("createSessionStore notifies subscribers and clears per session", () => {
   store.set("sess-2", { bytes: 1, lines: 1, text: "y" });
   assert.equal(notifications, 2);
 });
+test("spillFile builds a plain-text File with the synthesized name", () => {
+  const { spillFile } = loadBundle().exports.__internals;
+  const file = spillFile("a".repeat(50000), 7);
+  assert.equal(file.name, "pasted-text-7.txt");
+  assert.equal(file.type, "text/plain");
+  assert.equal(file.size, 50000);
+});
+
+test("handlePasteEvent leaves small pastes alone", () => {
+  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
+  let prevented = false;
+  const outcome = handlePasteEvent({
+    text: "just a short note",
+    sessionId: "sess-1",
+    conversation: {},
+    shell: {},
+    foldStore: createSessionStore(),
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(outcome, "inline");
+  assert.equal(prevented, false);
+});
+
+test("handlePasteEvent records fold state and does not prevent the default", () => {
+  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  let prevented = false;
+  const text = "x".repeat(5000);
+  const outcome = handlePasteEvent({
+    text,
+    sessionId: "sess-1",
+    conversation: {},
+    shell: {},
+    foldStore,
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(outcome, "fold");
+  assert.equal(prevented, false, "fold layer must never swallow the paste");
+  assert.deepEqual(foldStore.getSnapshot()["sess-1"], { bytes: 5000, lines: 1, text });
+});
+
+test("handlePasteEvent uploads a large paste and prevents the default", () => {
+  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
+  const calls = { drafts: [], added: [], released: [], uploadListeners: 0 };
+  const conversation = {
+    createDrafts(sessionId, files) {
+      calls.drafts.push({ sessionId, name: files[0].name });
+      return [{ id: "draft-1", kind: "file" }];
+    },
+    releaseDraftAttachments(descriptors) {
+      calls.released.push(descriptors.map((d) => d.id));
+    },
+    fileUploads: {
+      subscribe() { calls.uploadListeners += 1; return () => {}; },
+      getSnapshot() { return { "draft-1": { status: "uploading" } }; },
+    },
+  };
+  const shell = { addAttachments(ids) { calls.added.push(ids); return true; } };
+  let prevented = false;
+  const outcome = handlePasteEvent({
+    text: "y".repeat(50000),
+    sessionId: "sess-1",
+    conversation,
+    shell,
+    foldStore: createSessionStore(),
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(outcome, "file");
+  assert.equal(prevented, true);
+  assert.deepEqual(calls.drafts, [{ sessionId: "sess-1", name: "pasted-text-1.txt" }]);
+  assert.deepEqual(calls.added, [["draft-1"]]);
+  assert.equal(calls.uploadListeners, 1);
+});
+
+test("handlePasteEvent falls back to inline when the composer refuses the attachment", () => {
+  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
+  const calls = { released: [] };
+  const conversation = {
+    createDrafts() { return [{ id: "draft-1", kind: "file" }]; },
+    releaseDraftAttachments(descriptors) { calls.released.push(descriptors.map((d) => d.id)); },
+    fileUploads: { subscribe: () => () => {}, getSnapshot: () => ({}) },
+  };
+  const shell = { addAttachments: () => false };
+  let prevented = false;
+  const outcome = handlePasteEvent({
+    text: "y".repeat(50000),
+    sessionId: "sess-1",
+    conversation,
+    shell,
+    foldStore: createSessionStore(),
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(outcome, "inline");
+  assert.equal(prevented, false, "a refused attachment must leave the text in the editor");
+  assert.deepEqual(calls.released, [["draft-1"]]);
+});
+
+test("handlePasteEvent falls back to inline when the session has no shell", () => {
+  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
+  let prevented = false;
+  const outcome = handlePasteEvent({
+    text: "y".repeat(50000),
+    sessionId: undefined,
+    conversation: { createDrafts() { throw new Error("should not be called"); } },
+    shell: undefined,
+    foldStore: createSessionStore(),
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(outcome, "inline");
+  assert.equal(prevented, false);
+});
+
+test("handlePasteEvent restores the text when the upload reports an error", () => {
+  const { handlePasteEvent, createSessionStore } = loadBundle().exports.__internals;
+  let listener = null;
+  const conversation = {
+    createDrafts() { return [{ id: "draft-1", kind: "file" }]; },
+    releaseDraftAttachments() {},
+    fileUploads: {
+      subscribe(fn) { listener = fn; return () => { listener = null; }; },
+      getSnapshot() { return { "draft-1": { status: "error", message: "boom" } }; },
+    },
+  };
+  const restored = [];
+  const shell = {
+    addAttachments: () => true,
+    paste(text) { restored.push(text); },
+  };
+  const outcome = handlePasteEvent({
+    text: "z".repeat(50000),
+    sessionId: "sess-1",
+    conversation,
+    shell,
+    foldStore: createSessionStore(),
+    preventDefault: () => {},
+  });
+  assert.equal(outcome, "file");
+  assert.equal(typeof listener, "function");
+  listener();
+  assert.equal(restored.length, 1);
+  assert.equal(restored[0], "z".repeat(50000));
+});
