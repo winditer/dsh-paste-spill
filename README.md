@@ -41,9 +41,25 @@ DSH 的**入站**大文本粘贴处理：`dsh-spill` 管的是工具输出（出
 ./scripts/install-into-profile.sh
 ```
 
-脚本会把两个包软链进 `~/.dsh/profiles/desktop/node_modules/` 并把包名加进该 profile 的 `dsh.profile.bundles`。profile 的 `patchReload: "live"` 会让改动即时生效；若 GUI 未自动拾取，刷新页面。
+脚本会把两个包软链进 `~/.dsh/profiles/desktop/node_modules/` 并把包名加进该 profile 的 `dsh.profile.bundles`。
 
-> 为什么必须在沙箱外：agent 的文件沙箱是 `workspace-write`，只能写本仓库，写不了 `~/.dsh/profiles/desktop/`。
+**装完需要重启 DSH 应用**（不是刷新页面）。原因：profile 的 `patchReload: "live"` 只让**补丁文件**热重载；`dsh.profile.bundles` 是在**启动时**一次性合成的（`dsh-app-boot/lib/index.js:240` 的 `bundlePatches` 只算一次，live 重合成复用内存里的 `composed.bundlePatches`，只重读补丁文件）。改 bundles 列表必须重启。
+
+重启后可用以下命令自检合成结果（不会启动服务）：
+
+```bash
+# 在临时 profile 里验证两个包能被正确合成
+mkdir -p /tmp/probe/node_modules && cd /tmp/probe
+printf '{"name":"p","private":true,"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","dsh-paste-spill","dsh-client-ui-paste-spill"],"patchReload":"live"}}}\n' > package.json
+printf '[]\n' > cordis.patch.yml
+ln -s <本仓库>/dsh-paste-spill node_modules/dsh-paste-spill
+ln -s <本仓库>/dsh-client-ui-paste-spill node_modules/dsh-client-ui-paste-spill
+DSH_HOME=/tmp DSH_HOME_DIR=/tmp node "/Applications/DSH Desktop.app/Contents/Resources/app/node_modules/@deepseek-ai/dsh/lib/bin.js" --profile probe --dump-config | grep -A 1 paste-spill
+```
+
+预期输出包含 `- id: paste-spill` / `name: dsh-paste-spill` 与 `- id: ui-paste-spill` / `name: dsh-client-ui-paste-spill` 两行。（`--profile desktop` 不能用来 dump：electron 应用独占管理该 profile。）
+
+> 为什么安装必须在沙箱外：agent 的文件沙箱是 `workspace-write`，只能写本仓库，写不了 `~/.dsh/profiles/desktop/`。
 
 ## 卸载
 
