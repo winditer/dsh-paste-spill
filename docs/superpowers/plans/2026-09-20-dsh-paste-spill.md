@@ -1814,3 +1814,27 @@ No "TBD", no "add appropriate error handling", no "similar to Task N". Every cod
 - `PASTE_NAME_PREFIX = "pasted-text-"` appears in the host helper (Task 1), the client bundle (Task 3), and the README (Task 6) — and Task 3's manifest comment names the host file it must stay in sync with.
 - `pasteCallId` is defined once (Task 1) and used only via `presentedPayload`; Task 2 asserts the exact `paste:0123456789ab` value, matching Task 1's test.
 - `exports.inject` is `["slots", "conversation", "sessions", "locale"]` in Task 3 and asserted in Task 3; `onDocumentPaste` uses `ctx.conversation` and `ctx.sessions`, and `apply` uses `ctx.locale` and `ctx.slots` — all declared.
+---
+
+## 执行记录（Task 7 完成后追加）
+
+### 已完成的验证
+
+| 项 | 证据 |
+|---|---|
+| 宿主纯逻辑 | `dsh-paste-spill`: `node --test` 15/15 |
+| 浏览器半（含阈值、上传、失败回补、卡片、hook 形状） | `dsh-client-ui-paste-spill`: `node --test` 22/22 |
+| 工厂包语法与纯净性 | `node --check lib/client.js` 通过；无顶层 `import`/`export` |
+| 装载行合成 | 临时 profile `--dump-config` 输出含 `- id: paste-spill` / `- id: ui-paste-spill` 两行 |
+| 两半与 profile 软链 | 两包的 `realpath` 指向本仓库；经软链 `import()` 与工厂加载均成功 |
+| 服务名正确性 | `sessionProjections`（`dsh-session-projection:52`）、`conversation`（`ui-conversation:2857`）、`slots`（`ui-renderer:995`）、`sessions`（`ui-session:314`）、`locale`（`ui-locale:1378`）逐一核对存在 |
+| CSS 变量 | 8 个 `--dsh-*` / `--dsw-*` 变量均在 stock CSS 中出现 |
+
+### 实现期发现并修掉的两个真 bug
+
+1. **hook 形状错误（严重）**。`inject()` 返回的 `hooks` 值会被渲染层包成 `observableHook` → `useSyncExternalStoreWithSelector`（`dsh-client-ui-renderer/lib/client.js:203-210`、`:341-347`）。原先把 `useDraft` 写成普通函数当 prop 传，导致：卡片**永远不订阅草稿**，文本清空后卡片不会消失；且 hook 调用形状与渲染层实际产出不符。已改为传 **store**（`{getSnapshot, subscribe}`），卡片内用选择器读取，并补了 2 个回归测试（断言 `face.hooks.*` 必须是 store）。
+2. **CSS 几何偏宽**. 折叠卡原用 `calc(100% - side-clearance*2)`，而 stock dock 卡（`ui-conversation` TodoPanel）还要再扣 4 个 `--dsh-composer-dock-inset`。已对齐，避免比同栏 stock 卡宽出一圈。
+
+### 未能在此环境完成的验证
+
+**真实 GUI 的 4 个端到端用例未执行**：GUI 需重启才能拾取新的 `dsh.profile.bundles`（`dsh-app-boot/lib/index.js:240` 的 `bundlePatches` 只在启动时算一次；`patchReload: "live"` 只热重载补丁文件，不重读 bundles 列表）。此项需用户重启后手动确认。
