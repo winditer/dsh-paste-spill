@@ -1,0 +1,90 @@
+{
+  "readings": {
+    "backward": [
+      {
+        "t": "2026-09-20T10:09:25Z",
+        "fms": "https://fms.example/e1b81b09119c24dec8f1c632",
+        "speed": 37.018,
+        "telemetry": true,
+        "note": "cpfctpqnoumyjgevcinjmqbnejzlzcpvwjjnvbchsbtipsmtxjzjqnfhtkyn"
+      },
+      {
+        "t": "2026-09-20T05:28:25Z",
+        "fms": "https://fms.example/cdcd697df3355ac5098cefbd",
+        "speed": 81.144,
+        "telemetry": true,
+        "note": "mxzspkknkf lcqcpozqbfkrzqmdn midutmsnfzjsyuircwnyjgonrqvufgk"
+      },
+      {
+        "t": "2026-09-20T07:12:33Z",
+        "fms": "https://fms.example/aafba4d7bf7f12a7afd0e7ec",
+        "speed": 14.388,
+        "telemetry": false,
+        "note": "vumeviv kkztedeyvdw rjoda rozlxwfghgphldyjmpylynooaleavemtpi"
+      },
+      {
+        "t": "2026-09-20T16:33:35Z",
+        "fms": "https://fms.example/abd140290d17fd46bbb5bdee",
+        "speed": 107.131,
+        "telemetry": true,
+        "note": "wddlbgbsvyetrdx fzkn welnjfitaolaiqnb v chbvhdlywgeypscbslbz"
+      },
+      {
+        "t": "2026-09-20T20:05:51Z",
+        "fms": "https://fms.example/5d4520f9ed0fef53edb49e5b",
+        "speed": 119.34,
+        "telemetry": true,
+        "note": "atofmzcwlnwkns jwtrkjbdbugecwxshghmemhz og ijakmnfnahckbaigp"
+      },
+      {
+        "t": "2026-09-20T16:54:48Z",
+        "fms": "https://fms.example/3dbdafa6d3cfb9fbeacb0fbf",
+        "speed": 114.729,
+        "telemetry": true,
+        "note": "cbrzkmbaoghmbzycoumvwgugrmwcyhbrfqirsqdnn cfnthmu oicmhcn  k"
+      },
+      {
+        "t": "2026-09-20T06:04:37Z",
+        "fms": "https://fms.example/1a57dd628ad83ee8f9827778",
+        "speed": 112.786,
+        "telemetry": true,
+        "note": "tyhkk pjlhbcwhzghnfkzxvryzotbtmurhbzdmjit hripkeefynfy mdfcj"
+      },
+      {
+        "t": "2026-09-20T02:20:15Z",
+        "fms": "https://fms.example/8b40d8a45aac7fbbc2d8e96b",
+        "speed": 116.165,
+        "telemetry": true,
+        "note": "atympakzwx gceosztrumobvgyridgrsdbopkgqaimzrxmggztianslgsyga"
+      },
+      {
+        "t": "2026-09-20T10:45:26Z",
+        "fms": "https://fms.example/7806c1a4a4a5d2dddae1de10",
+        "speed": 71.535,
+        "telemetry": false,
+        "note": "bbkyxt zifzuarkkieahjzd fjwwlbmkyfjyalvubabyguyjhzqhtihauyrz"
+      },
+      {
+        "t": "2026-09-20T00:52:14Z",
+        "fms": "https://fms.example/2fabbeb2a0e6f35cabdb838e",
+        "speed": 57.803,
+        "telemetry": false,
+        "note": "elcbqfl  edmygouuvhhhghlfghyfbggorcmaaxgmkxgbqwfcnequrartjbj"
+      },
+      {
+        "t": "2026-09-20T01:13:16Z",
+        "fms": "https://fms.example/0aebc88d10aa8be3be85fe91",
+        "speed": 89.441,
+        "telemetry": false,
+        "note": "lauvrkkzledcpjudbdvkpztejeebkuvviwbyiqrctsyrxqqfmpbzeje wfxw"
+      },
+      {
+        "t": "2026-09-20T21:02:42Z",
+        "fms": "https://fms.example/c2dcd69c9e990da5aba3a229",
+        "speed": 11.006,
+        "telemetry": false,
+        "note": "nrbdyitcuyrvabqscdxhvvstfwqgiqymg mpqgkfkrhikvhubx mosygoxtk"
+      }
+    ]
+  }
+}

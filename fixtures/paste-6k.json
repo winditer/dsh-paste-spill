@@ -1,0 +1,174 @@
+{
+  "readings": {
+    "backward": [
+      {
+        "t": "2026-09-20T12:23:36Z",
+        "fms": "https://fms.example/3715df6b6fdedaa46d981ad1",
+        "speed": 6.527,
+        "telemetry": false,
+        "note": "ioolidjweavtmbdrhv bwyqpqnneabafeycqrflnrrlqnbq tmoklycre hr"
+      },
+      {
+        "t": "2026-09-20T03:21:57Z",
+        "fms": "https://fms.example/afcf5c9bb5ef4d055aea7d75",
+        "speed": 108.908,
+        "telemetry": false,
+        "note": "moaazgxvkppeadqe sadrbbbxufzorxutkgfazyucurmdvrhjhjzbuyuqmhu"
+      },
+      {
+        "t": "2026-09-20T13:01:27Z",
+        "fms": "https://fms.example/b2a1cfcc69b6a172fcfdfbc3",
+        "speed": 97.829,
+        "telemetry": true,
+        "note": "ncrcvsvqjkkycxafhynkxgmouurjiewruelupdmxgfisweegioeif tczck "
+      },
+      {
+        "t": "2026-09-20T09:46:19Z",
+        "fms": "https://fms.example/94e24808bfbda3d8ad9ca95f",
+        "speed": 105.609,
+        "telemetry": true,
+        "note": "srmiqclvtqglmqlszervkn boevzocpotnrwolzfskud jbhkallsjhguzof"
+      },
+      {
+        "t": "2026-09-20T12:29:13Z",
+        "fms": "https://fms.example/3e1b4efb3ecb9faebab5fffe",
+        "speed": 57.788,
+        "telemetry": false,
+        "note": "jrinqcyeikcpizojprfbhqpxfmvfkoqs cyorinfcwsddlwmpnysgeqteisn"
+      },
+      {
+        "t": "2026-09-20T09:53:29Z",
+        "fms": "https://fms.example/89f1ed0dfe7fbad0fd7c8aba",
+        "speed": 25.287,
+        "telemetry": false,
+        "note": "jgbhjnj xjfndftd c kokpkcbwmubnokdssxcbrqerxlczaxditxeaappyn"
+      },
+      {
+        "t": "2026-09-20T16:02:52Z",
+        "fms": "https://fms.example/2bce908defa92e4300f2f1d2",
+        "speed": 2.133,
+        "telemetry": true,
+        "note": "muyjusduhpnsyybabxsqkiqzwqiztme dzevmvmhujhqrvqxtaewp gkkugm"
+      },
+      {
+        "t": "2026-09-20T22:00:20Z",
+        "fms": "https://fms.example/59cbd0cbdc6cbfe71cb4ae5d",
+        "speed": 81.319,
+        "telemetry": false,
+        "note": "tzpakoojbkohwinffcvhpjvxgynxkmciahqcfxppfyhcmqqdwj kaajtnwyx"
+      },
+      {
+        "t": "2026-09-20T20:25:59Z",
+        "fms": "https://fms.example/2f5cefe893ff4057ddc1bfef",
+        "speed": 6.692,
+        "telemetry": true,
+        "note": "iafuplrmkkkklvyymyvewcqkuvzzkac igdjitemylelgapivhcmnenrvypw"
+      },
+      {
+        "t": "2026-09-20T03:16:48Z",
+        "fms": "https://fms.example/48ffe26d1f6f0b730cb49e4c",
+        "speed": 16.569,
+        "telemetry": true,
+        "note": "ogeqwytuedsqfiasowynjhrzcludrgp aspxjz bjgwyvxpyhctmavdgcqei"
+      },
+      {
+        "t": "2026-09-20T17:52:01Z",
+        "fms": "https://fms.example/0ea5cea597236aca22db54ea",
+        "speed": 47.593,
+        "telemetry": true,
+        "note": "zklwokzujgjl vywwbnzzglrjoblnad uzrvxxarhshoyqgolzhirdqznhmo"
+      },
+      {
+        "t": "2026-09-20T04:28:07Z",
+        "fms": "https://fms.example/bdec6aa69f48c8d6ac074cf8",
+        "speed": 110.903,
+        "telemetry": true,
+        "note": "xgpnh huebxlbkltcgztejjsqwwntuumvtydxaupnzplvxqkmmthkokivwnl"
+      },
+      {
+        "t": "2026-09-20T05:34:19Z",
+        "fms": "https://fms.example/b985c7fd57fdf05d6b6d9cf9",
+        "speed": 55.71,
+        "telemetry": true,
+        "note": "qjzsockkppx nlq jowei wncysw xlehnnferqj rblvisaiwpsfnohro p"
+      },
+      {
+        "t": "2026-09-20T13:38:07Z",
+        "fms": "https://fms.example/3bb01eaa9befc3560dce14d0",
+        "speed": 26.406,
+        "telemetry": false,
+        "note": "pzlqgbzxiywiqznzgktfixnvgejf hpdokkbdwjgfhgarjetchwdlwvejtkz"
+      },
+      {
+        "t": "2026-09-20T06:19:30Z",
+        "fms": "https://fms.example/b592f5dc85d4d2bb5a8ec681",
+        "speed": 21.246,
+        "telemetry": true,
+        "note": "ircpjnibigdthkyuxxdhasrjlrsgwjqedyttbbefikbirewptglsjawuhbxq"
+      },
+      {
+        "t": "2026-09-20T01:15:43Z",
+        "fms": "https://fms.example/2b4ea1f8ac61e9efacd91f9b",
+        "speed": 111.376,
+        "telemetry": true,
+        "note": "nfzwpeevgh ejcrdsnntasdrsdtpgqdlzse wkfsanbyicizemphpbm nuit"
+      },
+      {
+        "t": "2026-09-20T08:06:41Z",
+        "fms": "https://fms.example/a94b0eedee5530bc64ece3bc",
+        "speed": 89.079,
+        "telemetry": false,
+        "note": "krjgdywgbcvy kbflt qqdgdrk wmfkaqwndbbtybazetkavspmonloqekqc"
+      },
+      {
+        "t": "2026-09-20T01:46:43Z",
+        "fms": "https://fms.example/7ec98e3dbdc4af3cce75954f",
+        "speed": 24.338,
+        "telemetry": true,
+        "note": "fwrfstgmostypwsvdnnwzqznmso fmckqkbbszmddyc fdtjjwvtaggnojnw"
+      },
+      {
+        "t": "2026-09-20T11:06:22Z",
+        "fms": "https://fms.example/cb2ee549cc202b4c6f83dbfb",
+        "speed": 113.852,
+        "telemetry": true,
+        "note": "a nnawcqrqw smgznjoidqfwtimzijnggxqrtdkb jppdsyycflpcvvgvdbz"
+      },
+      {
+        "t": "2026-09-20T10:47:23Z",
+        "fms": "https://fms.example/bd7c8177fa855720d99c6316",
+        "speed": 37.02,
+        "telemetry": false,
+        "note": "bfypijm stywieyouqgabmyhncgbdbbwptahraiaixanqvexvcqu kzxairi"
+      },
+      {
+        "t": "2026-09-20T13:39:45Z",
+        "fms": "https://fms.example/f7233a1b9bcced7a5fab6af9",
+        "speed": 33.392,
+        "telemetry": false,
+        "note": "damruj gucadbnoezjeetyeavg nrjvmiyctbrkxbplyzqgghlgfuri fpex"
+      },
+      {
+        "t": "2026-09-20T08:48:08Z",
+        "fms": "https://fms.example/c67ad3fd9cd4d7bc4df602f0",
+        "speed": 109.393,
+        "telemetry": true,
+        "note": "njumklrrkjypfqadqpstbybcz oagoro owzc x gbsah fbvzhibmhil uh"
+      },
+      {
+        "t": "2026-09-20T13:20:34Z",
+        "fms": "https://fms.example/9f8893f0de5d8542cbd1f7ec",
+        "speed": 37.874,
+        "telemetry": true,
+        "note": "mrmjokwvxjb hrwbvryuhwxjpp bujfejserezxryijxllskjroirhhmdrte"
+      },
+      {
+        "t": "2026-09-20T16:09:00Z",
+        "fms": "https://fms.example/e8b587804c13f675c2dc49bd",
+        "speed": 44.594,
+        "telemetry": true,
+        "note": "tkbu lqggwdq wpbfxcmklzrvcpzsl ebkduagfoyhikmcwpanwfmwfjxouw"
+      }
+    ]
+  }
+}
