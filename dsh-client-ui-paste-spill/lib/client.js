@@ -1001,7 +1001,7 @@ window.__ModuleLoader__.load({
           "border:.5px solid var(--dsw-alias-border-l1);border-radius:12px 12px 0 0;" +
           "background:var(--dsw-specific-tip);color:var(--dsw-alias-label-primary);" +
           "font-size:13px;line-height:20px;overflow:hidden}" +
-          ".dshps-fold-row{display:flex;align-items:center;gap:10px}" +
+
           ".dshps-fold-title{font-weight:500}" +
           ".dshps-fold-meta{color:var(--dsw-alias-label-tertiary)}" +
           ".dshps-fold-hint{margin-top:2px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}" +
