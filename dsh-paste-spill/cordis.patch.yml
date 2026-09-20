@@ -1,0 +1,7 @@
+# dsh-paste-spill bundle patch: one loader row per package half.
+# The row `name` is this package itself, so the loader imports this package's
+# host half. Semantics per dsh-app-boot applyEntryPatches: new rows use
+# `insert:`; `id` is the fiber/entry identifier.
+- insert:
+    - id: paste-spill
+      name: dsh-paste-spill

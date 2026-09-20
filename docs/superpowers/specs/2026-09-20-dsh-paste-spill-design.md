@@ -206,7 +206,7 @@ return {
 
 - `lib/index.js` = 宿主半的**占位**（与 `dsh-message-rail` / `dsh-ui-attachment` 同构：宿主半不做事，`lib/client.js` 承载 UI）。写 `export function apply() {}`。
 - `lib/client.js` = `window.__ModuleLoader__.load({ id, factory: (require) => {...} })` 工厂包，**纯 JS + `require("react")`，无 JSX/import**（浏览器半的既有约定）。
-- 构建：esbuild 打 `src/client.js` → `lib/client.js`（脚本模板取自 `dsh-temp-chat/scripts/build.mjs`，esbuild 0.24.2）。`src/client.js` 可以写 ESM + JSX，由 esbuild 转成工厂包。
+- **无构建步骤**（已更正）：本机没有 esbuild 或任何打包器。`lib/client.js` **既是源码也是产物**，手写为 `window.__ModuleLoader__` 工厂包 —— 与 `dsh-message-rail` 的发布形态一致。纯逻辑在工厂内实现，并挂在 `module.exports.__internals` 上供 `node --test` 直接断言，避免"源码/产物两份、逻辑漂移"。
 - `immediately: true` 让插件在启动时立即激活（与 `dsh-temp-chat` 一致），因为我们要在编辑器出现前就挂上 `paste` 监听。
 
 ---
@@ -466,12 +466,15 @@ SPEC 主张拆出 `dsh-paste-spill-policy` 承载阈值。但：
 
 ---
 
-## 12. 待验证的两件事（实现时确认）
+## 12. 已解决：上传失败的观测方式
 
-1. **上传失败的观测方式**。`ctx.conversation.createDrafts(sessionId, files)`（`:2972`）对非图片**立即**启动 `beginFileUpload`，返回的是草稿描述符 —— **上传的异步结果不在返回值里**。`fileUploads.upload` 的 remote 契约只返回 `{receiptId, file:{attachmentId, name, bytes}}`（`dsh-client-file-upload/lib/typert.remote-client.js:9-17`），失败面在 `ctx.conversation` 的 uploads 状态快照里（槽位注入面 `uploads` / `onRetryFile`，`ui-conversation:16082-16093`）。
-   - 若能在 dock 卡片（React 内，可拿到 `uploads`）里可靠观测失败 → 失败时把原文补回编辑器（"保留原始内联文本"）；
-   - **若无法可靠观测 → 采用保守降级**：转文件路径**始终保留内联原文**（即不 `preventDefault()`），代价是大文本双重占用一次上下文。宁可重复，不可丢失。
-2. **`document` 捕获阶段 `preventDefault()` 是否确实阻止 Lexical 的 `PASTE_COMMAND`**。Lexical 经 `registerCommand(PASTE_COMMAND, ...)` 处理 paste（`ui-conversation:15259`，命令表在 `:8567`）。标准 DOM 语义下捕获阶段的 `preventDefault()` 应阻止默认插入，但需在真实 GUI 跑一遍 §8 的端到端用例 1–3 确认。
+原设计把"如何观测上传失败"留作待验证项。**已核对源码，答案是可观测**：
+
+`ctx.conversation.fileUploads` 是公开的 snapshot store（`dsh-client-ui-conversation/lib/client.js:2842`），每个草稿附件条目从 `uploading` 迁移到 `ready`（带 `receiptId`、`file`）或 `error`（带 `message`）（`:3015-3061`），并有 `getSnapshot()` / `subscribe()`。
+
+因此**不需要**"始终保留内联原文"的保守降级：转文件层正常 `preventDefault()`，并订阅 `fileUploads`；仅在条目落到 `error` 时把原文补回编辑器（`shell.paste(text)`）。附件上传失败时 composer 本来就会显示带重试按钮的失败附件卡，内容不会丢失。
+
+**另一项（捕获阶段 `preventDefault()`）**：实现照 DOM 标准做捕获阶段监听并 `preventDefault()`；若发现 Lexical 仍插入文本，退回"不 preventDefault"的保守路线（代价：大文本双重表示）。此项需在真实 GUI 走一遍 §8 的端到端用例 1–3 确认。
 
 ### 12.1 其它已核对、无需再验的点
 
@@ -479,4 +482,10 @@ SPEC 主张拆出 `dsh-paste-spill-policy` 承载阈值。但：
 - session-scope 槽的 `inject(sessionId)` **会收到 sessionId**（`ui-conversation:16717` 的 `composer.bar` 即此形状）→ dock 卡片能在组件内定位会话；
 - `composer.dock` 是 `{kind:"list"}`，注册形状 `{name, id, order, locale}`（stock 先例 `ui-chat:8351-8356`，`id: "stats"`）；
 - `fileHostPath(ref)` 必须传**合法 durable ref**（`{attachmentId, name, bytes}`，且 `name === fileLeafName(name)`），否则抛 `INVALID_ATTACHMENT_REF`（`dsh-attachment-local:645-649`）→ 宿主侧应 try/catch 并跳过该文件；
-- `agent/inbox/inserted` 的 payload 是 `{ agent, message }`，`message.content` 里的 `file` 块形状为 `{type:"file", attachment:{attachmentId, name, bytes}}`。
+- `agent/inbox/inserted` 的 payload 是 `{ agent, message }`（`dsh-agent/lib/index.js:209-220` 的 `agentEvents` 会把 `agent` 融合进每个 payload），`message.content` 里的 `file` 块形状为 `{type:"file", attachment:{attachmentId, name, bytes}}`；
+- composer 的 contenteditable 宿主带 **`data-composer-input`** 属性（`ui-conversation:15155-15165` 的 `ComposerContentEditable`），这是判定"粘贴发生在输入框内"的可靠选择器。
+
+### 12.2 实现阶段新增的两条更正
+
+1. **无构建步骤**（见 §4.5）：本机没有 esbuild 或任何打包器，`lib/client.js` 手写为工厂包并直接发布，与 `dsh-message-rail` 一致。纯逻辑挂在 `__internals` 上供测试直接断言。
+2. **客户端的两个清单不同源**（见 §4.4）：`package.json` 的 `dsh.client.inject` 是**npm 包名**（加载顺序），而插件自身返回的 `inject` 是**cordis 服务名**（`["slots","conversation","sessions","locale"]`，授权 `ctx.<service>` 访问）。实测 `dsh-client-ui-conversation` 以 `super(ctx, "conversation")` 提供 `conversation`、`:2857`；`sessions` 经 `ctx.get("sessions")` 访问、`dsh-client-ui-session:3183`。
