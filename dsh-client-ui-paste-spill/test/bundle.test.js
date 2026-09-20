@@ -263,8 +263,8 @@ test("the dock card renders nothing without a fold record", () => {
   const { PasteFoldCard } = loadBundle().exports.__internals;
   const tree = PasteFoldCard({
     sessionId: "sess-1",
-    usePasteFold: () => ({}),
-    useDraft: () => "",
+    usePasteFold: (select) => select({}),
+    useDraft: (select) => select({ draft: "" }),
     t: (key) => key,
   });
   assert.equal(tree, null);
@@ -275,8 +275,8 @@ test("the dock card renders nothing once the draft no longer holds the text", ()
   const record = { bytes: 5000, lines: 2, text: "big pasted text" };
   const tree = PasteFoldCard({
     sessionId: "sess-1",
-    usePasteFold: () => ({ "sess-1": record }),
-    useDraft: () => "cleared",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useDraft: (select) => select({ draft: "cleared" }),
     t: (key) => key,
   });
   assert.equal(tree, null);
@@ -287,8 +287,8 @@ test("the dock card renders the fold metadata while the text is present", () => 
   const record = { bytes: 5000, lines: 2, text: "big pasted text" };
   const tree = PasteFoldCard({
     sessionId: "sess-1",
-    usePasteFold: () => ({ "sess-1": record }),
-    useDraft: () => "big pasted text and more",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useDraft: (select) => select({ draft: "big pasted text and more" }),
     t: (key, params) => `${key}:${JSON.stringify(params ?? {})}`,
   });
   // Collect leaf strings rather than matching the whole serialized tree: the
@@ -308,4 +308,75 @@ test("the dock card renders the fold metadata while the text is present", () => 
   assert.match(text, /"bytes":5000/);
   assert.match(text, /"lines":2/);
   assert.match(text, /foldHint/);
+});
+
+test("the dock entry exposes store-shaped hooks, not plain functions", () => {
+  const { apply } = loadBundle().exports;
+  const capture = { entry: null, component: null, effects: [] };
+  const stateStore = { getSnapshot: () => ({ draft: "hi" }), subscribe: () => () => {} };
+  const documentStub = {
+    addEventListener() {},
+    removeEventListener() {},
+    querySelector: () => null,
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = documentStub;
+  try {
+    const ctx = {
+      locale: { register: () => {} },
+      effect: (fn) => { capture.effects.push(fn); return () => {}; },
+      slots: {
+        inject: (_key, register) => register(),
+        register: (entry, component) => { capture.entry = entry; capture.component = component; },
+      },
+      conversation: { input: { shell: () => ({ state: stateStore }) } },
+    };
+    apply(ctx);
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  assert.equal(capture.entry.name, "conversation.composer.dock");
+  assert.equal(capture.entry.id, "paste-spill");
+  assert.equal(typeof capture.component, "function");
+
+  const face = capture.entry.inject("sess-1");
+  // The renderer wraps every `hooks` value in useSyncExternalStore, so each one
+  // MUST be a store. A plain function here silently never re-renders.
+  for (const [name, source] of Object.entries(face.hooks)) {
+    assert.equal(typeof source.subscribe, "function", `hook ${name} must expose subscribe`);
+    assert.equal(typeof source.getSnapshot, "function", `hook ${name} must expose getSnapshot`);
+  }
+  assert.deepEqual(Object.keys(face.hooks).sort(), ["draft", "pasteFold"]);
+  assert.equal(face.hooks.draft, stateStore, "the draft hook must be the shell's own state store");
+});
+
+test("the draft hook degrades to a harmless store when the session has no shell", () => {
+  const { apply } = loadBundle().exports;
+  let entry = null;
+  const documentStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = documentStub;
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: () => () => {},
+      slots: { inject: (_k, register) => register(), register: (e) => { entry = e; } },
+      conversation: { input: { shell: () => { throw new Error("no binding"); } } },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+  const face = entry.inject("sess-1");
+  assert.equal(typeof face.hooks.draft.getSnapshot, "function");
+  assert.equal(face.hooks.draft.getSnapshot(), undefined);
 });

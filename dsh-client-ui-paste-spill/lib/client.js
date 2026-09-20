@@ -82,6 +82,9 @@ window.__ModuleLoader__.load({
     /**
      * Tiny session-keyed store shared between the paste listener and the dock
      * card. Hand-rolled so the bundle depends on nothing but react.
+     *
+     * Shape matches dsh-client-store's snapshot store so the renderer can wrap it
+     * directly in useSyncExternalStoreWithSelector.
      */
     function createSessionStore() {
       let state = {};
@@ -117,6 +120,22 @@ window.__ModuleLoader__.load({
           publish();
         },
       };
+    }
+
+    /** A store that always reads as absent — used when the session has no shell. */
+    const ABSENT_STORE = {
+      getSnapshot: () => undefined,
+      subscribe: () => () => {},
+    };
+
+    /** Resolve the composer shell for one session, or null when it has no binding. */
+    function shellOf(ctx, sessionId) {
+      if (sessionId === undefined || sessionId === null) return null;
+      try {
+        return ctx.conversation.input.shell(sessionId) ?? null;
+      } catch {
+        return null;
+      }
     }
 
     /** Synthesize the File a spill paste becomes. */
@@ -247,11 +266,14 @@ window.__ModuleLoader__.load({
      * Dock card for the fold layer. It is a HINT, never a replacement: the full
      * text stays in the editor and is submitted verbatim, which is what keeps
      * slash-command and goal parsing identical to a plugin-free install.
+     *
+     * `usePasteFold` / `useDraft` arrive as SELECTOR hooks bound by the renderer
+     * (`observableHook` -> useSyncExternalStoreWithSelector), so both must be
+     * called with a selector and both hooks must be called on every render.
      */
     function PasteFoldCard({ sessionId, usePasteFold, useDraft, t }) {
-      const records = usePasteFold();
-      const record = records === undefined || records === null ? undefined : records[sessionId];
-      const draft = useDraft();
+      const record = usePasteFold((state) => (state === undefined || state === null ? undefined : state[sessionId]));
+      const draft = useDraft((state) => (state === undefined || state === null ? undefined : state.draft));
       if (!keepFoldFor(record, draft)) return null;
       const label = t === undefined ? (key) => key : t;
       return React.createElement(
@@ -323,20 +345,17 @@ window.__ModuleLoader__.load({
             order: 0,
             locale: NS,
             inject: (sessionId) => {
-              let shell = null;
-              if (sessionId !== undefined) {
-                try {
-                  shell = ctx.conversation.input.shell(sessionId);
-                } catch {
-                  shell = null;
-                }
-              }
+              const shell = shellOf(ctx, sessionId);
               return {
                 sessionId,
-                // The shell's `state` store carries the live draft; the card hides
-                // itself as soon as the pasted text leaves the editor.
-                useDraft: () => (shell === null ? "" : shell.state.getSnapshot().draft),
-                hooks: { pasteFold: foldStore },
+                hooks: {
+                  // Stores, NOT plain functions: the renderer wraps every hook
+                  // source in observableHook -> useSyncExternalStoreWithSelector.
+                  pasteFold: foldStore,
+                  // The shell's own state store carries the live draft, so the card
+                  // hides itself the moment the pasted text leaves the editor.
+                  draft: shell === null || shell.state === undefined ? ABSENT_STORE : shell.state,
+                },
               };
             },
           },
