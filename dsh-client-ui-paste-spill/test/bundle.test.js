@@ -14,7 +14,13 @@ function loadBundle() {
   run(fakeWindow);
   assert.ok(record, "bundle must register itself with window.__ModuleLoader__.load");
   const react = {
-    createElement: () => null,
+    // Build a serializable stand-in for a React element tree so node-side tests
+    // can assert on what the component renders without a DOM or react-dom.
+    createElement: (type, props, ...children) => ({
+      type: typeof type === "function" ? type.name || "Component" : type,
+      props: props ?? null,
+      children,
+    }),
     memo: (component) => component,
     useState: () => [undefined, () => {}],
     useEffect: () => {},
@@ -251,4 +257,55 @@ test("handlePasteEvent restores the text when the upload reports an error", () =
   listener();
   assert.equal(restored.length, 1);
   assert.equal(restored[0], "z".repeat(50000));
+});
+
+test("the dock card renders nothing without a fold record", () => {
+  const { PasteFoldCard } = loadBundle().exports.__internals;
+  const tree = PasteFoldCard({
+    sessionId: "sess-1",
+    usePasteFold: () => ({}),
+    useDraft: () => "",
+    t: (key) => key,
+  });
+  assert.equal(tree, null);
+});
+
+test("the dock card renders nothing once the draft no longer holds the text", () => {
+  const { PasteFoldCard } = loadBundle().exports.__internals;
+  const record = { bytes: 5000, lines: 2, text: "big pasted text" };
+  const tree = PasteFoldCard({
+    sessionId: "sess-1",
+    usePasteFold: () => ({ "sess-1": record }),
+    useDraft: () => "cleared",
+    t: (key) => key,
+  });
+  assert.equal(tree, null);
+});
+
+test("the dock card renders the fold metadata while the text is present", () => {
+  const { PasteFoldCard } = loadBundle().exports.__internals;
+  const record = { bytes: 5000, lines: 2, text: "big pasted text" };
+  const tree = PasteFoldCard({
+    sessionId: "sess-1",
+    usePasteFold: () => ({ "sess-1": record }),
+    useDraft: () => "big pasted text and more",
+    t: (key, params) => `${key}:${JSON.stringify(params ?? {})}`,
+  });
+  // Collect leaf strings rather than matching the whole serialized tree: the
+  // JSON form escapes the quotes inside the interpolated label arguments.
+  const leaves = [];
+  const walk = (node) => {
+    if (typeof node === "string") {
+      leaves.push(node);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    for (const child of node.children ?? []) walk(child);
+  };
+  walk(tree);
+  const text = leaves.join("|");
+  assert.match(text, /foldTitle/);
+  assert.match(text, /"bytes":5000/);
+  assert.match(text, /"lines":2/);
+  assert.match(text, /foldHint/);
 });

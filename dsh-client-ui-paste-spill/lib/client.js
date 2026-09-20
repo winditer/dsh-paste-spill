@@ -243,9 +243,35 @@ window.__ModuleLoader__.load({
       });
     }
 
-    /** Replaced by the real card in the next task. */
-    function PasteFoldCard() {
-      return null;
+    /**
+     * Dock card for the fold layer. It is a HINT, never a replacement: the full
+     * text stays in the editor and is submitted verbatim, which is what keeps
+     * slash-command and goal parsing identical to a plugin-free install.
+     */
+    function PasteFoldCard({ sessionId, usePasteFold, useDraft, t }) {
+      const records = usePasteFold();
+      const record = records === undefined || records === null ? undefined : records[sessionId];
+      const draft = useDraft();
+      if (!keepFoldFor(record, draft)) return null;
+      const label = t === undefined ? (key) => key : t;
+      return React.createElement(
+        "div",
+        {
+          className: "dshps-fold-card",
+          "data-paste-spill-fold": true,
+        },
+        React.createElement(
+          "div",
+          { className: "dshps-fold-row" },
+          React.createElement("span", { className: "dshps-fold-title" }, label("foldTitle")),
+          React.createElement(
+            "span",
+            { className: "dshps-fold-meta" },
+            label("foldMeta", { bytes: record.bytes, lines: record.lines }),
+          ),
+        ),
+        React.createElement("div", { className: "dshps-fold-hint" }, label("foldHint")),
+      );
     }
 
     /**
@@ -271,6 +297,24 @@ window.__ModuleLoader__.load({
         return () => document.removeEventListener("paste", listener, { capture: true });
       }, "dsh-paste-spill: paste listener");
 
+      ctx.effect(() => {
+        const selector = 'style[data-plugin-css="dsh-paste-spill"]';
+        if (document.querySelector(selector) !== null) return () => {};
+        const tag = document.createElement("style");
+        tag.dataset.plugin = "dsh-paste-spill";
+        tag.dataset.pluginCss = "dsh-paste-spill";
+        tag.textContent =
+          ".dshps-fold-card{box-sizing:border-box;width:calc(100% - var(--dsh-composer-side-clearance) - var(--dsh-composer-side-clearance));" +
+          "max-width:var(--dsh-composer-card-max-width);margin:0 auto;padding:6px 12px;border:.5px solid var(--dsw-alias-border-l1);" +
+          "border-radius:12px;background:var(--dsw-specific-tip);color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}" +
+          ".dshps-fold-row{display:flex;align-items:center;gap:10px}" +
+          ".dshps-fold-title{font-weight:500}" +
+          ".dshps-fold-meta{color:var(--dsw-alias-label-tertiary)}" +
+          ".dshps-fold-hint{margin-top:2px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}";
+        document.head.appendChild(tag);
+        return () => tag.remove();
+      }, "dsh-paste-spill: styles");
+
       ctx.slots.inject("conversation.composer.dock", () =>
         ctx.slots.register(
           {
@@ -278,10 +322,23 @@ window.__ModuleLoader__.load({
             id: "paste-spill",
             order: 0,
             locale: NS,
-            inject: (sessionId) => ({
-              sessionId,
-              hooks: { pasteFold: foldStore },
-            }),
+            inject: (sessionId) => {
+              let shell = null;
+              if (sessionId !== undefined) {
+                try {
+                  shell = ctx.conversation.input.shell(sessionId);
+                } catch {
+                  shell = null;
+                }
+              }
+              return {
+                sessionId,
+                // The shell's `state` store carries the live draft; the card hides
+                // itself as soon as the pasted text leaves the editor.
+                useDraft: () => (shell === null ? "" : shell.state.getSnapshot().draft),
+                hooks: { pasteFold: foldStore },
+              };
+            },
           },
           PasteFoldCard,
         ),
@@ -302,6 +359,7 @@ window.__ModuleLoader__.load({
       uploadPaste,
       handlePasteEvent,
       onDocumentPaste,
+      PasteFoldCard,
     };
     return module.exports;
   },
