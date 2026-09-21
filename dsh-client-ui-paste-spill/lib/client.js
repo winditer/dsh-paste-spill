@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "in-composer-fold-1";
+    const BUILD_REV = "in-composer-chip-1";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -61,19 +61,19 @@ window.__ModuleLoader__.load({
 
     const zh = {
       foldTitle: "已折叠大文本",
+      foldTitleExpanded: "已展开大文本",
       foldMeta: "{bytes} 字节 · {lines} 行",
-      // Shown while collapsed, when the editor is clamped. Says what the reader
-      // is looking at, since the visible lines are a truncated view.
-      foldHint: "输入框已折叠显示，点击展开全文 · 提交时按原样发送",
-      // Shown after expanding: the clamp is gone, so the promise is just about
-      // what gets submitted.
-      foldHintExpanded: "已展开全文，再次点击可折叠 · 提交时按原样发送",
+      // Tooltip on the chip, and the chip is the only place this is said now:
+      // the build that rendered a paragraph ABOVE the input box was rejected.
+      foldHint: "点击展开全文 · 提交时按原样发送",
+      foldHintExpanded: "点击折叠全文 · 提交时按原样发送",
     };
     const en = {
       foldTitle: "Large text folded",
+      foldTitleExpanded: "Large text expanded",
       foldMeta: "{bytes} bytes · {lines} lines",
-      foldHint: "Composer collapsed — click to expand · sent as-is",
-      foldHintExpanded: "Expanded — click again to collapse · sent as-is",
+      foldHint: "Click to expand · sent as-is",
+      foldHintExpanded: "Click to collapse · sent as-is",
     };
 
     /** UTF-8 byte length — the one measurement all thresholds use. */
@@ -182,6 +182,33 @@ window.__ModuleLoader__.load({
     const SCROLL_SELECTOR = "[data-input-scroll]";
 
     /**
+     * DOM attribute on the composer card while a fold chip is mounted. The chip
+     * itself lives in a floating layer (the overlay anchor is `height:0`), so it
+     * would otherwise paint over the attachments row and the editor; this
+     * attribute is what makes the card reserve a band for it instead.
+     *
+     * Keyed on the chip being present rather than on the collapsed state: the
+     * chip stays mounted while expanded (it is the "collapse again" affordance),
+     * so the reservation must stay too or the text would jump on every toggle.
+     */
+    const CHIP_ATTR = "data-dshps-chip";
+
+    /** Top offset of the chip inside the card, in px — mirrors the card's own
+     * stock `padding-top`. */
+    const CHIP_TOP_PX = 8;
+    /** Chip height in px, matching the stock attachment chips' visual weight. */
+    const CHIP_HEIGHT_PX = 32;
+    /** Gap between the chip and the content below it, in px. */
+    const CHIP_GAP_PX = 4;
+    /**
+     * Top padding the card must carry while the chip is mounted, in px. Summed
+     * from the parts rather than hard-coded so the chip can never drift into the
+     * attachments row: this is the one number that keeps a floating chip from
+     * overlapping in-flow content.
+     */
+    const CHIP_BAND_PX = CHIP_TOP_PX + CHIP_HEIGHT_PX + CHIP_GAP_PX;
+
+    /**
      * Apply or remove the collapsed attribute on ONE session's composer card.
      *
      * `[data-composer-card]` is marked by the stock InputBar on the element
@@ -192,13 +219,21 @@ window.__ModuleLoader__.load({
      *
      * Returns true when the card was found, so the caller can retry: the card can
      * legitimately be absent for a commit or two when a session is switching.
+     *
+     * @param collapsed - clamp the editor to the folded height.
+     * @param hasChip - reserve the chip band. Defaults to `collapsed`, which is
+     *   right for callers that have no separate expanded state; the real component
+     *   passes it explicitly, because the chip must keep its band while expanded.
      */
-    function applyFoldToCard(anchor, collapsed) {
+    function applyFoldToCard(anchor, collapsed, hasChip) {
       if (anchor === null || anchor === undefined) return false;
       const card = typeof anchor.closest === "function" ? anchor.closest("[data-composer-card]") : null;
       if (card === null) return false;
       if (collapsed) card.setAttribute(FOLD_ATTR, "");
       else card.removeAttribute(FOLD_ATTR);
+      const chip = hasChip === undefined ? collapsed === true : hasChip === true;
+      if (chip) card.setAttribute(CHIP_ATTR, "");
+      else card.removeAttribute(CHIP_ATTR);
       return true;
     }
 
@@ -642,70 +677,11 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Card for the fold layer, rendered in the composer dock directly ABOVE the
-     * input box. It is a HINT, never a replacement: the full text stays in the
-     * editor and is submitted verbatim, which is what keeps slash-command and goal
-     * parsing identical to a plugin-free install.
-     *
-     * It is also the toggle for the collapsed editor style. Collapsing is a
-     * presentational state on the composer card (see FOLD_ATTR); the text itself
-     * is never touched, so expanding/collapsing cannot change what is submitted.
-     *
-     * `usePasteFold` arrives as a SELECTOR hook bound by the renderer
-     * (`observableHook` -> useSyncExternalStoreWithSelector), so it must be called
-     * with a selector and it must be called on every render. It is the card's only
-     * data source: the watcher clears the record when the folded text leaves the
-     * draft, which is what hides the card.
-     */
-    function PasteFoldCard({ sessionId, usePasteFold, useFoldExpanded, setFoldExpanded, t }) {
-      const record = readSessionSlice(usePasteFold, sessionId);
-      const expanded = readSessionSlice(useFoldExpanded, sessionId);
-      if (!foldApplies(record)) return null;
-      const label = t === undefined ? (key) => key : t;
-      const open = expanded === true;
-      return React.createElement(
-        "div",
-        {
-          className: "dshps-fold-card",
-          "data-paste-spill-fold": true,
-        },
-        React.createElement(
-          "button",
-          {
-            type: "button",
-            className: "dshps-fold-row",
-            "data-paste-spill-toggle": open ? "expanded" : "collapsed",
-            "aria-expanded": open,
-            onClick: () => {
-              if (typeof setFoldExpanded === "function") setFoldExpanded(sessionId, !open);
-            },
-          },
-          React.createElement("span", { className: "dshps-fold-title" }, label("foldTitle")),
-          React.createElement(
-            "span",
-            { className: "dshps-fold-meta" },
-            label("foldMeta", { bytes: record.bytes, lines: record.lines }),
-          ),
-          React.createElement(
-            "span",
-            { className: "dshps-fold-chevron", "aria-hidden": true },
-            open ? "\u25BE" : "\u25B8",
-          ),
-        ),
-        React.createElement(
-          "div",
-          { className: "dshps-fold-hint" },
-          label(open ? "foldHintExpanded" : "foldHint"),
-        ),
-      );
-    }
-
-    /**
      * Read one session's slice out of a selector hook, tolerating an absent hook.
      *
      * A hook that is missing or not a function must NOT throw here: these
      * components render inside the composer, so an exception would take down the
-     * user's ability to type at all — a far worse failure than a missing card. A
+     * user's ability to type at all — a far worse failure than a missing chip. A
      * missing expanded-store hook therefore degrades to "not expanded" (the folded
      * view, which is the safe state), and a missing fold hook to "no record" (the
      * composer renders untouched).
@@ -717,29 +693,48 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Zero-size marker rendered INSIDE the composer card.
+     * Chip for the fold layer, rendered INSIDE the composer card, in a band of its
+     * own directly above the attachments row and the editor.
      *
-     * Registered on `conversation.input.overlay` (kind "list", scope "session"),
-     * which the stock InputBar renders inside `[data-composer-card]`, before the
-     * editor. That position is what makes this the honest fix for "collapse the
-     * input box": the marker reaches its own session's card with `closest()`,
-     * without querying the document (which would hit whichever composer happens
-     * to be first) and without modifying any stock file.
+     * It is a HINT, never a replacement: the full text stays in the editor and is
+     * submitted verbatim, which is what keeps slash-command and goal parsing
+     * identical to a plugin-free install.
      *
-     * It renders nothing: it only syncs one DOM attribute, which the stylesheet
-     * turns into the clamped, faded editor style.
+     * It is also the toggle for the collapsed editor style, and it does the
+     * clamping itself. Collapsing is a presentational state on the composer card
+     * (see FOLD_ATTR); the text itself is never touched, so expanding/collapsing
+     * cannot change what is submitted.
+     *
+     * Why ONE component for both jobs. The previous build split them: a card in
+     * `conversation.input.dock` and a marker in `conversation.input.overlay`. That
+     * dock slot renders as a SIBLING ABOVE [data-composer-card], so the card could
+     * only ever appear outside the input box — which is exactly what was rejected.
+     * `conversation.input.overlay` is the only slot that renders inside the card,
+     * so the visible affordance and the attribute both come from here.
+     *
+     * `usePasteFold` arrives as a SELECTOR hook bound by the renderer
+     * (`observableHook` -> useSyncExternalStoreWithSelector), so it must be called
+     * with a selector and it must be called on every render. It is the chip's only
+     * data source: the watcher clears the record when the folded text leaves the
+     * draft, which is what hides the chip.
      */
-    function FoldMarker({ sessionId, usePasteFold, useFoldExpanded, setFoldExpanded }) {
+    function PasteFoldChip({ sessionId, usePasteFold, useFoldExpanded, setFoldExpanded, t }) {
       const record = readSessionSlice(usePasteFold, sessionId);
       const expanded = readSessionSlice(useFoldExpanded, sessionId);
+      const present = foldApplies(record);
       const collapsed = foldCollapsed(record, expanded);
       const anchorRef = React.useRef(null);
-      // useLayoutEffect, not useEffect: the attribute must be on the card in the
+
+      // useLayoutEffect, not useEffect: the attributes must be on the card in the
       // same commit that reveals the fold, otherwise the first paint shows the
       // full 40k paste and then snaps shut.
+      //
+      // `present` (not `collapsed`) drives the band: the chip stays mounted while
+      // expanded — it is the "collapse again" affordance — so releasing the band on
+      // expand would drop the text up under a floating chip.
       React.useLayoutEffect(() => {
-        applyFoldToCard(anchorRef.current, collapsed);
-      }, [collapsed]);
+        applyFoldToCard(anchorRef.current, collapsed, present);
+      }, [collapsed, present]);
 
       // Expand when the user clicks the faded band at the bottom of the clamped
       // editor. Bound in the CAPTURE phase on the scroll container so the caret is
@@ -771,20 +766,63 @@ window.__ModuleLoader__.load({
         }
       }, [collapsed, sessionId, setFoldExpanded]);
       // Cleanup is separate so it also runs on unmount/teardown, when the session
-      // switches away: leaving the attribute behind would clamp the NEXT session's
-      // composer with nothing painted to explain it.
+      // switches away: leaving the attributes behind would clamp the NEXT session's
+      // composer with nothing painted to explain it, and a stale band would indent
+      // its content for a chip that is not there.
       React.useEffect(
         () => () => {
-          applyFoldToCard(anchorRef.current, false);
+          applyFoldToCard(anchorRef.current, false, false);
         },
         [],
       );
-      return React.createElement("div", {
-        ref: anchorRef,
-        className: "dshps-fold-anchor",
-        "data-paste-spill-anchor": true,
-        "aria-hidden": true,
-      });
+
+      const label = t === undefined ? (key) => key : t;
+      const open = expanded === true;
+      return React.createElement(
+        React.Fragment,
+        null,
+        // The zero-size locator. Always rendered, even with no record, because the
+        // effects above need a mounted node to reach the card from (and to clear
+        // the attributes from on teardown).
+        React.createElement("div", {
+          ref: anchorRef,
+          className: "dshps-fold-anchor",
+          "data-paste-spill-anchor": true,
+          "aria-hidden": true,
+        }),
+        present
+          ? React.createElement(
+              "button",
+              {
+                type: "button",
+                className: "dshps-chip",
+                "data-paste-spill-chip": true,
+                "data-paste-spill-toggle": open ? "expanded" : "collapsed",
+                "aria-expanded": open,
+                title: label(open ? "foldHintExpanded" : "foldHint"),
+                onClick: () => {
+                  if (typeof setFoldExpanded === "function") setFoldExpanded(sessionId, !open);
+                },
+              },
+              React.createElement(
+                "span",
+                { className: "dshps-chip-title" },
+                label(open ? "foldTitleExpanded" : "foldTitle"),
+              ),
+              React.createElement("span", { className: "dshps-chip-dot", "aria-hidden": true }, "\u00B7"),
+              React.createElement(
+                "span",
+                { className: "dshps-chip-meta" },
+                label("foldMeta", { bytes: record.bytes, lines: record.lines }),
+              ),
+              React.createElement(
+                "span",
+                { className: "dshps-chip-chevron", "aria-hidden": true },
+                open ? "\u25BE" : "\u25B8",
+              ),
+            )
+          : null,
+      );
     }
 
     /**
@@ -991,25 +1029,27 @@ window.__ModuleLoader__.load({
         tag.dataset.plugin = "dsh-paste-spill";
         tag.dataset.pluginCss = "dsh-paste-spill";
         tag.textContent =
-          // Geometry mirrors the stock QueueDock (the other shipped occupant of this
-          // same slot, ui-conversation QueueDock.module.css) so the card lines up
-          // with the row above the input bar instead of overflowing it.
-          ".dshps-fold-card{box-sizing:border-box;" +
-          "width:calc(100% - var(--dsh-composer-side-clearance) - var(--dsh-composer-side-clearance) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset));" +
-          "max-width:calc(var(--dsh-composer-card-max-width) - var(--dsh-composer-dock-inset) - var(--dsh-composer-dock-inset));" +
-          "margin:0 auto calc(0px - var(--dsh-composer-stack-gap) - 3px);padding:6px 12px;flex:none;" +
-          "border:.5px solid var(--dsw-alias-border-l1);border-radius:12px 12px 0 0;" +
-          "background:var(--dsw-specific-tip);color:var(--dsw-alias-label-primary);" +
-          "font-size:13px;line-height:20px;overflow:hidden}" +
-
-          ".dshps-fold-title{font-weight:500}" +
-          ".dshps-fold-meta{color:var(--dsw-alias-label-tertiary)}" +
-          ".dshps-fold-hint{margin-top:2px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}" +
-          ".dshps-fold-card + *{margin-top:0}" +
-          ".dshps-fold-row{width:100%;border:0;background:0 0;padding:0;font:inherit;text-align:left;" +
-          "color:inherit;cursor:pointer;align-items:center;display:flex;gap:10px}" +
-          ".dshps-fold-row:focus-visible{outline:2px solid var(--dsw-alias-label-tertiary);outline-offset:-2px}" +
-          ".dshps-fold-chevron{margin-left:auto;color:var(--dsw-alias-label-tertiary);font-size:11px}" +
+          // The chip floats (the overlay anchor is `height:0`), so it cannot occupy
+          // the flow itself. These two rules are a pair: the chip is positioned in
+          // the band, and the card reserves exactly that band as padding. Sizing the
+          // band from the same constants the chip is positioned with is what keeps
+          // the chip from ever painting over the attachments row.
+          "[data-composer-card][" + CHIP_ATTR + "]{padding-top:" + CHIP_BAND_PX + "px}" +
+          ".dshps-chip{position:absolute;top:" + CHIP_TOP_PX + "px;left:12px;right:12px;" +
+          "height:" + CHIP_HEIGHT_PX + "px;box-sizing:border-box;width:auto;" +
+          // Mirrors dsh-client-ui-attachment's chip (GD8l4q_card) so it reads as one
+          // of the composer's own affordances rather than a plugin banner.
+          "border:.5px solid var(--dsw-alias-border-l2,#0000001f);" +
+          "background:var(--dsw-specific-input-major,transparent);" +
+          "border-radius:16px;padding:0 12px;gap:10px;align-items:center;display:flex;" +
+          "text-align:left;font:inherit;color:inherit;cursor:pointer;overflow:hidden;" +
+          "z-index:1}" +
+          ".dshps-chip:hover{border-color:var(--dsw-alias-border-l1,#00000033)}" +
+          ".dshps-chip:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}" +
+          ".dshps-chip-title{flex:none;font-weight:500;color:var(--dsw-alias-label-primary)}" +
+          ".dshps-chip-dot{flex:none;color:var(--dsw-alias-label-tertiary)}" +
+          ".dshps-chip-meta{flex:none;color:var(--dsw-alias-label-tertiary)}" +
+          ".dshps-chip-chevron{margin-left:auto;color:var(--dsw-alias-label-tertiary);font-size:11px}" +
           // The anchor itself must occupy no space and never intercept a click; it
           // exists only to locate the composer card from inside it.
           ".dshps-fold-anchor{height:0;width:0;pointer-events:none}" +
@@ -1017,79 +1057,59 @@ window.__ModuleLoader__.load({
           // the cut edge into the card so it reads as "there is more below" rather
           // than as a rendering bug. The 84px includes the container's own top
           // padding, so the visible text is 3 lines.
-          "[data-composer-card][data-dshps-folded] [data-input-scroll]{" +
+          "[data-composer-card][" + FOLD_ATTR + "] " + SCROLL_SELECTOR + "{" +
           "max-height:" + FOLD_CLAMP_PX + "px;" +
           "mask-image:linear-gradient(to bottom,#000 calc(100% - " + FADE_PX + "px),transparent);" +
           "-webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - " + FADE_PX + "px),transparent)}" +
           // The faded band is the expand target. Its cursor is set here so it reads
-          // as clickable; the hit-test itself is JS (see FoldMarker) because the
+          // as clickable; the hit-test itself is JS (see PasteFoldChip) because the
           // band's offset depends on the accessory/attachment rows above the editor
           // and cannot be expressed as a fixed distance from the card edge.
-          "[data-composer-card][data-dshps-folded] [data-input-scroll]{cursor:pointer}"
+          "[data-composer-card][" + FOLD_ATTR + "] " + SCROLL_SELECTOR + "{cursor:pointer}"
         document.head.appendChild(tag);
         return () => tag.remove();
       }, "dsh-paste-spill: styles");
 
-      // Registered on `conversation.input.dock`, NOT `conversation.composer.dock`.
-      //
-      // Verified in the shipped bundle: composer.dock is rendered only under
-      // `variant === "composer" && input !== void 0 && sessionId !== void 0`, and
-      // the variant is "hero" whenever `sessionId === void 0 || shellPhase ===
-      // "blank" && ...` — so in a BLANK session (exactly where a big paste is
-      // first tried) that slot never renders at all, and the card could not
-      // appear no matter what the store held. input.dock is rendered on
-      // `zone !== void 0`, independent of the variant, which is why the
-      // attachment chip and the stock todo/queue docks all show up there.
-      ctx.slots.inject("conversation.input.dock", () =>
-        ctx.slots.register(
-          {
-            name: "conversation.input.dock",
-            id: "paste-spill",
-            order: 10,
-            locale: NS,
-            inject: (sessionId) => ({
-              sessionId,
-              // A store, NOT a plain function: the renderer wraps every hook source
-              // in observableHook -> useSyncExternalStoreWithSelector. The fold store
-              // is the card's ONLY source. It deliberately does not also read the
-              // session's draft: that hook is materialized once per session binding
-              // and cached, so a binding created before the shell existed would hold
-              // a permanently absent store and hide the card even with a valid
-              // record. The draft watcher, which demonstrably sees every revision,
-              // clears the record instead.
-              hooks: { pasteFold: foldStore, foldExpanded: expandStore },
-              setFoldExpanded,
-            }),
-          },
-          PasteFoldCard,
-        ),
-      );
-
-      // The collapsing half. `conversation.input.overlay` is rendered INSIDE
+      // The ONLY registration. `conversation.input.overlay` is rendered INSIDE
       // `[data-composer-card]`, above the editor, scoped to one session — exactly
-      // what "collapse the input box" needs and what the dock (a sibling above the
-      // whole card) cannot reach.
+      // what "fold the input box, with nothing outside it" needs.
+      //
+      // The previous build ALSO registered `conversation.input.dock` for a separate
+      // hint card. That slot renders as a sibling ABOVE the whole card (next to the
+      // stock todo/queue docks), so the hint could only ever be outside the input
+      // box, and it was removed for that reason.
       //
       // Chosen after checking the alternatives: `input.attachments` is kind
-      // "single" and already owned by dsh-client-ui-attachment, so registering
-      // there would displace the stock attachment UI; and the editor is private to
-      // SessionInputShell, so a real in-editor chip would mean hand-editing
-      // another package's Lexical instance and rebuilding the submitted text
-      // (which is what breaks slash/goal parsing). A list-kind, session-scoped
-      // slot needs neither.
+      // "single" and already owned by dsh-client-ui-attachment, and the renderer
+      // renders only `entriesOfSlot(...)[0]`, so a second registrant would be
+      // silently dropped (or, worse, displace the stock attachment UI); the
+      // in-card `accessory` row is a prop of InputBar, not fed by any slot; and the
+      // editor is private to SessionInputShell, so a real in-editor chip would mean
+      // hand-editing another package's Lexical instance and rebuilding the
+      // submitted text (which is what breaks slash/goal parsing). A list-kind,
+      // session-scoped slot needs neither.
       ctx.slots.inject("conversation.input.overlay", () =>
         ctx.slots.register(
           {
             name: "conversation.input.overlay",
             id: "paste-spill",
             order: 0,
+            locale: NS,
             inject: (sessionId) => ({
               sessionId,
+              // A store, NOT a plain function: the renderer wraps every hook source
+              // in observableHook -> useSyncExternalStoreWithSelector. The fold store
+              // is the chip's ONLY source. It deliberately does not also read the
+              // session's draft: that hook is materialized once per session binding
+              // and cached, so a binding created before the shell existed would hold
+              // a permanently absent store and hide the chip even with a valid
+              // record. The draft watcher, which demonstrably sees every revision,
+              // clears the record instead.
               hooks: { pasteFold: foldStore, foldExpanded: expandStore },
               setFoldExpanded,
             }),
           },
-          FoldMarker,
+          PasteFoldChip,
         ),
       );
     };
@@ -1108,6 +1128,7 @@ window.__ModuleLoader__.load({
       readSessionSlice,
       applyFoldToCard,
       FOLD_ATTR,
+      CHIP_ATTR,
       createSessionStore,
       insertedRun,
       measurableText,
@@ -1117,8 +1138,7 @@ window.__ModuleLoader__.load({
       uploadPaste,
       reactToDraft,
       watchDraft,
-      PasteFoldCard,
-      FoldMarker,
+      PasteFoldChip,
     };
     return module.exports;
   },

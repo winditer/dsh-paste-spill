@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
  * Materialize lib/client.js exactly as the browser ModuleLoader would: capture
  * the registered record, then call its factory with a stubbed `require`.
  */
-function loadBundle() {
+function loadBundle(reactExtras = {}) {
   const source = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
   let record = null;
   const fakeWindow = { __ModuleLoader__: { load: (value) => { record = value; } } };
@@ -37,6 +37,94 @@ function loadBundle() {
     throw new Error(`unexpected require: ${id}`);
   };
   return { record, exports: record.factory(fakeRequire) };
+}
+
+/**
+ * Materialize the bundle with a react stub whose effects actually RUN.
+ *
+ * The default stub no-ops useLayoutEffect/useEffect, which is right for asserting
+ * on the rendered tree but useless for the wiring: the whole point of this plugin
+ * is a DOM side effect (attributes on the stock composer card), and that only
+ * happens when the effect body executes. This loader collects the effect callbacks
+ * so a test can invoke them against a fake DOM.
+ */
+function loadBundleWithEffects() {
+  const source = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  let record = null;
+  new Function("window", source)({ __ModuleLoader__: { load: (value) => { record = value; } } });
+  const layoutEffects = [];
+  const passiveEffects = [];
+  const react = {
+    createElement: (type, props, ...children) => ({
+      type: typeof type === "function" ? type.name || "Component" : type,
+      props: props ?? null,
+      children,
+    }),
+    memo: (component) => component,
+    useState: () => [undefined, () => {}],
+    useEffect: (fn) => { passiveEffects.push(fn); },
+    useLayoutEffect: (fn) => { layoutEffects.push(fn); },
+    useMemo: (factory) => factory(),
+    useRef: (initial) => ({ current: initial ?? null }),
+    useSyncExternalStore: () => undefined,
+  };
+  const exports = record.factory((id) => {
+    if (id === "react") return react;
+    throw new Error(`unexpected require: ${id}`);
+  });
+  return { exports, layoutEffects, passiveEffects };
+}
+
+/**
+ * A stock-shaped composer card: the real InputBar renders the overlay anchor as a
+ * child of [data-composer-card], so `closest` from inside the anchor resolves to
+ * the card itself.
+ */
+function fakeCard() {
+  const card = {
+    attrs: new Set(),
+    setAttribute(name) { this.attrs.add(name); },
+    removeAttribute(name) { this.attrs.delete(name); },
+    querySelector: () => null,
+  };
+  return card;
+}
+
+/**
+ * Find the chip button in a rendered PasteFoldChip tree, or null.
+ *
+ * The component always returns a Fragment of [locator, chip|null], so a test that
+ * wants to know whether the visible affordance is on screen has to look one level
+ * in rather than test the root.
+ */
+function chipOf(tree) {
+  for (const child of tree?.children ?? []) {
+    if (child !== null && typeof child === "object" && child.props?.["data-paste-spill-chip"]) return child;
+  }
+  return null;
+}
+
+/** The zero-size locator element the component always renders. */
+function anchorOf(tree) {
+  for (const child of tree?.children ?? []) {
+    if (child !== null && typeof child === "object" && child.props?.["data-paste-spill-anchor"]) return child;
+  }
+  return null;
+}
+
+/** Join the leaf strings of a serialized element tree. */
+function leafText(tree) {
+  const leaves = [];
+  const walk = (node) => {
+    if (typeof node === "string") {
+      leaves.push(node);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    for (const child of node.children ?? []) walk(child);
+  };
+  walk(tree);
+  return leaves.join("|");
 }
 
 /**
@@ -607,51 +695,50 @@ test("a folded run is always a substring of the draft it was diffed from", () =>
   }
 });
 
-test("the dock card renders nothing without a fold record", () => {
-  const { PasteFoldCard } = loadBundle().exports.__internals;
-  const tree = PasteFoldCard({
+test("no fold record renders the locator but no chip", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const tree = PasteFoldChip({
     sessionId: "sess-1",
     usePasteFold: (select) => select({}),
+    useFoldExpanded: (select) => select({}),
     t: (key) => key,
   });
-  assert.equal(tree, null);
+  // The locator ALWAYS renders: the layout effect needs a mounted node to reach
+  // the composer card from, and teardown needs one to clear the attributes from.
+  // The visible chip, however, must not render when nothing is folded.
+  assert.equal(chipOf(tree), null, "nothing folded means no chip");
+  assert.equal(anchorOf(tree).props["data-paste-spill-anchor"], true);
 });
 
-test("the dock card renders from the fold record alone, without a draft hook", () => {
-  const { PasteFoldCard } = loadBundle().exports.__internals;
+test("the chip renders from the fold record alone, without a draft hook", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
   // The card deliberately has NO draft hook: the session binding's draft store is
   // materialized once and cached, so a binding born before the shell existed would
   // hand the card a permanently empty store and hide it forever. The watcher owns
   // clearing the record instead, so rendering depends on exactly one store.
   const record = { bytes: 5000, lines: 2, sentinels: ["big pasted text"] };
-  const tree = PasteFoldCard({
+  const tree = PasteFoldChip({
     sessionId: "sess-1",
     usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select({}),
     t: (key, params) => `${key}:${JSON.stringify(params ?? {})}`,
   });
-  assert.notEqual(tree, null, "a record alone must be enough to render");
+  const chip = chipOf(tree);
+  assert.notEqual(chip, null, "a record alone must be enough to render the chip");
   // Collect leaf strings rather than matching the whole serialized tree: the
   // JSON form escapes the quotes inside the interpolated label arguments.
-  const leaves = [];
-  const walk = (node) => {
-    if (typeof node === "string") {
-      leaves.push(node);
-      return;
-    }
-    if (node === null || typeof node !== "object") return;
-    for (const child of node.children ?? []) walk(child);
-  };
-  walk(tree);
-  const text = leaves.join("|");
+  const text = leafText(chip);
   assert.match(text, /foldTitle/);
   assert.match(text, /"bytes":5000/);
   assert.match(text, /"lines":2/);
-  assert.match(text, /foldHint/);
+  // "Sent as-is" is carried by the chip's tooltip now. The build that rendered it
+  // as a paragraph ABOVE the input box was rejected.
+  assert.match(chip.props.title, /foldHint/);
 });
 
-test("the dock entry exposes store-shaped hooks, not plain functions", () => {
+test("the composer entry exposes store-shaped hooks, not plain functions", () => {
   const { apply } = loadBundle().exports;
-  const capture = { entry: null, component: null, effects: [], dock: null, overlay: null };
+  const capture = { entry: null, component: null, effects: [], registered: [] };
   const stateStore = { getSnapshot: () => ({ draft: "hi" }), subscribe: () => () => {} };
   const documentStub = {
     addEventListener() {},
@@ -672,8 +759,7 @@ test("the dock entry exposes store-shaped hooks, not plain functions", () => {
         register: (entry, component) => {
           capture.entry = entry;
           capture.component = component;
-          if (entry.name === "conversation.input.dock") capture.dock = { entry, component };
-          if (entry.name === "conversation.input.overlay") capture.overlay = { entry, component };
+          capture.registered.push(entry.name);
         },
       },
       conversation: { input: { shell: () => ({ state: stateStore }) } },
@@ -684,11 +770,15 @@ test("the dock entry exposes store-shaped hooks, not plain functions", () => {
     else globalThis.document = previousDocument;
   }
 
-  assert.equal(capture.dock.entry.name, "conversation.input.dock");
-  assert.equal(capture.dock.entry.id, "paste-spill");
-  assert.equal(typeof capture.dock.component, "function");
+  // Exactly ONE registration. The visible chip and the editor clamp both live in
+  // `conversation.input.overlay`, the only slot that renders inside
+  // [data-composer-card]. A separate dock registration would put the affordance
+  // outside the input box, which is what was rejected.
+  assert.deepEqual(capture.registered, ["conversation.input.overlay"]);
+  assert.equal(capture.entry.id, "paste-spill", "must not collide with the stock overlay occupants");
+  assert.equal(typeof capture.component, "function");
 
-  const face = capture.dock.entry.inject("sess-1");
+  const face = capture.entry.inject("sess-1");
   // The renderer wraps every `hooks` value in useSyncExternalStore, so each one
   // MUST be a store. A plain function here silently never re-renders.
   for (const [name, source] of Object.entries(face.hooks)) {
@@ -725,7 +815,8 @@ test("the collapse marker registers inside the composer card, not beside it", ()
     if (previousDocument === undefined) delete globalThis.document;
     else globalThis.document = previousDocument;
   }
-  assert.deepEqual([...slots.keys()].sort(), ["conversation.input.dock", "conversation.input.overlay"]);
+  assert.deepEqual([...slots.keys()], ["conversation.input.overlay"],
+    "one in-card slot only: a dock registration would sit outside the input box");
   const overlay = slots.get("conversation.input.overlay");
   assert.equal(overlay.entry.id, "paste-spill", "must not collide with the stock overlay occupants");
   const face = overlay.entry.inject("sess-1");
@@ -738,7 +829,7 @@ test("the collapse marker registers inside the composer card, not beside it", ()
 });
 
 test("the pasted text leaving the draft clears the record, which hides the card", () => {
-  const { watchDraft, createSessionStore, createPasteInbox, PasteFoldCard } = loadBundle().exports.__internals;
+  const { watchDraft, createSessionStore, createPasteInbox, PasteFoldChip } = loadBundle().exports.__internals;
   const foldStore = createSessionStore();
   const draftStore = createDraftStore("");
   const stop = watchDraft({
@@ -752,19 +843,20 @@ test("the pasted text leaving the draft clears the record, which hides the card"
   });
   const run = "x".repeat(5000);
   draftStore.setDraft(run);
-  const visible = () => PasteFoldCard({
+  const visible = () => chipOf(PasteFoldChip({
     sessionId: "sess-1",
     usePasteFold: (select) => select(foldStore.getSnapshot()),
+    useFoldExpanded: (select) => select({}),
     t: (key) => key,
-  });
-  assert.notEqual(visible(), null, "the card shows while the folded text is in the draft");
+  }));
+  assert.notEqual(visible(), null, "the chip shows while the folded text is in the draft");
   draftStore.setDraft("");
   assert.equal(foldStore.getSnapshot()["sess-1"], undefined, "clearing the draft must drop the record");
-  assert.equal(visible(), null, "and the card must then render nothing");
+  assert.equal(visible(), null, "and the chip must then render nothing");
   stop();
 });
 
-test("the dock inject never touches the session shell, so a missing binding cannot hide the card", () => {
+test("the inject never touches the session shell, so a missing binding cannot hide the chip", () => {
   const { apply } = loadBundle().exports;
   let entry = null;
   const documentStub = {
@@ -798,9 +890,10 @@ test("the dock inject never touches the session shell, so a missing binding cann
 test("REGRESSION: a 6000-byte paste folds even when the session binding predates the shell", () => {
   const { apply } = loadBundle().exports;
   // Reproduces the reported failure ("超过4000，低于50000，没有折叠") end to end:
-  // the dock entry is injected for a session whose shell is ALREADY materialized,
-  // then the draft changes. Because the card's hook is the plugin's own fold store
-  // rather than the framework-cached session binding, the record reaches it.
+  // the composer entry is injected for a session whose shell is ALREADY
+  // materialized, then the draft changes. Because the chip's hook is the plugin's
+  // own fold store rather than the framework-cached session binding, the record
+  // reaches it.
   let entry = null;
   let component = null;
   const hostStub = {
@@ -824,10 +917,8 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
     slots: {
       inject: (_key, register) => register(),
       register: (e, c) => {
-        // The plugin now registers twice (dock card + in-card collapse marker);
-        // this test is about the CARD, so pick the dock by name rather than
-        // whichever registration happened to land last.
-        if (e.name === "conversation.input.dock") { entry = e; component = c; }
+        entry = e;
+        component = c;
       },
     },
     sessions: { list: { getSnapshot: () => ({ current: "session-abc" }), subscribe: () => () => {} } },
@@ -840,7 +931,7 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
     else globalThis.document = previousDocument;
   }
 
-  // The dock asks for its hooks before any paste happens (the binding is made
+  // The slot asks for its hooks before any paste happens (the binding is made
   // once, cached, and reused) — the case that used to freeze an empty store.
   const face = entry.inject("session-abc");
   assert.equal(face.sessionId, "session-abc");
@@ -848,24 +939,18 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
   const body = "x".repeat(6000);
   draftStore.setDraft(body);
 
-  // The card must render from the store the dock already holds.
+  // The chip must render from the store the slot already holds.
   const tree = component({
     sessionId: "session-abc",
     usePasteFold: (select) => select(face.hooks.pasteFold.getSnapshot()),
     useFoldExpanded: (select) => select(face.hooks.foldExpanded.getSnapshot()),
     t: (key, params) => `${key}:${JSON.stringify(params ?? {})}`,
   });
-  assert.notEqual(tree, null, "the fold card must render for a 6000-byte paste");
+  const chip = chipOf(tree);
+  assert.notEqual(chip, null, "the fold chip must render for a 6000-byte paste");
 
-  const leaves = [];
-  const walk = (node) => {
-    if (typeof node === "string") { leaves.push(node); return; }
-    if (node === null || typeof node !== "object") return;
-    for (const child of node.children ?? []) walk(child);
-  };
-  walk(tree);
-  const text = leaves.join("|");
-  assert.match(text, /foldTitle/, "the card shows in the composer dock");
+  const text = leafText(chip);
+  assert.match(text, /foldTitle/, "the chip shows inside the composer card");
   assert.match(text, /"bytes":6000/, "and reports the real pasted size");
   assert.equal(draftStore.getSnapshot().draft, body, "a fold never mutates the draft");
 });
@@ -874,8 +959,8 @@ test("a blank session still gets a watcher, so the hero composer folds", () => {
   const { apply } = loadBundle().exports;
   // The reported failure happened in a BLANK session, where composer.dock never
   // renders. Two things must hold there: the watcher must install even though the
-  // shell may not resolve on the first attempt, and the card must be registered on
-  // the variant-independent slot.
+  // shell may not resolve on the first attempt, and the chip must be registered on
+  // a slot that renders regardless of the composer variant.
   const slots = [];
   let entry = null;
   const draftStore = createDraftStore("");
@@ -898,9 +983,7 @@ test("a blank session still gets a watcher, so the hero composer folds", () => {
       effect: (fn) => { fn(); return () => {}; },
       slots: {
         inject: (key, register) => { slots.push(key); register(); },
-        register: (e) => {
-          if (e.name === "conversation.input.dock") entry = e;
-        },
+        register: (e) => { entry = e; },
       },
       sessions: { list: { getSnapshot: () => ({ current: "session-blank" }), subscribe: () => () => {} } },
       // Throws the first time (scope not mounted yet), then resolves — the real
@@ -923,11 +1006,11 @@ test("a blank session still gets a watcher, so the hero composer folds", () => {
   }
 
   assert.deepEqual(
-    slots.slice().sort(),
-    ["conversation.input.dock", "conversation.input.overlay"],
-    "the card goes on the variant-independent dock; the clamp marker inside the card",
+    slots,
+    ["conversation.input.overlay"],
+    "the chip and the clamp come from the one in-card slot",
   );
-  assert.equal(entry.name, "conversation.input.dock");
+  assert.equal(entry.name, "conversation.input.overlay");
   assert.equal(shellCalls, 1, "the first attempt legitimately fails");
   // The bounded retry schedule drives the second attempt, which succeeds.
   assert.equal(typeof rafPending, "function", "an unresolved shell must be retried, not abandoned");
@@ -935,7 +1018,7 @@ test("a blank session still gets a watcher, so the hero composer folds", () => {
   assert.equal(shellCalls, 2, "the retry must re-attempt shell resolution");
   const body = "z".repeat(6000);
   draftStore.setDraft(body);
-  // The proof that matters: the record reaches the store the dock card reads.
+  // The proof that matters: the record reaches the store the chip reads.
   const face = entry.inject("session-blank");
   const record = face.hooks.pasteFold.getSnapshot()["session-blank"];
   assert.ok(record !== undefined, "the retried watcher must fold the paste");
@@ -1071,4 +1154,164 @@ test("the collapse rule outranks the stock scroll rule it overrides", () => {
     attributes.length >= 3,
     `selector ${selector} must carry >=3 attribute tests to outrank a single class, got ${attributes.length}`,
   );
+});
+
+test("the chip is positioned inside the card, and the card reserves a band for it", () => {
+  // The chip cannot occupy the flow itself: `conversation.input.overlay` is the
+  // only in-card slot available and its anchor is `height:0` (a floating layer
+  // shared with the `/` and `@` menus). So the chip is absolutely positioned, and
+  // the card must reserve exactly that band as padding — otherwise the chip paints
+  // over the attachments row and the editor's first line.
+  let css = "";
+  const documentStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null, querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild: (tag) => { css = tag.textContent; } },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = documentStub;
+  try {
+    loadBundle().exports.apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_k, register) => register(), register: () => {} },
+      conversation: { input: { shell: () => undefined } },
+      sessions: { list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} } },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  const band = /\[data-composer-card\]\[data-dshps-chip\]\{padding-top:(\d+)px\}/.exec(css);
+  assert.ok(band, "the card must reserve a band while the chip is mounted");
+  const chip = /\.dshps-chip\{([^}]*)\}/.exec(css);
+  assert.ok(chip, "the chip rule must be installed");
+  assert.match(chip[1], /position:absolute/, "the chip floats, so it cannot take flow space");
+  assert.match(chip[1], /top:\d+px/, "and is pinned inside that band");
+
+  // The two numbers must agree, or the chip overlaps the content below it. This is
+  // the whole reason both are computed from the same constants.
+  const top = Number(/\.dshps-chip\{[^}]*top:(\d+)px/.exec(css)[1]);
+  const height = Number(/\.dshps-chip\{[^}]*height:(\d+)px/.exec(css)[1]);
+  assert.ok(
+    Number(band[1]) >= top + height,
+    `band ${band[1]}px must cover the chip (top ${top}px + height ${height}px)`,
+  );
+});
+
+test("a mounted but expanded fold keeps its band, so the text does not jump", () => {
+  // The chip stays on screen while expanded (it is the "collapse again"
+  // affordance), so the band must stay reserved. Releasing it on expand would drop
+  // the editor up under a floating chip.
+  const { applyFoldToCard, FOLD_ATTR, CHIP_ATTR } = loadBundle().exports.__internals;
+  const card = {
+    attrs: new Set(),
+    setAttribute(n) { this.attrs.add(n); },
+    removeAttribute(n) { this.attrs.delete(n); },
+  };
+  const anchor = { closest: () => card };
+
+  applyFoldToCard(anchor, true, true);
+  assert.ok(card.attrs.has(FOLD_ATTR), "collapsed clamps the editor");
+  assert.ok(card.attrs.has(CHIP_ATTR), "and the chip is on screen");
+
+  // Expanded: the clamp goes, the chip stays.
+  applyFoldToCard(anchor, false, true);
+  assert.equal(card.attrs.has(FOLD_ATTR), false, "expanding releases the clamp");
+  assert.ok(card.attrs.has(CHIP_ATTR), "but the chip is still mounted, so the band stays");
+
+  // Gone: both must go.
+  applyFoldToCard(anchor, false, false);
+  assert.equal(card.attrs.has(FOLD_ATTR), false);
+  assert.equal(card.attrs.has(CHIP_ATTR), false, "teardown must not leave a stale band");
+});
+
+test("the chip toggles the expanded store rather than mutating the draft", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const calls = [];
+  const record = { bytes: 6000, lines: 3, sentinels: ["x"] };
+  const render = (expanded) => PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select(expanded === undefined ? {} : { "sess-1": expanded }),
+    setFoldExpanded: (sessionId, next) => calls.push([sessionId, next]),
+    t: (key) => key,
+  });
+
+  // Collapsed: the affordance is "expand".
+  const collapsed = chipOf(render(undefined));
+  assert.equal(collapsed.props["aria-expanded"], false);
+  collapsed.props.onClick();
+  assert.deepEqual(calls, [["sess-1", true]], "clicking a collapsed chip expands it");
+
+  // Expanded: the affordance flips to "collapse", and the label with it.
+  const expanded = chipOf(render(true));
+  assert.equal(expanded.props["aria-expanded"], true);
+  assert.match(leafText(expanded), /foldTitleExpanded/);
+  expanded.props.onClick();
+  assert.deepEqual(calls.at(-1), ["sess-1", false], "clicking an expanded chip collapses it");
+});
+
+test("the chip's effects stamp the stock composer card it renders inside", () => {
+  // End-to-end wiring, with effects actually executing. Everything above asserts
+  // on the rendered tree or the stylesheet; this is the only test that proves the
+  // attribute reaches the DOM node that does the clamping — and it proves it
+  // reaches the card via `closest()` from the anchor, not by document query (which
+  // would hit whichever composer happens to be first, i.e. the wrong session).
+  const { exports, layoutEffects, passiveEffects } = loadBundleWithEffects();
+  const { FOLD_ATTR, CHIP_ATTR } = exports.__internals;
+
+  const card = fakeCard();
+  const anchorNode = { closest: (sel) => (sel === "[data-composer-card]" ? card : null) };
+  const record = { bytes: 6000, lines: 3, sentinels: ["x"] };
+
+  const render = (expanded) => {
+    layoutEffects.length = 0;
+    passiveEffects.length = 0;
+    const tree = exports.__internals.PasteFoldChip({
+      sessionId: "sess-1",
+      usePasteFold: (select) => select({ "sess-1": record }),
+      useFoldExpanded: (select) => select(expanded === undefined ? {} : { "sess-1": expanded }),
+      setFoldExpanded: () => {},
+      t: (key) => key,
+    });
+    // React would assign the ref during commit; the stub cannot, so do it here.
+    anchorOf(tree).props.ref.current = anchorNode;
+    return tree;
+  };
+
+  // Collapsed: the card is clamped AND carries the chip band.
+  render(undefined);
+  assert.equal(layoutEffects.length, 1, "exactly one layout effect syncs the card");
+  layoutEffects[0]();
+  assert.ok(card.attrs.has(FOLD_ATTR), "the editor is clamped");
+  assert.ok(card.attrs.has(CHIP_ATTR), "and the chip band is reserved");
+
+  // Expanded: clamp released, band kept (the chip is still on screen).
+  render(true);
+  layoutEffects[0]();
+  assert.equal(card.attrs.has(FOLD_ATTR), false, "expanding unclamps the editor");
+  assert.ok(card.attrs.has(CHIP_ATTR), "while the chip stays, so the band must stay");
+
+  // Teardown (session switch): an unmount effect clears both. It is the LAST
+  // passive effect (the mousedown handler registers first and, while expanded,
+  // bails out immediately), and it returns its cleanup rather than running it.
+  // Indexed rather than searched for: invoking effects to identify them would
+  // mutate the card during the search and make the result meaningless.
+  const cleanup = passiveEffects.at(-1);
+  assert.equal(typeof cleanup(), "function", "the unmount effect must return a cleanup");
+  cleanup()();
+  assert.equal(card.attrs.has(FOLD_ATTR), false, "teardown unclamps");
+  assert.equal(card.attrs.has(CHIP_ATTR), false, "and releases the band");
+});
+
+test("the component renders a locator even with no store, so the card is always reachable", () => {
+  // A missing hook must degrade, not throw: this renders inside the composer, so
+  // an exception would take down the user's ability to type at all.
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const tree = PasteFoldChip({ sessionId: "sess-1", usePasteFold: undefined, useFoldExpanded: undefined });
+  assert.equal(chipOf(tree), null, "no store means nothing folded");
+  assert.ok(anchorOf(tree), "but the locator still renders, so the effects have a node");
 });

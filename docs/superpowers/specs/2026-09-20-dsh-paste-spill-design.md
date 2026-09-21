@@ -1,7 +1,8 @@
 # dsh-paste-spill — 设计文档
 
 > 日期：2026-09-20
-> 状态：已实施（§0 记录实施期更正；§4.3 记录折叠层从"仅提示"改为"输入框内折叠"）
+> 状态：已实施（§0 记录实施期更正；§4.3 记录折叠层的两次形态更正：
+> "仅提示" → "输入框内折叠" → "输入框内的折叠卡片，框外无任何提示"）
 > 插件名：`dsh-paste-spill`（SPEC §10 已定）
 > 目标环境：DSH Desktop `0.1.5-rc.2`，checkout `/Applications/DSH Desktop.app/Contents/Resources/app/`
 > 依据：`dsh-paste-spill-investigation.md`（SPEC），本设计**更正了 SPEC 中三处不成立的机制**（见 §9）
@@ -50,7 +51,8 @@ Codex 在输入框粘贴大段文本时会自动转成文件（Desktop 生成 `P
 两层**独立**（SPEC §4.3：`两层不要合并成一个开关`）。4,000 是纯 UI 折叠，零语义变化；50,000 改变模型所见，必须显式。
 
 **用户已确认的两项决策：**
-- **A. 折叠层形态 = dock 卡片**（`conversation.composer.dock`），不做编辑器内 chip
+- **A. 折叠层形态 = 输入框**内部**的折叠卡（`conversation.input.overlay`），框外不放任何提示；不做编辑器内 chip**
+  - 实施期更正：最初落在 `conversation.composer.dock`、后又改到 `conversation.input.dock`，两者都在 `[data-composer-card]` **之外**（`input.dock` 是卡片的前一个兄弟节点），只能"提示"而不能"在框内折叠"。最终只保留 `conversation.input.overlay` 一处注册。
 - **B. 包结构 = 两包**
 
 ---
@@ -83,7 +85,7 @@ Codex 的 `LARGE_PASTE_CHAR_THRESHOLD = 1000` 是**纯 UI 折叠**阈值、不�
 │       └ 阻止默认粘贴（文本不进编辑器）                        │
 │                                                             │
 │  ③ 4000 ≤ bytes < 50000 → 全文照常进编辑器 + 记一份折叠元数据  │
-│       └ conversation.composer.dock 渲染一张折叠卡片           │
+│       └ 输入框内部渲染一张折叠卡（编辑区上方、框内）           │
 │       └ 提交时全文原样内联（不做任何替换）                    │
 └─────────────────────────────────────────────────────────────┘
                           │ 上传经 fileUploads.upload（既有 remote 面）
@@ -139,47 +141,53 @@ stock 里**没有 paste 钩子**：`PASTE_COMMAND` 是包内闭包注册的（`u
 
 ### 4.3 折叠层（4,000 ≤ bytes < 50,000）—— 输入框内折叠
 
-> **本节已修订。** 初版只在 `conversation.composer.dock` 加一张"提示卡"，输入框里仍是全文；用户反馈"只有提示，希望在输入框中直接显示折叠样式"，因此折叠层现在分为**两半**。两个已不成立的做法记录如下，勿再实现：
+> **本节已修订。** 折叠层被改过两次形态，逐版记录如下，**前两版勿再实现**。最终形态在 §4.3.1：`conversation.input.overlay` 一处注册，框内一张折叠卡，框外无提示。
 >
-> 1. **`conversation.composer.dock` 在空白会话不渲染。** 它只在 `variant === "composer" && input !== void 0 && sessionId !== void 0` 下渲染，而 `variant` 在 `sessionId === void 0 || shellPhase === "blank" && …` 时为 `"hero"`。空白会话（也就是粘贴大文本的第一现场）该槽位根本不渲染 —— 卡片无论如何都不会出现。改为 `conversation.input.dock`（渲染条件只有 `zone !== void 0`，与 variant 无关）。
+> 1. **`conversation.composer.dock` 在空白会话不渲染。** 它只在 `variant === "composer" && input !== void 0 && sessionId !== void 0` 下渲染，而 `variant` 在 `sessionId === void 0 || shellPhase === "blank" && …` 时为 `"hero"`。空白会话（也就是粘贴大文本的第一现场）该槽位根本不渲染 —— 卡片无论如何都不会出现。
 > 2. **卡片不能同时依赖两个 store。** 初版卡片要求"折叠记录 + 会话草稿"同时成立，但 draft hook 由 `standardProps` **按 session binding 只物化一次并缓存**（WeakMap keyed by scopeBinding），早于 shell 创建的 binding 会永久持有空 store，卡片据此判定"文本已消失"而永久隐藏。现在折叠记录是卡片唯一数据源，生命周期由 draft watcher（唯一能看到每次修订的地方）通过 `sentinels` 掌握。
+> 3. **折叠卡必须在输入框内部，框外不留任何提示。** 前两版分别落在 `conversation.composer.dock` 和 `conversation.input.dock`（后者修掉了"空白会话不渲染"的问题）。但**这两个槽位都在 `[data-composer-card]` 之外**：`composer.dock` 在 `composerBar` 里、与此无关；`input.dock` 由 `composerBar` 渲染成卡片的**前一个兄弟节点**。用户两次反馈说得正是这件事："现在只有提示，我希望直接在输入框中显示折叠样式"、"我需要和附件一样的折叠在输入框内部，不需要在外部提示"——只要还在框外，就永远只能"提示"而不能"在框内折叠"。`conversation.input.overlay` 是唯一渲染在卡片**内部**的可用槽位（渲染点 `sessionId !== void 0 && <div class=overlayAnchor>{renderSlot("conversation.input.overlay", {})}</div>`），因此现在是**唯一的注册点**。
 
-#### 4.3.1 上半：输入框上方的卡片（`conversation.input.dock`）
+**由更正 1–3 收敛出的最终形状**：`conversation.input.overlay` 一处注册、一个组件 `PasteFoldChip`，同时负责①渲染框内的折叠卡 ②给卡片打上 `data-dshps-folded`。两者必须同源：卡片可见性与它施加的折叠样式若来自两处，就会出现"卡在框内、折叠样式却没施加"的不一致状态。
 
-```js
-ctx.slots.inject("conversation.input.dock", () => ctx.slots.register({
-  name: "conversation.input.dock",
-  id: "paste-spill",
-  order: 10,          // stock 占位：todo=0、queue=20
-  locale: NS,
-  inject: (sessionId) => ({ sessionId, hooks: { pasteFold: foldStore, foldExpanded: expandStore }, setFoldExpanded }),
-}, PasteFoldCard));
-```
-
-卡片本身是**展开/收起的按钮**（`aria-expanded`，键盘可达）。
-
-#### 4.3.2 下半：输入框内的折叠样式（`conversation.input.overlay`）
-
-真正的"折叠"施加在编辑区上，由一个**零尺寸标记**组件完成：
+#### 4.3.1 输入框内的折叠卡（`conversation.input.overlay`）
 
 ```js
 ctx.slots.inject("conversation.input.overlay", () => ctx.slots.register({
   name: "conversation.input.overlay",
   id: "paste-spill",
   order: 0,
+  locale: NS,
   inject: (sessionId) => ({ sessionId, hooks: { pasteFold: foldStore, foldExpanded: expandStore }, setFoldExpanded }),
-}, FoldMarker));
+}, PasteFoldChip));
 ```
 
-为什么是 `input.overlay`（三个候选都已逐个核对）：
+为什么是 `input.overlay`（四个候选都已逐个核对）：
 
 | 候选 | 结论 |
 | --- | --- |
-| `conversation.input.attachments`（也在卡片内） | `kind: "single"`，已被 `dsh-client-ui-attachment` 独占；注册会顶掉原生附件 UI。**不可用** |
+| `conversation.input.dock` | `kind:"list"`、与 variant 无关，但由 `composerBar` 渲染成 `[data-composer-card]` 的**前一个兄弟节点** —— 在框外。**已废弃** |
+| `conversation.input.attachments`（在卡片内） | `kind: "single"`，已被 `dsh-client-ui-attachment` 独占；且渲染器 `renderOutletContent` 对 single 只取 `entriesOfSlot(...)[0]`，第二个注册者被静默丢弃。**不可用** |
 | 编辑器内的真 chip | `editor` 是 `SessionInputShell` 私有字段，插件拿不到；要往别人的 Lexical 实例注册 node 并**重建提交内容**，正是破坏 `/goal` 解析的做法（Codex #25346）。**不做** |
-| `conversation.input.overlay` | `kind: "list"`、`scope: "session"`，空闲可共用；渲染点在 `[data-composer-card]` **内部**、编辑区之上。**采用** |
+| `conversation.input.overlay` | `kind: "list"`、`scope: "session"`，与 stock 的 `input-trigger`/`commands`/`message-feedback` 共用；渲染点在 `[data-composer-card]` **内部**、编辑区之上。**采用** |
 
-标记组件通过 ``anchorRef.current.closest("[data-composer-card]")`` 找到**自己所在会话**的卡片并打上 `data-dshps-folded`——这是"多会话同时打开时不会压错输入框"的关键：它只沿自身祖先链向上，绝不 `document.querySelector`。
+**卡片形态**：单行紧凑芯片，复用 stock 附件卡的视觉语言（`.5px solid var(--dsw-alias-border-l2)`、`border-radius:16px`、`background:var(--dsw-specific-input-major)`、`height:32px`、`padding:0 12px`、`gap:10px`），内容为 `已折叠大文本 · 6008 字节 · 174 行 ▸`，展开后标题换成"已展开大文本"、箭头换成 `▾`。整个芯片是一个 `<button>`（`aria-expanded`，键盘可达），点击切换展开/收起。
+
+**定位**：`conversation.input.overlay` 的锚点是**浮动层**（`.p_FcLG_overlayAnchor{height:0;position:absolute;inset:0 0 auto}`），而卡片本身 `position:relative`，所以芯片用绝对定位落在卡片顶部，并让卡片为它**预留一条带**：
+
+```css
+[data-composer-card][data-dshps-chip]{padding-top:44px}   /* 8 + 32 + 4 */
+.dshps-chip{position:absolute;top:8px;left:12px;right:12px;height:32px;…}
+```
+
+`:has()` 不是必须的：`data-dshps-chip` 由 `applyFoldToCard` 直接打在卡片上，所以"芯片是否占位"用的是自身属性，只和 `data-dshps-folded` 一样是同一个组件写的。带高由 `CHIP_TOP_PX + CHIP_HEIGHT_PX + CHIP_GAP_PX` 三个 JS 常量算出并**插值进**样式串，避免与定位各写一份而失步（测试断言 `padding-top ≥ top + height`）。
+
+**为什么折叠时展开入口有两个、而框外没有**：芯片本身（按钮）是主入口；另一个是折叠区底部的渐隐带（见 4.3.2）。框外不再有任何提示元素。
+
+#### 4.3.2 折叠样式与渐隐带
+
+真正的"折叠"施加在编辑区上，由同一个组件的 `useLayoutEffect` 完成。它通过 ``anchorRef.current.closest("[data-composer-card]")`` 找到**自己所在会话**的卡片并打上 `data-dshps-folded`——这是"多会话同时打开时不会压错输入框"的关键：它只沿自身祖先链向上，绝不 `document.querySelector`。
+
+用 `useLayoutEffect` 而非 `useEffect`：属性必须与"显示折叠"在同一次提交里生效，否则首帧会先画出 4 万字的全文再突然收起。
 
 样式（纯 CSS，不包裹/不复制任何 stock 节点）：
 
@@ -190,12 +198,13 @@ ctx.slots.inject("conversation.input.overlay", () => ctx.slots.register({
   cursor:pointer}
 ```
 
-`[data-input-scroll]` 是 stock 的滚动容器（原 `max-height:var(--dsh-composer-text-max-height)`），只覆盖高度。`mask-image` 让切边渐隐进卡片背景，读起来是"下面还有"而不是渲染错误。`FADE_PX=30` 与 `FOLD_CLAMP_PX=84` 是 JS 常量并**插值进**样式串，避免与命中判定各写一份而失步。
+`[data-input-scroll]` 是 stock 的滚动容器（原 `max-height:var(--dsh-composer-text-max-height)`，即 `336px`），只覆盖高度。该 stock 规则是单类、无 `!important`，所以本选择器靠两个属性选择器（≥3 个属性测试）在特异性上稳压它 —— 测试断言了这一点，因为一旦被简化成单类，折叠会**静默失效且无任何报错**。`mask-image` 让切边渐隐进卡片背景，读起来是"下面还有"而不是渲染错误。`FADE_PX=30` 与 `FOLD_CLAMP_PX=84` 是 JS 常量并**插值进**样式串，避免与命中判定各写一份而失步。
 
-展开入口有两个：
+**渐隐带**用 `mousedown` **捕获阶段**命中判定（`clientY >= rect.bottom - FADE_PX`）后 `preventDefault()` 再展开。用捕获阶段是因为等到冒泡时插入点已被放置、容器已滚动，渐隐带会从指针下移开。**只有渐隐带可点**：可见文字行的点击完全照旧，因此折叠后仍能点进输入框追加"总结一下"，不会误展开。
 
-1. 上方卡片（按钮）；
-2. 折叠区底部渐隐带 —— 用 `mousedown` **捕获阶段**命中判定（`clientY >= rect.bottom - FADE_PX`）后 `preventDefault()` 再展开。用捕获阶段是因为等到冒泡时插入点已被放置、容器已滚动，渐隐带会从指针下移开。**只有渐隐带可点**：可见文字行的点击完全照旧，因此折叠后仍能点进输入框追加"总结一下"，不会误展开。
+**展开后芯片仍在、带仍保留**：芯片在展开态依然是"收起"入口，所以 `applyFoldToCard` 的第三个参数 `hasChip` 与 `collapsed` 分开。否则一展开就松开预留带，文字会跳到一枚浮动芯片下面。
+
+**卸载清理**：会话切走时由一个卸载 effect 清掉 `data-dshps-folded` 与 `data-dshps-chip`。残留属性会把**下一个**会话的输入框裁掉一大截，而屏幕上没有任何东西解释这件事。
 
 #### 4.3.3 折叠的语义：仅表现层
 
@@ -227,7 +236,7 @@ ctx.slots.inject("conversation.input.overlay", () => ctx.slots.register({
 
 | 服务名 | 提供者 | 我们是否需要 |
 |---|---|---|
-| `slots` | `dsh-client-ui-renderer:995` | ✅ 注册 dock 槽 |
+| `slots` | `dsh-client-ui-renderer:995` | ✅ 注册 `conversation.input.overlay` |
 | `conversation` | `dsh-client-ui-conversation:2857` | ✅ `createDrafts` |
 | `sessions` | `dsh-client-ui-session`（`ctx.sessions.list`，`:322`） | ✅ 当前会话 id |
 | `locale` | `dsh-client-locale` | ✅ 文案 |
@@ -456,7 +465,7 @@ export const inject = ["sessionProjections"];   // 读 turnBoundary 投影
 **客户端（可在浏览器/Node 下测纯函数）**
 - 字节计数：ASCII / 中文 / emoji / 混合，边界 3999 / 4000 / 49999 / 50000；
 - 文件名与扩展名猜测：代码 vs 文本 vs 未知；
-- 阈值分流：<4000 不触发；4000–49999 只出 dock 卡片；≥50000 只走附件。
+- 阈值分流：<4000 不触发；4000–49999 只出框内折叠卡（`input.dock` 不注册、框外无元素）；≥50000 只走附件。
 
 **宿主（纯函数 + 事件合同）**
 - `agent/inbox/inserted` 只从 `message.content` 提取 `file` 块，不误抓 text 块；
@@ -465,7 +474,7 @@ export const inject = ["sessionProjections"];   // 读 turnBoundary 投影
 - **回归**：确认不在 `session/event` 里 append（可用一个断言脚本复现 `:1181` 的重入抛错，作为"为什么不用它"的可执行证据）。
 
 **端到端（需在 GUI 人工验证，沙箱外）**
-1. 粘贴 5,000 字节 → 编辑器有全文 + dock 卡片；提交后模型请求里是**内联全文**；
+1. 粘贴 5,000 字节 → 编辑器有全文 + **框内**折叠卡（框外不得出现任何元素）；提交后模型请求里是**内联全文**；
 2. 粘贴 60,000 字节 → composer 出现 `pasted-*.txt` 附件卡；提交后消息里是 `file` 块；turn tail 出现交付卡；
 3. 点交付卡 → 右侧栏 documentpreview **打开的是附件库里的文件**（这条同时验证 SPEC §6.1 的"工作区外可读"在真实 GUI 里成立）；
 4. 助手结尾用行内代码提到该路径 → 变可点链接。
@@ -488,7 +497,7 @@ export const inject = ["sessionProjections"];   // 读 turnBoundary 投影
 - 真正插 chip 的是 shell **私有**方法 `insertReference(ref, span)`（`ui-conversation:12976`），且带 CAS：`if (span.draftRev !== this.rev) return false` —— 必须有**当次实时 revision 的 span**；事件通道 `slash/input-insert-reference`（`:13449`）由包内 `execute()` 派发，外部插件无法伪造一个合法 span；
 - 编辑器 `nodes: [ReferenceChipNode, TextRefNode]` 是包内构造参数（`:12680`），`ReferenceChipNode` **未导出**。
 
-→ 要做真 chip 只能 **shadow 整个 `dsh-client-ui-conversation`**。用户决策 A（dock 卡片）避免了这一步。
+→ 要做真 chip 只能 **shadow 整个 `dsh-client-ui-conversation`**。用户决策 A（输入框内折叠卡）避免了这一步。
 
 ### 9.3 §10.3 三分结构 —— 第三包在本场景失效
 
@@ -514,7 +523,7 @@ SPEC 主张拆出 `dsh-paste-spill-policy` 承载阈值。但：
 
 ## 10. 范围（YAGNI）
 
-**做**：两层阈值；dock 折叠卡片；转文件走真实附件上传；宿主侧取宿主路径并落 `presented`；复用现成交付卡做右侧栏预览。
+**做**：两层阈值；输入框**内**的折叠卡（`conversation.input.overlay`，框外无提示）；转文件走真实附件上传；宿主侧取宿主路径并落 `presented`；复用现成交付卡做右侧栏预览。
 
 **不做**（明确排除）：
 - 编辑器内 chip（决策 A 已排除；需 shadow stock，风险高）；
@@ -536,8 +545,7 @@ SPEC 主张拆出 `dsh-paste-spill-policy` 承载阈值。但：
 │   └── lib/index.js                   构建产物（ESM）
 ├── dsh-client-ui-paste-spill/         客户端包
 │   ├── package.json
-│   ├── src/client.js                  paste 捕获 + dock 卡片
-│   ├── scripts/build.mjs              esbuild
+│   ├── lib/client.js                  草稿订阅 + 框内折叠卡 + CSS（既是源码也是产物）
 │   └── lib/{index.js,client.js}       构建产物
 ├── docs/superpowers/specs/2026-09-20-dsh-paste-spill-design.md
 └── README.md                          挂载说明（沙箱外执行那一步）
@@ -558,8 +566,8 @@ SPEC 主张拆出 `dsh-paste-spill-policy` 承载阈值。但：
 ### 12.1 其它已核对、无需再验的点
 
 - 取当前会话 id：`ctx.sessions.list.getSnapshot().current`（`dsh-client-ui-session/lib/client.js:204` 同款用法）；
-- session-scope 槽的 `inject(sessionId)` **会收到 sessionId**（`ui-conversation:16717` 的 `composer.bar` 即此形状）→ dock 卡片能在组件内定位会话；
-- `composer.dock` 是 `{kind:"list"}`，注册形状 `{name, id, order, locale}`（stock 先例 `ui-chat:8351-8356`，`id: "stats"`）；
+- session-scope 槽的 `inject(sessionId)` **会收到 sessionId**（`ui-conversation:16717` 的 `composer.bar` 即此形状）→ 折叠卡能在组件内定位会话；
+- `conversation.input.overlay` 是 `{kind:"list", scope:"session"}`，注册形状 `{name, id, order, locale, inject}`；stock 占用者 `dsh-client-ui-input-trigger`/`dsh-client-ui-commands`/`dsh-client-ui-message-feedback`，因此 `id` 必须用 `"paste-spill"` 以免冲突；
 - `fileHostPath(ref)` 必须传**合法 durable ref**（`{attachmentId, name, bytes}`，且 `name === fileLeafName(name)`），否则抛 `INVALID_ATTACHMENT_REF`（`dsh-attachment-local:645-649`）→ 宿主侧应 try/catch 并跳过该文件；
 - `agent/inbox/inserted` 的 payload 是 `{ agent, message }`（`dsh-agent/lib/index.js:209-220` 的 `agentEvents` 会把 `agent` 融合进每个 payload），`message.content` 里的 `file` 块形状为 `{type:"file", attachment:{attachmentId, name, bytes}}`；
 - composer 的 contenteditable 宿主带 **`data-composer-input`** 属性（`ui-conversation:15155-15165` 的 `ComposerContentEditable`），这是判定"粘贴发生在输入框内"的可靠选择器。
