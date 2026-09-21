@@ -1190,6 +1190,15 @@ test("the chip is positioned inside the card, and the card reserves a band for i
   assert.ok(chip, "the chip rule must be installed");
   assert.match(chip[1], /position:absolute/, "the chip floats, so it cannot take flow space");
   assert.match(chip[1], /top:\d+px/, "and is pinned inside that band");
+  // A compact chip, not a full-width bar: the user chose the single-line compact
+  // shape, so `right` must stay auto and the width must hug the content. Pinning
+  // both sides would silently turn it into a banner across the whole card.
+  assert.match(chip[1], /width:fit-content/, "the chip hugs its content");
+  assert.match(chip[1], /max-width:calc\(100% - 24px\)/, "but cannot overflow the card");
+  assert.ok(!/right:\d/.test(chip[1]), "no `right` offset, which would stretch it full width");
+  // 32px tall and single-line: a wrapped label would be clipped, not wrapped.
+  assert.match(chip[1], /height:32px/);
+  assert.match(css, /\.dshps-chip-title\{[^}]*white-space:nowrap/, "the title stays on one line");
 
   // The two numbers must agree, or the chip overlaps the content below it. This is
   // the whole reason both are computed from the same constants.

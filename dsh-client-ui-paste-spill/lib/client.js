@@ -1035,8 +1035,12 @@ window.__ModuleLoader__.load({
           // band from the same constants the chip is positioned with is what keeps
           // the chip from ever painting over the attachments row.
           "[data-composer-card][" + CHIP_ATTR + "]{padding-top:" + CHIP_BAND_PX + "px}" +
-          ".dshps-chip{position:absolute;top:" + CHIP_TOP_PX + "px;left:12px;right:12px;" +
-          "height:" + CHIP_HEIGHT_PX + "px;box-sizing:border-box;width:auto;" +
+          ".dshps-chip{position:absolute;top:" + CHIP_TOP_PX + "px;left:12px;" +
+          // Hug the content (a compact chip, like the attachment chip it imitates)
+          // but never extend past the card. `right` stays auto: with both sides
+          // pinned the chip would stretch into a full-width bar.
+          "width:fit-content;max-width:calc(100% - 24px);" +
+          "height:" + CHIP_HEIGHT_PX + "px;box-sizing:border-box;" +
           // Mirrors dsh-client-ui-attachment's chip (GD8l4q_card) so it reads as one
           // of the composer's own affordances rather than a plugin banner.
           "border:.5px solid var(--dsw-alias-border-l2,#0000001f);" +
@@ -1046,10 +1050,13 @@ window.__ModuleLoader__.load({
           "z-index:1}" +
           ".dshps-chip:hover{border-color:var(--dsw-alias-border-l1,#00000033)}" +
           ".dshps-chip:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}" +
-          ".dshps-chip-title{flex:none;font-weight:500;color:var(--dsw-alias-label-primary)}" +
+          // One line only. The chip is a fixed 32px tall, so a wrap would be
+          // clipped rather than grow; the meta is the part allowed to give way
+          // (ellipsis) because the title and the chevron are the affordance.
+          ".dshps-chip-title{flex:none;white-space:nowrap;font-weight:500;color:var(--dsw-alias-label-primary)}" +
           ".dshps-chip-dot{flex:none;color:var(--dsw-alias-label-tertiary)}" +
-          ".dshps-chip-meta{flex:none;color:var(--dsw-alias-label-tertiary)}" +
-          ".dshps-chip-chevron{margin-left:auto;color:var(--dsw-alias-label-tertiary);font-size:11px}" +
+          ".dshps-chip-meta{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary)}" +
+          ".dshps-chip-chevron{flex:none;margin-left:auto;padding-left:2px;color:var(--dsw-alias-label-tertiary);font-size:11px}" +
           // The anchor itself must occupy no space and never intercept a click; it
           // exists only to locate the composer card from inside it.
           ".dshps-fold-anchor{height:0;width:0;pointer-events:none}" +
