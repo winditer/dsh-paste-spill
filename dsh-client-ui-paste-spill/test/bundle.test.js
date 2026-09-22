@@ -296,7 +296,7 @@ test("reactToDraft records fold state for a large insertion without uploading", 
     foldStore,
   });
   assert.equal(outcome, "fold");
-  assert.deepEqual(foldStore.getSnapshot()["sess-1"], { bytes: 5000, lines: 1, sentinels: [run] });
+  assert.deepEqual(foldStore.getSnapshot()["sess-1"], { bytes: 5000, lines: 1, sentinels: [run], text: run });
 });
 
 test("reactToDraft uploads a spill-sized insertion", () => {
@@ -911,6 +911,11 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
     setDraft: (text) => draftStore.setDraft(text),
     addAttachments: () => true,
   };
+  // The sidecar attach runs on collapse, so this stub needs the real draft-
+  // attachment surface: without it the collapse correctly REFUSES (it will not
+  // empty a composer with nothing carrying the text), and this test would be
+  // asserting the fallback instead of the fold.
+  const attachments = [];
   const ctx = {
     locale: { register: () => {} },
     effect: (fn) => { fn(); return () => {}; },
@@ -922,7 +927,11 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
       },
     },
     sessions: { list: { getSnapshot: () => ({ current: "session-abc" }), subscribe: () => () => {} } },
-    conversation: { input: { shell: () => shell } },
+    conversation: {
+      input: { shell: () => shell },
+      createDrafts: (_sessionId, files) => files.map((file, i) => ({ id: `sidecar-${i}`, file })),
+      releaseDraftAttachments: (drafts) => { drafts.forEach((d) => attachments.splice(attachments.indexOf(d.id), 1)); },
+    },
   };
   try {
     apply(ctx);
@@ -952,7 +961,28 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
   const text = leafText(chip);
   assert.match(text, /foldTitle/, "the chip shows inside the composer card");
   assert.match(text, /"bytes":6000/, "and reports the real pasted size");
-  assert.equal(draftStore.getSnapshot().draft, body, "a fold never mutates the draft");
+  // SEMANTICS CHANGE (user requirement): folding now EMPTIES the composer and the
+  // plugin holds the text, so the draft is expected to be empty here. The chip is
+  // the affordance that writes it back.
+  assert.equal(draftStore.getSnapshot().draft, "", "a fold clears the composer");
+  // ...and the round trip must close, or clearing the composer would be data loss.
+  // Clicking the chip routes through the restore-aware toggle and puts it back.
+  chipOf(
+    component({
+      sessionId: "session-abc",
+      usePasteFold: (select) => select(face.hooks.pasteFold.getSnapshot()),
+      useFoldExpanded: (select) => select(face.hooks.foldExpanded.getSnapshot()),
+      setFoldExpanded: face.setFoldExpanded,
+      onToggle: face.onToggle,
+      getHeld: face.getHeld,
+      t: (key) => key,
+    }),
+  ).props.onClick();
+  assert.equal(
+    draftStore.getSnapshot().draft,
+    body,
+    "expanding the chip restores the held text verbatim",
+  );
 });
 
 test("a blank session still gets a watcher, so the hero composer folds", () => {
@@ -993,9 +1023,11 @@ test("a blank session still gets a watcher, so the hero composer folds", () => {
           shell: () => {
             shellCalls += 1;
             if (shellCalls === 1) throw new Error("scope not mounted");
-            return { state: draftStore, setDraft: (text) => draftStore.setDraft(text) };
+            return { state: draftStore, setDraft: (text) => draftStore.setDraft(text), addAttachments: () => true };
           },
         },
+        createDrafts: (_sessionId, files) => files.map((file, i) => ({ id: `sidecar-${i}`, file })),
+        releaseDraftAttachments: () => {},
       },
     });
   } finally {
@@ -1023,7 +1055,10 @@ test("a blank session still gets a watcher, so the hero composer folds", () => {
   const record = face.hooks.pasteFold.getSnapshot()["session-blank"];
   assert.ok(record !== undefined, "the retried watcher must fold the paste");
   assert.equal(record.bytes, 6000, "and measure it in UTF-8 bytes");
-  assert.equal(draftStore.getSnapshot().draft, body, "a fold leaves the draft intact");
+  // SEMANTICS CHANGE: a fold now EMPTIES the editor and holds the text, so the
+  // draft is expected to be cleared here rather than left intact. The chip is what
+  // carries the affordance to bring it back.
+  assert.equal(draftStore.getSnapshot().draft, "", "a fold clears the composer and holds the text");
 });
 
 test("applying the plugin replaces a stale stylesheet from a previous build", () => {
@@ -1057,16 +1092,6 @@ test("applying the plugin replaces a stale stylesheet from a previous build", ()
   }
   assert.equal(removed.length, 1, "the stale sheet must be removed");
   assert.equal(appended.length, 1, "and exactly one fresh sheet installed");
-});
-
-test("foldCollapsed: a fold collapses the composer until the user expands it", () => {
-  const { foldCollapsed } = loadBundle().exports.__internals;
-  const record = { bytes: 6000, lines: 5, sentinels: ["x"] };
-  assert.equal(foldCollapsed(record, undefined), true, "a fresh fold starts collapsed");
-  assert.equal(foldCollapsed(record, false), true);
-  assert.equal(foldCollapsed(record, true), false, "expanded means the editor is not clamped");
-  assert.equal(foldCollapsed(undefined, undefined), false, "nothing folded: composer untouched");
-  assert.equal(foldCollapsed(null, false), false);
 });
 
 test("applyFoldToCard stamps only the card it is anchored inside", () => {
@@ -1323,4 +1348,232 @@ test("the component renders a locator even with no store, so the card is always 
   const tree = PasteFoldChip({ sessionId: "sess-1", usePasteFold: undefined, useFoldExpanded: undefined });
   assert.equal(chipOf(tree), null, "no store means nothing folded");
   assert.ok(anchorOf(tree), "but the locator still renders, so the effects have a node");
+});
+
+/** Build a real hold store pre-loaded with one session's held text. */
+function holdWith(sessionId, text) {
+  const store = loadBundle().exports.__internals.createHoldStore();
+  store.set(sessionId, text);
+  return store;
+}
+
+// --- Hold-and-restore: collapsing EMPTIES the editor, expanding refills it ----
+//
+// The user's requirement: "折叠后，输入框中清空，展开后才显示原始内容". The fold
+// layer therefore stops being pure presentation: the text is physically moved out
+// of the draft and held by the plugin, so the composer is genuinely empty while
+// collapsed. Every test below pins one half of that round trip, because a
+// hold-without-restore is a data-loss bug, not a cosmetic one.
+
+test("collapsing holds the text and leaves the editor empty", () => {
+  const { collapseFold, createHoldStore } = loadBundle().exports.__internals;
+  const held = createHoldStore();
+  const record = { bytes: 6000, lines: 3, text: "BIG PASTED TEXT", sentinels: ["BIG PASTED TEXT"] };
+  const writes = [];
+  const outcome = collapseFold({
+    record,
+    sessionId: "sess-1",
+    draft: "BIG PASTED TEXT",
+    holdStore: held,
+    setDraft: (text) => writes.push(text),
+  });
+  assert.equal(outcome, "held");
+  assert.deepEqual(writes, [""], "the editor is cleared, not clamped-with-text");
+  assert.equal(held.get("sess-1"), "BIG PASTED TEXT", "and the text is kept, not dropped");
+});
+
+test("collapsing keeps unrelated text and removes only the pasted run", () => {
+  const { collapseFold, createHoldStore } = loadBundle().exports.__internals;
+  const held = createHoldStore();
+  const record = { bytes: 6000, lines: 3, text: "PASTED", sentinels: ["PASTED"] };
+  const writes = [];
+  collapseFold({
+    record,
+    sessionId: "sess-1",
+    draft: "please summarize: PASTED",
+    holdStore: held,
+    setDraft: (text) => writes.push(text),
+  });
+  assert.deepEqual(writes, ["please summarize: "], "the user's own words survive the collapse");
+});
+
+test("expanding writes the held text back into the editor", () => {
+  const { expandFold, createHoldStore } = loadBundle().exports.__internals;
+  const held = holdWith("sess-1", "BIG PASTED TEXT");
+  const writes = [];
+  const outcome = expandFold({
+    sessionId: "sess-1",
+    draft: "",
+    holdStore: held,
+    setDraft: (text) => writes.push(text),
+  });
+  assert.equal(outcome, "restored");
+  assert.deepEqual(writes, ["BIG PASTED TEXT"], "the original content comes back verbatim");
+  assert.equal(held.has("sess-1"), false, "and the hold is released, so it cannot be restored twice");
+});
+
+test("expanding an empty hold is a no-op that never clobbers a draft", () => {
+  const { expandFold, createHoldStore } = loadBundle().exports.__internals;
+  const held = createHoldStore();
+  const writes = [];
+  const outcome = expandFold({
+    sessionId: "sess-1",
+    draft: "user typed something new",
+    holdStore: held,
+    setDraft: (text) => writes.push(text),
+  });
+  assert.equal(outcome, "none");
+  assert.deepEqual(writes, [], "with nothing held the draft is left exactly as the user left it");
+});
+
+test("expanding appends the held text after anything the user typed while collapsed", () => {
+  const { expandFold, createHoldStore } = loadBundle().exports.__internals;
+  const held = holdWith("sess-1", "PASTED");
+  const writes = [];
+  expandFold({
+    sessionId: "sess-1",
+    draft: "summarize this: ",
+    holdStore: held,
+    setDraft: (text) => writes.push(text),
+  });
+  assert.deepEqual(writes, ["summarize this: \nPASTED"], "the held text is appended on its own line, over nothing the user typed");
+});
+
+test("the hold store exposes exactly the surface the collapse and restore need", () => {
+  // The held text is the ONLY copy once the composer is empty, so the store's
+  // contract is worth pinning directly: read it back verbatim, know whether a hold
+  // exists, release it exactly once, and never report a released hold as present.
+  const { createHoldStore } = loadBundle().exports.__internals;
+  const held = createHoldStore();
+  assert.equal(held.has("sess-1"), false, "nothing held initially");
+  assert.equal(held.get("sess-1"), undefined);
+  held.set("sess-1", "BIG PASTED TEXT");
+  assert.equal(held.has("sess-1"), true);
+  assert.equal(held.get("sess-1"), "BIG PASTED TEXT", "the text survives the round trip verbatim");
+  held.clear("sess-1");
+  assert.equal(held.has("sess-1"), false);
+  assert.equal(held.get("sess-1"), undefined, "a released hold reads as absent");
+  // Defensive: an absent session id must never throw or alias another session.
+  held.set(undefined, "x");
+  assert.equal(held.has(undefined), false, "an absent session id holds nothing");
+});
+
+test("the chip's expand path restores rather than only flipping a flag", () => {
+  // The toggle must go through expandFold: flipping `expanded` alone would relabel
+  // the chip to "expanded" while the editor stayed empty — the state the user
+  // would read as data loss.
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const writes = [];
+  const record = { bytes: 6000, lines: 3, text: "PASTED", sentinels: ["PASTED"] };
+  const tree = PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select({}),
+    setFoldExpanded: () => {},
+    onToggle: (sessionId, next) => writes.push([sessionId, next]),
+    t: (key) => key,
+  });
+  chipOf(tree).props.onClick();
+  assert.deepEqual(writes, [["sess-1", true]], "the click routes through the restore-aware toggle");
+});
+
+test("a collapse attaches a sidecar so an emptied composer still submits the text", () => {
+  // The load-bearing guarantee behind the empty-composer design: stock's submit
+  // serializes the live draft and offers no hook, so if the collapse only emptied
+  // the editor the user's paste would be submitted as NOTHING. The sidecar
+  // attachment is what carries it, through the same proven file-block path the
+  // >=50000 spill already uses.
+  const { apply } = loadBundle().exports;
+  let entry = null;
+  const hostStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = hostStub;
+  const draftStore = createDraftStore("");
+  const added = [];
+  const created = [];
+  const shell = {
+    state: draftStore,
+    setDraft: (text) => draftStore.setDraft(text),
+    addAttachments: (ids) => { added.push(...ids); return true; },
+  };
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_key, register) => register(), register: (e) => { entry = e; } },
+      sessions: { list: { getSnapshot: () => ({ current: "s1" }), subscribe: () => () => {} } },
+      conversation: {
+        input: { shell: () => shell },
+        createDrafts: (_sessionId, files) => {
+          created.push(...files);
+          return files.map((file, i) => ({ id: `d-${i}`, file }));
+        },
+        releaseDraftAttachments: () => {},
+      },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  const body = "w".repeat(6000);
+  draftStore.setDraft(body);
+
+  assert.equal(draftStore.getSnapshot().draft, "", "the composer is emptied");
+  assert.equal(created.length, 1, "exactly one sidecar file is synthesized");
+  assert.equal(created[0].size, 6000, "carrying the full pasted text");
+  assert.match(created[0].name, /^pasted-text-\d+\.txt$/, "under the host-recognized name");
+  assert.deepEqual(added, ["d-0"], "and it is admitted to the draft, so the submission carries it");
+});
+
+test("a refused sidecar leaves the text in the composer instead of emptying it", () => {
+  // The refusal path is the whole reason the attach happens BEFORE the clear. If
+  // the composer will not take the attachment, clearing the draft would leave an
+  // empty box whose text nothing would ever send -- silent data loss.
+  const { apply } = loadBundle().exports;
+  let entry = null;
+  const hostStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = hostStub;
+  const draftStore = createDraftStore("");
+  let released = 0;
+  const shell = {
+    state: draftStore,
+    setDraft: (text) => draftStore.setDraft(text),
+    addAttachments: () => false,
+  };
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_key, register) => register(), register: (e) => { entry = e; } },
+      sessions: { list: { getSnapshot: () => ({ current: "s1" }), subscribe: () => () => {} } },
+      conversation: {
+        input: { shell: () => shell },
+        createDrafts: (_sessionId, files) => files.map((file, i) => ({ id: `d-${i}`, file })),
+        releaseDraftAttachments: () => { released += 1; },
+      },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  const body = "v".repeat(6000);
+  draftStore.setDraft(body);
+
+  assert.equal(draftStore.getSnapshot().draft, body, "the text stays inline, so nothing is lost");
+  assert.equal(released, 1, "and the refused attachment is released rather than leaked");
 });
