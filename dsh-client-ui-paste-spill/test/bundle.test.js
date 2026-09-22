@@ -1696,3 +1696,65 @@ test("dismissing is a no-op when nothing is held or attached", () => {
   assert.equal(outcome, "none");
   assert.deepEqual(detached, [], "nothing to detach");
 });
+
+test("the sidecar attachment card is hidden, but only the sidecar's own card", () => {
+  // The user asked for the chip ALONE ("不需要下部分的文件，只保留上部分内容").
+  // The sidecar must still exist -- it is what carries the text into a submission
+  // made from an emptied composer -- so it is hidden rather than dropped, and the
+  // selector has to match our filename prefix and nothing else. A broader rule
+  // would blink the user's own legitimate attachments out of existence.
+  const { apply } = loadBundle().exports;
+  let css = "";
+  const hostStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    createElement: () => ({
+      dataset: {},
+      set textContent(value) { css = value; },
+      get textContent() { return css; },
+      remove() {},
+    }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = hostStub;
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: () => {}, register: () => {} },
+      sessions: { list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} } },
+      conversation: { input: { shell: () => undefined } },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  const rule = /\[title\^="pasted-text-"\]\{([^}]*)\}/.exec(css);
+  assert.ok(rule, "a rule hides the sidecar card by its filename prefix");
+  assert.match(rule[1], /display:none/, "the card takes no space, so no empty gap is left");
+  // Scoped to the composer's attachment card, not every element with that title.
+  assert.match(css, /\[data-composer-card\][^,{]*\[title\^="pasted-text-"\]/, "and the rule is scoped to the composer card");
+});
+
+test("hiding the sidecar card does not make the attachment removable-less", () => {
+  // Hiding the card removes the stock × affordance, so the chip's own × must still
+  // be the way out. This pins that the dismiss path detaches by id (which does not
+  // depend on any DOM), rather than relying on a button that is now invisible.
+  const { dismissFold, createHoldStore } = loadBundle().exports.__internals;
+  const holdStore = createHoldStore();
+  holdStore.set("sess-1", "PASTED");
+  const detached = [];
+  const outcome = dismissFold({
+    sessionId: "sess-1",
+    holdStore,
+    attachmentIds: ["sidecar-1"],
+    removeAttachment: (id) => { detached.push(id); return true; },
+    clearFold: () => {},
+  });
+  assert.equal(outcome, "dismissed");
+  assert.deepEqual(detached, ["sidecar-1"], "the chip's × still detaches the hidden sidecar");
+  assert.equal(holdStore.has("sess-1"), false);
+});

@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "codex-chip-1";
+    const BUILD_REV = "codex-chip-2";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -1492,6 +1492,18 @@ window.__ModuleLoader__.load({
           // The anchor itself must occupy no space and never intercept a click; it
           // exists only to locate the composer card from inside it.
           ".dshps-fold-anchor{height:0;width:0;pointer-events:none}" +
+          // The sidecar file card is HIDDEN, not dropped: the user wants the chip
+          // alone ("不需要下部分的文件，只保留上部分内容"), but the attachment is
+          // what carries the text into a submission made from the emptied composer,
+          // so removing it would send nothing.
+          //
+          // Matched by the card's own `title` attribute, which stock sets to the
+          // file NAME, and scoped inside `[data-composer-card]` so the rule cannot
+          // reach a same-named element elsewhere. The prefix is ours alone
+          // (`pasted-text-`), so a user's genuine attachments are untouched --
+          // `display:none` rather than `visibility` so the card takes no space and
+          // leaves no gap where it used to sit.
+          "[data-composer-card] [title^=\"" + PASTE_NAME_PREFIX + "\"]{display:none}" +
           // Collapsed editor: clamp the stock scroll container to ~3 lines and fade
           // the cut edge into the card so it reads as "there is more below" rather
           // than as a rendering bug. The 84px includes the container's own top

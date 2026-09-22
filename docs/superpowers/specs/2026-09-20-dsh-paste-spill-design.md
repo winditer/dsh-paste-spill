@@ -234,6 +234,20 @@ ctx.slots.inject("conversation.input.overlay", () => ctx.slots.register({
 
 **顺序是安全性的全部**：先挂附件，**只在附件被接受之后**才清空草稿。附件被拒（提交面被锁）时降级为"文本原样留在编辑器 + 芯片在上方"，即旧行为；绝不出现"空编辑器 + 无人发送的文本"。
 
+**sidecar 的文件卡被 CSS 隐藏（用户要求"只保留上部分内容"）**：附件仍存在于草稿并随消息发出，只是卡片不显示：
+
+```css
+[data-composer-card] [title^="pasted-text-"]{display:none}
+```
+
+选择器按 stock 卡片自身的 `title` 属性（`FileCard` 里 `title: name`，即文件名）匹配，并限定在 `[data-composer-card]` 内：
+
+- 前缀 `pasted-text-` 是本插件独有的（`PASTE_NAME_PREFIX`，stock 中无同名前缀），所以**只隐藏我们自己的 sidecar**，用户拖进来的真实附件不受影响；
+- 限定在输入框卡片内，避免命中页面上其他同 `title` 的元素；
+- 用 `display:none` 而非 `visibility:hidden`，卡片不占位、不留空隙。
+
+**由此产生的取舍**：隐藏卡片同时隐藏了 stock 的上传进度/失败重试/删除入口。删除入口由芯片的 `×` 承担（按 attachment id 卸载，不依赖任何 DOM），但**上传失败将不再可见** —— 此时消息里可能带一个未 ready 的附件。这是"只保留芯片"这一要求的直接代价。
+
 **旧设计原本要避开的坑，现在的实际状态**：
 
 - **斜杠命令 / goal**：折叠态下草稿确实为空，因此与"未装插件"不再一致 —— 这是本交互的**已知取舍**。折叠后若要输入 `/goal`，需先展开写回。sidecar 保证**内容**不丢，但不再保证"编辑框所见即命令解析所见"。
