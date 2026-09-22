@@ -13,15 +13,25 @@ export const PASTE_NAME_PREFIX = "pasted-text-";
  * sidecar attachment. Its card is deliberately hidden in the composer (the user
  * wants only the chip), which is why it needs a name distinct from
  * `PASTE_NAME_PREFIX` — otherwise the hide rule could not be scoped to it without
- * also hiding a spilled paste's card. It is still one of ours, so it must still be
- * recognized here or the turn-tail card would silently stop appearing.
+ * also hiding a spilled paste's card.
  */
 export const FOLD_NAME_PREFIX = "folded-text-";
 
-/** @returns true when the name is one of our synthesized large-paste files. */
-export function isPasteAttachmentName(name) {
-  if (typeof name !== "string") return false;
-  return name.startsWith(PASTE_NAME_PREFIX) || name.startsWith(FOLD_NAME_PREFIX);
+/** @returns true when the name is a fold sidecar (composer-only, never presented). */
+export function isFoldAttachmentName(name) {
+  return typeof name === "string" && name.startsWith(FOLD_NAME_PREFIX);
+}
+
+/**
+ * @returns true when the name is a SPILLED paste — the one kind that earns a card.
+ *
+ * A `folded-text-` sidecar deliberately does NOT qualify. It must not produce a
+ * `deliverables/presented` event, because a fold's whole visible identity is the
+ * composer chip: a timeline card as well would present the same paste twice. The
+ * sidecar's only job is to carry the text through submit.
+ */
+export function isSpillAttachmentName(name) {
+  return typeof name === "string" && name.startsWith(PASTE_NAME_PREFIX);
 }
 
 /**
@@ -40,7 +50,9 @@ export function pasteAttachmentsOf(content) {
     if (typeof attachment.attachmentId !== "string" || attachment.attachmentId === "") continue;
     if (typeof attachment.name !== "string" || attachment.name === "") continue;
     if (typeof attachment.bytes !== "number") continue;
-    if (!isPasteAttachmentName(attachment.name)) continue;
+    // Spilled pastes only: a fold sidecar is carried, never presented (see
+    // isSpillAttachmentName for why the two are separated).
+    if (!isSpillAttachmentName(attachment.name)) continue;
     found.push({
       attachmentId: attachment.attachmentId,
       name: attachment.name,

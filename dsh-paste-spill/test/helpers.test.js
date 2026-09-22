@@ -2,28 +2,34 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   PASTE_NAME_PREFIX,
-  isPasteAttachmentName,
+  FOLD_NAME_PREFIX,
+  isFoldAttachmentName,
+  isSpillAttachmentName,
   pasteAttachmentsOf,
   pasteCallId,
   presentedPayload,
 } from "../lib/helpers.js";
 
-test("PASTE_NAME_PREFIX is the documented literal", () => {
+test("the two filename prefixes are the documented literals", () => {
   assert.equal(PASTE_NAME_PREFIX, "pasted-text-");
+  assert.equal(FOLD_NAME_PREFIX, "folded-text-");
+  // They must differ, or the composer could not hide one card without the other.
+  assert.notEqual(PASTE_NAME_PREFIX, FOLD_NAME_PREFIX);
 });
 
-test("isPasteAttachmentName only accepts our synthesized names", () => {
-  assert.equal(isPasteAttachmentName("pasted-text-1.txt"), true);
-  assert.equal(isPasteAttachmentName("pasted-text-12.md"), true);
-  // The fold sidecar uses its own prefix (the composer hides that card by name),
-  // but it is still our synthesized file and must still be recognized -- otherwise
-  // the turn-tail card would silently stop appearing for every folded paste.
-  assert.equal(isPasteAttachmentName("folded-text-1.txt"), true);
-  assert.equal(isPasteAttachmentName("folded-text-12.json"), true);
-  assert.equal(isPasteAttachmentName("notes.txt"), false);
-  assert.equal(isPasteAttachmentName("my-pasted-text-1.txt"), false);
-  assert.equal(isPasteAttachmentName(undefined), false);
-  assert.equal(isPasteAttachmentName(42), false);
+test("the two prefixes are classified separately, and neither accepts a stranger", () => {
+  // Only a spilled paste earns a timeline card; a fold sidecar is composer-only.
+  assert.equal(isSpillAttachmentName("pasted-text-1.txt"), true);
+  assert.equal(isSpillAttachmentName("pasted-text-12.md"), true);
+  assert.equal(isSpillAttachmentName("folded-text-1.txt"), false, "a fold sidecar is not a spill");
+
+  assert.equal(isFoldAttachmentName("folded-text-1.json"), true);
+  assert.equal(isFoldAttachmentName("pasted-text-1.txt"), false, "and a spill is not a sidecar");
+
+  for (const name of ["notes.txt", "my-pasted-text-1.txt", undefined, 42]) {
+    assert.equal(isSpillAttachmentName(name), false, `${name} is not a spill`);
+    assert.equal(isFoldAttachmentName(name), false, `${name} is not a sidecar`);
+  }
 });
 
 test("pasteAttachmentsOf extracts only well-formed file blocks with our prefix", () => {
@@ -66,4 +72,27 @@ test("presentedPayload carries turn, callId and one file entry", () => {
       files: [{ path: "/Users/x/.dsh/attachments/v1/files/01/0123/pasted-text-1.txt", description: "粘贴的大文本" }],
     },
   );
+});
+test("only a spilled paste is collected, so a fold sidecar gets no timeline card", () => {
+  // A fold's sidecar must never produce a `deliverables/presented` card. The user
+  // wants the fold to be JUST the composer chip: the sidecar exists only to carry
+  // the text through submit, and a big card in the timeline for a paste the user
+  // already saw as a chip is exactly the duplicate being removed.
+  //
+  // The >=50000 spill is the opposite: there the real attachment IS the feature,
+  // and its card is what the user clicks to preview.
+  const blocks = [
+    {
+      type: "file",
+      attachment: { attachmentId: "sha256:aa", name: "pasted-text-1.json", bytes: 60154 },
+    },
+    {
+      type: "file",
+      attachment: { attachmentId: "sha256:bb", name: "folded-text-2.json", bytes: 6008 },
+    },
+  ];
+  const found = pasteAttachmentsOf(blocks);
+  assert.equal(found.length, 1, "exactly one of the two is collected");
+  assert.equal(found[0].name, "pasted-text-1.json", "the spilled paste is the one that gets a card");
+  assert.equal(found[0].attachmentId, "sha256:aa");
 });

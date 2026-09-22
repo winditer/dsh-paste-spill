@@ -178,3 +178,33 @@ test("an append failure is swallowed and never rejects the step", async () => {
   const decision = await fire("agent/pre-step", { agent, signal: { aborted: false } });
   assert.deepEqual(decision, { kind: "continue" });
 });
+test("a fold sidecar produces no presented card, while a spilled paste still does", async () => {
+  // The end-to-end statement of the requirement: a 4000-50000 fold is visible ONLY
+  // as the composer chip. Its sidecar rides the submission but must not also add a
+  // timeline card -- that card was the duplicate being removed.
+  const { ctx, agent, appended, fire } = makeCtx();
+  apply(ctx);
+  await fire("agent/inbox/inserted", {
+    agent,
+    message: pastedMessage([
+      { type: "file", attachment: { attachmentId: "sha256:folded0000000a", name: "folded-text-1.json", bytes: 6008 } },
+    ]),
+  });
+  await fire("agent/pre-step", { agent, signal: { aborted: false } });
+  assert.deepEqual(appended, [], "the fold sidecar adds no card");
+
+  // The spilled paste is the case that DOES get a card, and it must be unaffected.
+  // A fresh harness, and its OWN `fire`: each harness owns its handler map, so
+  // firing through the first one would deliver the second agent to the first ctx.
+  const spilled = makeCtx();
+  apply(spilled.ctx);
+  await spilled.fire("agent/inbox/inserted", {
+    agent: spilled.agent,
+    message: pastedMessage([
+      { type: "file", attachment: { attachmentId: "sha256:spill00000000b", name: "pasted-text-2.json", bytes: 60154 } },
+    ]),
+  });
+  await spilled.fire("agent/pre-step", { agent: spilled.agent, signal: { aborted: false } });
+  assert.equal(spilled.appended.length, 1, "the spilled paste still gets its card");
+  assert.equal(spilled.appended[0].type, "deliverables/presented");
+});

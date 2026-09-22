@@ -248,12 +248,17 @@ ctx.slots.inject("conversation.input.overlay", () => ctx.slots.register({
 
 **为什么折叠层必须有自己的前缀（关键）**：两层都会挂文件，若共用 `pasted-text-`，隐藏规则无法区分它们，会把 **≥50000 层的附件卡一并隐藏** —— 而那张卡（"文本变成真附件"的可视结果）正是那一层存在的意义。因此：
 
-| 层 | 前缀 | 卡片 |
-|---|---|---|
-| 折叠层 sidecar | `folded-text-` | 隐藏 |
-| ≥50000 落盘附件 | `pasted-text-` | 显示 |
+| 层 | 前缀 | 输入框卡片 | 时间线卡片 |
+|---|---|---|---|
+| 折叠层 sidecar | `folded-text-` | 隐藏 | **不生成** |
+| ≥50000 落盘附件 | `pasted-text-` | 显示 | 生成（可点击预览） |
 
-两个前缀都属于本插件，宿主半的 `isPasteAttachmentName` 必须**同时**接受（`OR` 两个前缀）。漏掉 `folded-text-` 的后果是静默的：折叠提交后 turn tail 的卡片不再出现，而消息本身完全正常，很难联想到是文件名过滤。宿主测试钉住了这一点。
+**折叠层不生成时间线卡片**：折叠的可见身份只有输入框芯片，再生成一张 `deliverables/presented` 大卡会把同一段粘贴展示两遍（实机反馈："需要删除"）。所以宿主半分成两个判定：
+
+- `isSpillAttachmentName`（仅 `pasted-text-`）—— 决定是否发 `deliverables/presented`；
+- `isFoldAttachmentName`（仅 `folded-text-`）—— 折叠 sidecar，仅用于承载提交。
+
+两者不可合并：合成一个"两个前缀都算"的判定，正是最初误发时间线卡片的原因。
 
 **由此产生的取舍**：隐藏卡片同时隐藏了 stock 的上传进度/失败重试/删除入口。删除入口由芯片的 `×` 承担（按 attachment id 卸载，不依赖任何 DOM），但**上传失败将不再可见** —— 此时消息里可能带一个未 ready 的附件。这是"只保留芯片"这一要求的直接代价。
 
