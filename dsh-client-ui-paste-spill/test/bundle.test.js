@@ -189,11 +189,18 @@ function createDraftStore(initial, attachmentIds = []) {
       return true;
     },
     /**
-     * Mirror stock's own post-send commit: the draft is cleared AND the accepted
-     * attachments leave the composer, in one commit.
+     * Mirror stock's own post-send commit.
+     *
+     * The important detail is which fields CHANGE. Stock's send path removes the
+     * accepted attachment ids via a publish that does NOT bump the draft revision
+     * (`removeAttachment`/`commitSend` never touch `this.rev`); only the editor
+     * clearing moves the revision. An earlier version of this stub bumped `draftRev`
+     * here, which made the plugin look correct while the real app never fired its
+     * send detection at all -- the stub was more forgiving than the thing it stood
+     * in for. The revision is left alone now so the test exercises the real ordering.
      */
     commitSend() {
-      state = { ...state, draft: "", draftRev: state.draftRev + 1, attachmentIds: [] };
+      state = { ...state, draft: "", attachmentIds: [] };
       emit();
     },
   };
@@ -1836,7 +1843,10 @@ test("expanding clears the fold so the chip unmounts once the text is back", () 
       sessions: { list: { getSnapshot: () => ({ current: "s1" }), subscribe: () => () => {} } },
       conversation: {
         input: { shell: () => shell },
-        createDrafts: (_s, files) => files.map((file, i) => ({ id: `d-${i}`, file })),
+        // Globally unique ids, like stock's attachment ids. A per-batch counter
+        // would reuse `d-0` for every call, making a stale attachment
+        // indistinguishable from a fresh one and hiding accumulation bugs.
+        createDrafts: (_s, files) => files.map((file) => ({ id: `d-${createDraftsSeq++}`, file })),
         releaseDraftAttachments: () => {},
       },
     });
@@ -1905,7 +1915,10 @@ test("a fresh large paste after an expand folds again, so the chip is not suppre
       sessions: { list: { getSnapshot: () => ({ current: "s1" }), subscribe: () => () => {} } },
       conversation: {
         input: { shell: () => shell },
-        createDrafts: (_s, files) => files.map((file, i) => ({ id: `d-${i}`, file })),
+        // Globally unique ids, like stock's attachment ids. A per-batch counter
+        // would reuse `d-0` for every call, making a stale attachment
+        // indistinguishable from a fresh one and hiding accumulation bugs.
+        createDrafts: (_s, files) => files.map((file) => ({ id: `d-${createDraftsSeq++}`, file })),
         releaseDraftAttachments: () => {},
       },
     });
@@ -1949,6 +1962,8 @@ test("a fresh large paste after an expand folds again, so the chip is not suppre
 // up because each new paste collided with the stale state.
 
 /** Build an applied plugin wired to a draft store, returning the slot entry face. */
+let createDraftsSeq = 0;
+
 function setUpFold({ draft = "", attachments = [] } = {}) {
   const { apply } = loadBundle().exports;
   let entry = null;
@@ -1966,7 +1981,10 @@ function setUpFold({ draft = "", attachments = [] } = {}) {
     state: draftStore,
     setDraft: (text) => draftStore.setDraft(text),
     addAttachments: (ids) => draftStore.addAttachments(ids),
-    removeAttachment: () => true,
+    // Must actually mutate the store. A stub that just returns true leaves the id
+    // in the snapshot, so a stale sidecar is indistinguishable from a live one and
+    // the accumulation this suite exists to catch would go unnoticed.
+    removeAttachment: (id) => draftStore.removeAttachment(id),
   };
   try {
     apply({
@@ -1976,7 +1994,10 @@ function setUpFold({ draft = "", attachments = [] } = {}) {
       sessions: { list: { getSnapshot: () => ({ current: "s1" }), subscribe: () => () => {} } },
       conversation: {
         input: { shell: () => shell },
-        createDrafts: (_s, files) => files.map((file, i) => ({ id: `d-${i}`, file })),
+        // Globally unique ids, like stock's attachment ids. A per-batch counter
+        // would reuse `d-0` for every call, making a stale attachment
+        // indistinguishable from a fresh one and hiding accumulation bugs.
+        createDrafts: (_s, files) => files.map((file) => ({ id: `d-${createDraftsSeq++}`, file })),
         releaseDraftAttachments: () => {},
       },
     });
@@ -2069,4 +2090,31 @@ test("dismissing with × empties the composer and deletes the paste", () => {
   assert.equal(face.getHeld("s1"), undefined, "× releases the hold");
   assert.equal(face.hooks.pasteFold.getSnapshot()["s1"], undefined, "× drops the record");
   assert.equal(draftStore.getSnapshot().draft, "", "and the composer stays empty");
+});
+
+test("re-collapsing detaches the previous sidecar instead of orphaning it", () => {
+  // Reported live: pasting again after a dismiss/expand accumulated
+  // folded-text-1/3/5/7/9.json in the composer. Each collapse attached a fresh
+  // sidecar but the PREVIOUS one stayed attached and was forgotten, because
+  // `sidecarIds.set` overwrites the entry the dismiss path reads. An expand leaves
+  // the sidecar attached by design, so a re-collapse must clear it first.
+  const { face, draftStore, shell } = setUpFold();
+
+  // First fold cycle.
+  draftStore.setDraft("f".repeat(6000));
+  const first = face.hooks.pasteFold.getSnapshot()["s1"].text;
+  assert.ok(first, "the first paste folds");
+
+  // Expands back out, then folds again via the chip's own collapse path.
+  face.onToggle("s1", true);
+  draftStore.setDraft("g".repeat(6000));
+
+  // Only ONE sidecar should remain outstanding for the session: whatever earlier
+  // cycle attached must have been detached rather than silently dropped.
+  const outstanding = shell.state.getSnapshot().attachmentIds;
+  assert.equal(
+    outstanding.length,
+    1,
+    `the composer holds exactly one sidecar, not an accumulation (got ${JSON.stringify(outstanding)})`,
+  );
 });

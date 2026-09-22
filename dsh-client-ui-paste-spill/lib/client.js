@@ -38,7 +38,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "codex-chip-5";
+    const BUILD_REV = "codex-chip-6";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -609,7 +609,7 @@ window.__ModuleLoader__.load({
      *
      * @returns "inline" | "fold" | "file".
      */
-    function reactToDraft({ previous, current, run, recorded, sessionId, conversation, shell, foldStore, expandStore, holdStore, index = 1, onUploadSettled, onSidecar }) {
+    function reactToDraft({ previous, current, run, recorded, sessionId, conversation, shell, foldStore, expandStore, holdStore, index = 1, onUploadSettled, onSidecar, onBeforeSidecar }) {
       // The watcher is the single authority for the fold record's lifetime: it is
       // the only place that sees every draft revision, so it can clear the record
       // the moment the padded text is gone. The card deliberately does NOT rely on
@@ -678,6 +678,9 @@ window.__ModuleLoader__.load({
           // attachment degrades to "text stays inline next to the chip" rather
           // than to an empty composer holding text nothing would send.
           if (holdStore !== undefined && holdStore !== null && shell !== undefined && shell !== null && typeof shell.setDraft === "function") {
+            // Drop any sidecar from an earlier cycle BEFORE attaching a new one, or
+            // repeated fold cycles accumulate a card each (see clearSidecar).
+            if (typeof onBeforeSidecar === "function") onBeforeSidecar();
             const attached = attachSidecar({ conversation, sessionId, shell, text: candidate, index });
             diag({ foldSidecarAttached: attached !== null && attached !== undefined });
             // Report the admitted ids so the caller can detach them on dismiss.
@@ -742,7 +745,7 @@ window.__ModuleLoader__.load({
      *
      * @returns an unsubscribe function.
      */
-    function watchDraft({ shell, foldStore, expandStore, holdStore, sessionId, conversation, nextIndex, onRestore, onSidecar, onSendCommitted, sidecarIds, inbox }) {
+    function watchDraft({ shell, foldStore, expandStore, holdStore, sessionId, conversation, nextIndex, onRestore, onSidecar, onBeforeSidecar, onSendCommitted, sidecarIds, inbox }) {
       if (shell === undefined || shell === null || shell.state === undefined) return () => {};
       const store = shell.state;
       const initial = store.getSnapshot();
@@ -756,53 +759,44 @@ window.__ModuleLoader__.load({
         const snapshot = store.getSnapshot();
         if (snapshot === undefined || snapshot === null) return;
         const current = typeof snapshot.draft === "string" ? snapshot.draft : "";
-        if (snapshot.draftRev !== undefined && snapshot.draftRev === lastRev) return;
-        lastRev = snapshot.draftRev;
+        const sameRev = snapshot.draftRev !== undefined && snapshot.draftRev === lastRev;
         // A COMPLETED SEND clears everything this plugin owns for the session.
+        //
+        // This MUST run before the revision guard below. Stock's send path removes
+        // the accepted attachment ids through a store publish that does NOT bump the
+        // draft revision (`removeAttachment`/`commitSend` never touch `this.rev`), so
+        // a guard on `draftRev` alone would skip exactly the notification that proves
+        // the send happened. That is why this check never fired in the real app while
+        // the tests passed: the fake store bumped the revision on commit and stock
+        // does not.
         //
         // Nothing else observes a send, and without it the hold and record survive
         // the message forever: the watcher's own staleness test is skipped while a
         // hold is active (that guard is what stops a collapse from destroying its
         // own text), so an emptied-after-send draft looks identical to a collapse.
-        // The result was a chip that would not go, a phantom occupying the composer,
-        // and sidecars piling up as each new paste collided with the stale state.
-        //
-        // A send is recognized as "the composer is now empty AND the attachments are
-        // gone": stock's commitSend() clears the draft and removes the accepted
-        // attachment ids in one commit, whereas a collapse empties the draft but
-        // deliberately KEEPS the sidecar attachment. Requiring both is what tells
-        // the two apart, and requiring that we were folded (or holding) keeps this
-        // from firing on an ordinary empty composer.
         if (typeof onSendCommitted === "function") {
           const ids = Array.isArray(snapshot.attachmentIds) ? snapshot.attachmentIds : [];
           const folded = foldStore.getSnapshot()[sessionId] !== undefined;
           const held = holdStore !== undefined && holdStore !== null && holdStore.has(sessionId) === true;
-          // Only our OWN sidecar leaving is evidence of a send. The composer can
-          // legitimately hold other attachments (a file the user added by hand), so
-          // "no attachments at all" would miss a send that carried those too, while
-          // "the ids we attached are gone" is exactly the observation that the
-          // submission took them.
           const ours = sidecarIds === undefined ? undefined : sidecarIds.get(sessionId);
           // "Gone" means the ids we attached are no longer on the composer. An
-          // unknown/never-attached sidecar must NOT count as gone: that is the
-          // state during the collapse itself (the draft empties while the hold is
-          // being established), and treating it as a send would clear the fold the
-          // instant it was created.
+          // absent record must NOT count as gone: that is the state while a collapse
+          // establishes its hold, and treating it as a send would clear the fold the
+          // instant it was created. A non-empty `ours` also excludes the >=50000
+          // spill layer, which never attaches a sidecar and so can never look like a
+          // send -- important because a spill also ends with an emptied draft and a
+          // removed attachment, and stealing its revision would stall its upload.
           const sidecarGone = ours !== undefined && ours.length > 0 && ours.every((id) => !ids.includes(id));
-          // `ours.length > 0` is what excludes the SPILL layer: a spill never
-          // attaches a sidecar, so it never has ids here, so it can never look like
-          // a send. That matters because a spill also ends with an emptied draft and
-          // a removed attachment -- the send check must not steal its revision.
           if (current === "" && sidecarGone && (folded || held)) {
             onSendCommitted(sessionId);
             diag({ sendCommitted: true });
             previous = "";
+            lastRev = snapshot.draftRev;
             return;
           }
         }
-        // The spill pump below must still see this revision in every other case,
-        // including an empty one: its own settle callback needs the pass it is
-        // waiting for, and skipping it here would stall the upload.
+        if (sameRev) return;
+        lastRev = snapshot.draftRev;
         const beforePaste = previous;
         const run = insertedRun(beforePaste, current);
         const recorded = inbox.take();
@@ -827,6 +821,7 @@ window.__ModuleLoader__.load({
           holdStore,
           index: nextIndex(),
           onSidecar,
+          onBeforeSidecar,
           onUploadSettled: (ok) => {
             if (ok !== true) return;
             try {
@@ -905,6 +900,33 @@ window.__ModuleLoader__.load({
       }
       // The admitted ids are returned so the chip's × can detach exactly this file.
       return ids;
+    }
+
+    /**
+     * Detach this session's previously-attached sidecar, if any, and forget it.
+     *
+     * Called before every fresh attach. Without it a re-collapse ORPHANED the file
+     * from the previous cycle: `sidecarIds.set` overwrites the entry, so the old id
+     * was no longer reachable by the dismiss path and its card stayed in the
+     * composer. Repeating fold cycles then accumulated folded-text-1/3/5/7/9.json.
+     *
+     * Detaching (rather than just forgetting) is what releases the draft
+     * attachment; a failed removal is ignored because the fresh attach is still the
+     * right next step, and the worst case is one extra hidden card.
+     */
+    function clearSidecar({ sessionId, shell, sidecarIds }) {
+      if (sidecarIds === undefined || sidecarIds === null) return;
+      const previous = sidecarIds.get(sessionId);
+      sidecarIds.delete(sessionId);
+      if (!Array.isArray(previous) || previous.length === 0) return;
+      if (shell === null || shell === undefined || typeof shell.removeAttachment !== "function") return;
+      for (const id of previous) {
+        try {
+          shell.removeAttachment(id);
+        } catch {
+          /* best-effort: the fresh attach is still the right next step */
+        }
+      }
     }
 
     /**
@@ -1240,7 +1262,9 @@ window.__ModuleLoader__.load({
           const draft = shell.state?.getSnapshot()?.draft;
           // A collapse always re-attaches, even if an earlier one did: an expand
           // leaves the sidecar attached, so re-collapsing without a fresh attach
-          // would leave a stale file plus a cleared composer.
+          // would leave a stale file plus a cleared composer. Detach the previous
+          // one FIRST, or the old card lingers alongside the new file.
+          clearSidecar({ sessionId, shell, sidecarIds });
           const attached = attachSidecar({
             conversation: ctx.conversation,
             sessionId,
@@ -1446,6 +1470,7 @@ window.__ModuleLoader__.load({
             // Remember the sidecar ids so the chip's × can detach them: dismissing
             // must delete the paste from the submission, not only the composer.
             onSidecar: (ids) => sidecarIds.set(sessionId, ids),
+            onBeforeSidecar: () => clearSidecar({ sessionId, shell: ctx.conversation?.input?.shell?.(sessionId), sidecarIds }),
             sidecarIds,
             // A completed send retires everything this plugin owns for the session.
             // Stock has already cleared the draft and taken the attachments, so
