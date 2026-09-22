@@ -1345,11 +1345,14 @@ test("the chip's effects stamp the stock composer card it renders inside", () =>
   assert.ok(card.attrs.has(FOLD_ATTR), "the editor is clamped");
   assert.ok(card.attrs.has(CHIP_ATTR), "and the chip band is reserved");
 
-  // Expanded: clamp released, band kept (the chip is still on screen).
+  // Expanded: the chip is GONE, so both attributes must be released together.
+  // "展开后，chip 消失" — a band left reserved here would show a gap the user
+  // cannot explain, and a clause that kept the clamp would hide the very text the
+  // expand just restored.
   render(true);
   layoutEffects[0]();
   assert.equal(card.attrs.has(FOLD_ATTR), false, "expanding unclamps the editor");
-  assert.ok(card.attrs.has(CHIP_ATTR), "while the chip stays, so the band must stay");
+  assert.equal(card.attrs.has(CHIP_ATTR), false, "and releases the band, since the chip is gone");
 
   // Teardown (session switch): an unmount effect clears both. It is the LAST
   // passive effect (the mousedown handler registers first and, while expanded,
@@ -1550,7 +1553,10 @@ test("a collapse attaches a sidecar so an emptied composer still submits the tex
   assert.equal(draftStore.getSnapshot().draft, "", "the composer is emptied");
   assert.equal(created.length, 1, "exactly one sidecar file is synthesized");
   assert.equal(created[0].size, 6000, "carrying the full pasted text");
-  assert.match(created[0].name, /^pasted-text-\d+\.txt$/, "under the host-recognized name");
+  // The fold sidecar carries the FOLD prefix, not the spill's: the composer hides
+  // that card by name, so a shared prefix would hide a spilled paste's card too.
+  // The host half recognizes both (see isPasteAttachmentName).
+  assert.match(created[0].name, /^folded-text-\d+\.txt$/, "under the fold-sidecar name");
   assert.deepEqual(added, ["d-0"], "and it is admitted to the draft, so the submission carries it");
 });
 
@@ -1732,11 +1738,21 @@ test("the sidecar attachment card is hidden, but only the sidecar's own card", (
     else globalThis.document = previousDocument;
   }
 
-  const rule = /\[title\^="pasted-text-"\]\{([^}]*)\}/.exec(css);
+  const rule = /\[title\^="folded-text-"\]\{([^}]*)\}/.exec(css);
   assert.ok(rule, "a rule hides the sidecar card by its filename prefix");
   assert.match(rule[1], /display:none/, "the card takes no space, so no empty gap is left");
   // Scoped to the composer's attachment card, not every element with that title.
-  assert.match(css, /\[data-composer-card\][^,{]*\[title\^="pasted-text-"\]/, "and the rule is scoped to the composer card");
+  assert.match(css, /\[data-composer-card\][^,{]*\[title\^="folded-text-"\]/, "and the rule is scoped to the composer card");
+  // The >=50000 spill's card must NOT be caught by this rule: that layer exists to
+  // show an attachment chip, so hiding it would break the other half of the design.
+  const { foldFileName, pasteFileName } = loadBundle().exports.__internals;
+  assert.notEqual(
+    foldFileName("x", 1),
+    pasteFileName("x", 1),
+    "the fold sidecar and a spilled paste must have distinguishable names",
+  );
+  assert.equal(foldFileName("{a:1}", 3), "folded-text-3.json", "the sidecar name keeps the extension");
+  assert.match(pasteFileName("x", 1), /^pasted-text-/, "a spilled paste keeps the host-known prefix");
 });
 
 test("hiding the sidecar card does not make the attachment removable-less", () => {
@@ -1757,4 +1773,135 @@ test("hiding the sidecar card does not make the attachment removable-less", () =
   assert.equal(outcome, "dismissed");
   assert.deepEqual(detached, ["sidecar-1"], "the chip's × still detaches the hidden sidecar");
   assert.equal(holdStore.has("sess-1"), false);
+});
+
+// --- Expand dismisses the chip entirely ---------------------------------------
+//
+// Final requirement: "展开后，chip消失并显示文本的完整内容". Once the text is back
+// in the composer the chip has nothing left to represent, so it must unmount — not
+// linger in an "expanded" state that offers to fold it again.
+
+test("expanding clears the fold so the chip unmounts once the text is back", () => {
+  const { apply } = loadBundle().exports;
+  let entry = null;
+  const hostStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = hostStub;
+  const draftStore = createDraftStore("");
+  const shell = {
+    state: draftStore,
+    setDraft: (text) => draftStore.setDraft(text),
+    addAttachments: () => true,
+  };
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_key, register) => register(), register: (e) => { entry = e; } },
+      sessions: { list: { getSnapshot: () => ({ current: "s1" }), subscribe: () => () => {} } },
+      conversation: {
+        input: { shell: () => shell },
+        createDrafts: (_s, files) => files.map((file, i) => ({ id: `d-${i}`, file })),
+        releaseDraftAttachments: () => {},
+      },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  const body = "q".repeat(6000);
+  draftStore.setDraft(body);
+  const face = entry.inject("s1");
+  const record = face.hooks.pasteFold.getSnapshot()["s1"];
+  assert.ok(record, "the paste folded");
+
+  const renderChip = () => {
+    const tree = face && loadBundle().exports.__internals.PasteFoldChip({
+      sessionId: "s1",
+      usePasteFold: (select) => select(face.hooks.pasteFold.getSnapshot()),
+      useFoldExpanded: (select) => select(face.hooks.foldExpanded.getSnapshot()),
+      onToggle: face.onToggle,
+      onDismiss: face.onDismiss,
+      getHeld: face.getHeld,
+      t: (key) => key,
+    });
+    return chipOf(tree);
+  };
+
+  assert.notEqual(renderChip(), null, "the chip is shown while collapsed");
+
+  // Expand: the text goes back, and the chip must be gone.
+  face.onToggle("s1", true);
+  assert.equal(draftStore.getSnapshot().draft, body, "the full text is restored verbatim");
+  assert.equal(
+    renderChip(),
+    null,
+    "and the chip is unmounted, because nothing is folded any more",
+  );
+});
+
+test("a fresh large paste after an expand folds again, so the chip is not suppressed forever", () => {
+  // The unmount must come from the fold being CONSUMED, not from a sticky "user
+  // expanded once" flag: if it came from the flag, every later paste in that
+  // session would arrive already-expanded and the chip would never appear again.
+  const { apply } = loadBundle().exports;
+  let entry = null;
+  const hostStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = hostStub;
+  const draftStore = createDraftStore("");
+  const shell = {
+    state: draftStore,
+    setDraft: (text) => draftStore.setDraft(text),
+    addAttachments: () => true,
+  };
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_key, register) => register(), register: (e) => { entry = e; } },
+      sessions: { list: { getSnapshot: () => ({ current: "s1" }), subscribe: () => () => {} } },
+      conversation: {
+        input: { shell: () => shell },
+        createDrafts: (_s, files) => files.map((file, i) => ({ id: `d-${i}`, file })),
+        releaseDraftAttachments: () => {},
+      },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  const face = entry.inject("s1");
+  draftStore.setDraft("a".repeat(6000));
+  face.onToggle("s1", true);
+  assert.equal(draftStore.getSnapshot().draft, "a".repeat(6000), "first paste restored");
+
+  // A second, different large paste must fold again and show a chip.
+  draftStore.setDraft(`${"a".repeat(6000)}${"b".repeat(6000)}`);
+  const second = face.hooks.pasteFold.getSnapshot()["s1"];
+  assert.ok(second, "the second large paste folds again");
+  const tree = loadBundle().exports.__internals.PasteFoldChip({
+    sessionId: "s1",
+    usePasteFold: (select) => select(face.hooks.pasteFold.getSnapshot()),
+    useFoldExpanded: (select) => select(face.hooks.foldExpanded.getSnapshot()),
+    onToggle: face.onToggle,
+    onDismiss: face.onDismiss,
+    getHeld: face.getHeld,
+    t: (key) => key,
+  });
+  assert.notEqual(chipOf(tree), null, "and its chip is shown, not permanently suppressed");
 });

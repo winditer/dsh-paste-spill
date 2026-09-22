@@ -15,6 +15,11 @@ test("PASTE_NAME_PREFIX is the documented literal", () => {
 test("isPasteAttachmentName only accepts our synthesized names", () => {
   assert.equal(isPasteAttachmentName("pasted-text-1.txt"), true);
   assert.equal(isPasteAttachmentName("pasted-text-12.md"), true);
+  // The fold sidecar uses its own prefix (the composer hides that card by name),
+  // but it is still our synthesized file and must still be recognized -- otherwise
+  // the turn-tail card would silently stop appearing for every folded paste.
+  assert.equal(isPasteAttachmentName("folded-text-1.txt"), true);
+  assert.equal(isPasteAttachmentName("folded-text-12.json"), true);
   assert.equal(isPasteAttachmentName("notes.txt"), false);
   assert.equal(isPasteAttachmentName("my-pasted-text-1.txt"), false);
   assert.equal(isPasteAttachmentName(undefined), false);

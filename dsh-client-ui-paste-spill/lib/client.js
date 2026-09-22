@@ -21,13 +21,24 @@ window.__ModuleLoader__.load({
     const FOLD_BYTES = 4000;
     /** Spill at this many bytes: the text becomes a real file attachment. */
     const SPILL_BYTES = 50000;
-    /** Filename prefix the host half recognizes. Keep in sync with dsh-paste-spill. */
+    /** Filename prefix for a spilled paste. */
     const PASTE_NAME_PREFIX = "pasted-text-";
+    /**
+     * Filename prefix for the FOLD sidecar — deliberately different from
+     * `PASTE_NAME_PREFIX`.
+     *
+     * Both layers attach a file, but only the fold's card is hidden (the user wants
+     * the chip alone for 4000-50000). With one shared prefix the hide rule could
+     * not tell them apart, so it would also hide the >=50000 attachment — the very
+     * card that layer exists to show. Distinct names make
+     * `[title^="folded-text-"]` mean exactly one thing.
+     */
+    const FOLD_NAME_PREFIX = "folded-text-";
     const NS = "dsh-paste-spill";
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "codex-chip-2";
+    const BUILD_REV = "codex-chip-3";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -96,6 +107,10 @@ window.__ModuleLoader__.load({
      * Light content sniffing so a pasted code block keeps an honest extension.
      * Guessing wrong only costs syntax highlighting, never correctness.
      */
+    function foldFileName(text, index) {
+      return FOLD_NAME_PREFIX + pasteFileName(text, index).slice(PASTE_NAME_PREFIX.length);
+    }
+
     function pasteFileName(text, index) {
       const body = String(text);
       let ext = "txt";
@@ -207,9 +222,9 @@ window.__ModuleLoader__.load({
      * would otherwise paint over the attachments row and the editor; this
      * attribute is what makes the card reserve a band for it instead.
      *
-     * Keyed on the chip being present rather than on the collapsed state: the
-     * chip stays mounted while expanded (it is the "collapse again" affordance),
-     * so the reservation must stay too or the text would jump on every toggle.
+     * Now that expanding consumes the fold, the chip exists only while the text is
+     * folded, so "chip mounted" and "collapsed" are the same condition — the chip
+     * and the clamp share one lifetime.
      */
     const CHIP_ATTR = "data-dshps-chip";
 
@@ -242,9 +257,9 @@ window.__ModuleLoader__.load({
      * legitimately be absent for a commit or two when a session is switching.
      *
      * @param collapsed - clamp the editor to the folded height.
-     * @param hasChip - reserve the chip band. Defaults to `collapsed`, which is
-     *   right for callers that have no separate expanded state; the real component
-     *   passes it explicitly, because the chip must keep its band while expanded.
+     * @param hasChip - reserve the chip band. Defaults to `collapsed`; callers that
+     *   pass it explicitly pass the same value, because the chip is gone once the
+     *   fold is expanded.
      */
     function applyFoldToCard(anchor, collapsed, hasChip) {
       if (anchor === null || anchor === undefined) return false;
@@ -799,6 +814,11 @@ window.__ModuleLoader__.load({
       return new File([text], pasteFileName(text, index), { type: "text/plain" });
     }
 
+    /** The fold sidecar's file: same bytes, distinguishing NAME. */
+    function sidecarFile(text, index) {
+      return new File([text], foldFileName(text, index), { type: "text/plain" });
+    }
+
     /**
      * Attach a sidecar file carrying a collapsed fold's text, so the submission
      * stays complete while the composer itself is empty.
@@ -821,7 +841,7 @@ window.__ModuleLoader__.load({
       if (typeof conversation.createDrafts !== "function" || typeof shell.addAttachments !== "function") return null;
       let drafts;
       try {
-        drafts = conversation.createDrafts(sessionId, [spillFile(text, index)]);
+        drafts = conversation.createDrafts(sessionId, [sidecarFile(text, index)]);
       } catch (error) {
         diag({ sidecarCreateDraftsThrew: String(error && error.message) });
         return null;
@@ -941,14 +961,18 @@ window.__ModuleLoader__.load({
      * Chip for the fold layer, rendered INSIDE the composer card, in a band of its
      * own directly above the attachments row and the editor.
      *
-     * It is a HINT, never a replacement: the full text stays in the editor and is
-     * submitted verbatim, which is what keeps slash-command and goal parsing
-     * identical to a plugin-free install.
+     * It is the ONLY affordance for a 4000–50000 byte paste, and it has exactly two
+     * outcomes:
      *
-     * It is also the toggle for the collapsed editor style, and it does the
-     * clamping itself. Collapsing is a presentational state on the composer card
-     * (see FOLD_ATTR); the text itself is never touched, so expanding/collapsing
-     * cannot change what is submitted.
+     *   - click the body  -> the held text is written back into the composer and
+     *                        this chip unmounts (nothing is folded any more)
+     *   - click the ×     -> the paste is DELETED: hold released and the sidecar
+     *                        attachment detached
+     *
+     * While it is on screen the composer is EMPTY — folding really does take the
+     * text out of the draft and hand it to the plugin (see the hold store). That is
+     * why the sidecar attachment exists: stock serializes the live editor with no
+     * hook to intercept, so an emptied composer would otherwise submit nothing.
      *
      * Why ONE component for both jobs. The previous build split them: a card in
      * `conversation.input.dock` and a marker in `conversation.input.overlay`. That
@@ -967,12 +991,16 @@ window.__ModuleLoader__.load({
       const record = readSessionSlice(usePasteFold, sessionId);
       const expanded = readSessionSlice(useFoldExpanded, sessionId);
       const present = foldApplies(record) || (typeof getHeld === "function" && getHeld(sessionId) !== undefined);
+      // An expanded chip cannot be shown: expanding consumes the fold, so `expanded`
+      // is only ever transiently true mid-click and never true for a mounted chip.
+      // Kept in the visibility test anyway so a stale flag from an older build can
+      // never pin a chip on screen for text that is already back in the composer.
       const collapsed = present && expanded !== true;
       const anchorRef = React.useRef(null);
       // ONE toggle for both the chip and the faded band, so "expand" can never mean
-      // "flip a flag" in one place and "write the text back" in another. Expanding a
-      // real edit (the text is physically out of the editor) makes that distinction
-      // the difference between restoring the user's paste and losing it.
+      // "flip a flag" in one place and "write the text back" in another. Expanding
+      // is a real edit (the text is physically out of the editor), which makes that
+      // distinction the difference between restoring the user's paste and losing it.
       const applyToggle = (next) => {
         if (typeof onToggle === "function") onToggle(sessionId, next);
         if (typeof setFoldExpanded === "function") setFoldExpanded(sessionId, next);
@@ -986,14 +1014,12 @@ window.__ModuleLoader__.load({
 
       // useLayoutEffect, not useEffect: the attributes must be on the card in the
       // same commit that reveals the fold, otherwise the first paint shows the
-      // full 40k paste and then snaps shut.
-      //
-      // `present` (not `collapsed`) drives the band: the chip stays mounted while
-      // expanded — it is the "collapse again" affordance — so releasing the band on
-      // expand would drop the text up under a floating chip.
+      // full 40k paste and then snaps shut. Both attributes pass the same value:
+      // the chip and the collapsed clamp now share a lifetime, because expanding
+      // removes the chip.
       React.useLayoutEffect(() => {
-        applyFoldToCard(anchorRef.current, collapsed, present);
-      }, [collapsed, present]);
+        applyFoldToCard(anchorRef.current, collapsed, collapsed);
+      }, [collapsed]);
 
       // Expand when the user clicks the faded band at the bottom of the clamped
       // editor. Bound in the CAPTURE phase on the scroll container so the caret is
@@ -1192,7 +1218,11 @@ window.__ModuleLoader__.load({
           diag({ manualCollapse: outcome });
           return;
         }
-        // Expand: write the held text back, THEN drop the flag so the chip relabels.
+        // Expand: write the held text back, then CONSUME the fold. The chip must
+        // unmount, not linger in an "expanded" state: once the text is back in the
+        // composer there is nothing left folded for a chip to represent, and the
+        // user asked for exactly that ("展开后，chip 消失并显示文本的完整内容").
+        //
         // The held text is captured BEFORE the restore, because `expandFold`
         // releases the hold — reading it afterwards would always find nothing.
         const heldNow = holdStore.get(sessionId);
@@ -1206,18 +1236,15 @@ window.__ModuleLoader__.load({
           });
           diag({ manualExpand: outcome });
         }
-        // The record must come back with the text, or the chip has nothing to show
-        // and the next collapse would have no `text` to hold. The watcher cleared it
-        // while the hold was active, so it is rebuilt here from the restored text.
-        if (typeof heldNow === "string" && heldNow !== "") {
-          foldStore.set(sessionId, {
-            bytes: utf8Bytes(heldNow),
-            lines: countLines(heldNow),
-            sentinels: [heldNow],
-            text: heldNow,
-          });
-        }
-        expandStore.set(sessionId, true);
+        // Retire the record and the flag rather than rebuilding them. Rebuilding is
+        // what kept the chip on screen after an expand; and the flag in particular
+        // must NOT be left set, because the watcher reads it — a sticky "already
+        // expanded" marker would make every later paste arrive chip-less.
+        //
+        // Clearing the record is safe here (unlike during a hold): the text is in
+        // the draft again, so the watcher's own staleness test agrees with us.
+        foldStore.clear(sessionId);
+        expandStore.clear(sessionId);
       };
       const setFoldExpanded = (sessionId, next) => {
         if (sessionId === undefined || sessionId === null) return;
@@ -1503,7 +1530,7 @@ window.__ModuleLoader__.load({
           // (`pasted-text-`), so a user's genuine attachments are untouched --
           // `display:none` rather than `visibility` so the card takes no space and
           // leaves no gap where it used to sit.
-          "[data-composer-card] [title^=\"" + PASTE_NAME_PREFIX + "\"]{display:none}" +
+          "[data-composer-card] [title^=\"" + FOLD_NAME_PREFIX + "\"]{display:none}" +
           // Collapsed editor: clamp the stock scroll container to ~3 lines and fade
           // the cut edge into the card so it reads as "there is more below" rather
           // than as a rendering bug. The 84px includes the container's own top
@@ -1581,6 +1608,7 @@ window.__ModuleLoader__.load({
       decidePaste,
       countLines,
       pasteFileName,
+      foldFileName,
       foldTextPresent,
       foldApplies,
       holdApplies,

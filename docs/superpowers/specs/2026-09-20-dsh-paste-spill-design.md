@@ -237,14 +237,23 @@ ctx.slots.inject("conversation.input.overlay", () => ctx.slots.register({
 **sidecar 的文件卡被 CSS 隐藏（用户要求"只保留上部分内容"）**：附件仍存在于草稿并随消息发出，只是卡片不显示：
 
 ```css
-[data-composer-card] [title^="pasted-text-"]{display:none}
+[data-composer-card] [title^="folded-text-"]{display:none}
 ```
 
 选择器按 stock 卡片自身的 `title` 属性（`FileCard` 里 `title: name`，即文件名）匹配，并限定在 `[data-composer-card]` 内：
 
-- 前缀 `pasted-text-` 是本插件独有的（`PASTE_NAME_PREFIX`，stock 中无同名前缀），所以**只隐藏我们自己的 sidecar**，用户拖进来的真实附件不受影响；
+- 前缀 `folded-text-` 是本插件独有的（`FOLD_NAME_PREFIX`，stock 中无同名前缀），所以**只隐藏折叠层的 sidecar**，用户拖进来的真实附件不受影响；
 - 限定在输入框卡片内，避免命中页面上其他同 `title` 的元素；
 - 用 `display:none` 而非 `visibility:hidden`，卡片不占位、不留空隙。
+
+**为什么折叠层必须有自己的前缀（关键）**：两层都会挂文件，若共用 `pasted-text-`，隐藏规则无法区分它们，会把 **≥50000 层的附件卡一并隐藏** —— 而那张卡（"文本变成真附件"的可视结果）正是那一层存在的意义。因此：
+
+| 层 | 前缀 | 卡片 |
+|---|---|---|
+| 折叠层 sidecar | `folded-text-` | 隐藏 |
+| ≥50000 落盘附件 | `pasted-text-` | 显示 |
+
+两个前缀都属于本插件，宿主半的 `isPasteAttachmentName` 必须**同时**接受（`OR` 两个前缀）。漏掉 `folded-text-` 的后果是静默的：折叠提交后 turn tail 的卡片不再出现，而消息本身完全正常，很难联想到是文件名过滤。宿主测试钉住了这一点。
 
 **由此产生的取舍**：隐藏卡片同时隐藏了 stock 的上传进度/失败重试/删除入口。删除入口由芯片的 `×` 承担（按 attachment id 卸载，不依赖任何 DOM），但**上传失败将不再可见** —— 此时消息里可能带一个未 ready 的附件。这是"只保留芯片"这一要求的直接代价。
 

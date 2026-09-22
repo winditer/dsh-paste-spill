@@ -6,9 +6,22 @@
 /** Filename prefix that marks a file as synthesized from a large paste. */
 export const PASTE_NAME_PREFIX = "pasted-text-";
 
-/** @returns true when the name is one of our synthesized pasted-text files. */
+/**
+ * Filename prefix for the FOLD sidecar.
+ *
+ * A 4000-50000 byte paste folds: the composer is emptied and the text rides a
+ * sidecar attachment. Its card is deliberately hidden in the composer (the user
+ * wants only the chip), which is why it needs a name distinct from
+ * `PASTE_NAME_PREFIX` — otherwise the hide rule could not be scoped to it without
+ * also hiding a spilled paste's card. It is still one of ours, so it must still be
+ * recognized here or the turn-tail card would silently stop appearing.
+ */
+export const FOLD_NAME_PREFIX = "folded-text-";
+
+/** @returns true when the name is one of our synthesized large-paste files. */
 export function isPasteAttachmentName(name) {
-  return typeof name === "string" && name.startsWith(PASTE_NAME_PREFIX);
+  if (typeof name !== "string") return false;
+  return name.startsWith(PASTE_NAME_PREFIX) || name.startsWith(FOLD_NAME_PREFIX);
 }
 
 /**
