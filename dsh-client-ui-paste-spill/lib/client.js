@@ -38,7 +38,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "codex-chip-4";
+    const BUILD_REV = "codex-chip-5";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -742,7 +742,7 @@ window.__ModuleLoader__.load({
      *
      * @returns an unsubscribe function.
      */
-    function watchDraft({ shell, foldStore, expandStore, holdStore, sessionId, conversation, nextIndex, onRestore, onSidecar, inbox }) {
+    function watchDraft({ shell, foldStore, expandStore, holdStore, sessionId, conversation, nextIndex, onRestore, onSidecar, onSendCommitted, sidecarIds, inbox }) {
       if (shell === undefined || shell === null || shell.state === undefined) return () => {};
       const store = shell.state;
       const initial = store.getSnapshot();
@@ -758,6 +758,51 @@ window.__ModuleLoader__.load({
         const current = typeof snapshot.draft === "string" ? snapshot.draft : "";
         if (snapshot.draftRev !== undefined && snapshot.draftRev === lastRev) return;
         lastRev = snapshot.draftRev;
+        // A COMPLETED SEND clears everything this plugin owns for the session.
+        //
+        // Nothing else observes a send, and without it the hold and record survive
+        // the message forever: the watcher's own staleness test is skipped while a
+        // hold is active (that guard is what stops a collapse from destroying its
+        // own text), so an emptied-after-send draft looks identical to a collapse.
+        // The result was a chip that would not go, a phantom occupying the composer,
+        // and sidecars piling up as each new paste collided with the stale state.
+        //
+        // A send is recognized as "the composer is now empty AND the attachments are
+        // gone": stock's commitSend() clears the draft and removes the accepted
+        // attachment ids in one commit, whereas a collapse empties the draft but
+        // deliberately KEEPS the sidecar attachment. Requiring both is what tells
+        // the two apart, and requiring that we were folded (or holding) keeps this
+        // from firing on an ordinary empty composer.
+        if (typeof onSendCommitted === "function") {
+          const ids = Array.isArray(snapshot.attachmentIds) ? snapshot.attachmentIds : [];
+          const folded = foldStore.getSnapshot()[sessionId] !== undefined;
+          const held = holdStore !== undefined && holdStore !== null && holdStore.has(sessionId) === true;
+          // Only our OWN sidecar leaving is evidence of a send. The composer can
+          // legitimately hold other attachments (a file the user added by hand), so
+          // "no attachments at all" would miss a send that carried those too, while
+          // "the ids we attached are gone" is exactly the observation that the
+          // submission took them.
+          const ours = sidecarIds === undefined ? undefined : sidecarIds.get(sessionId);
+          // "Gone" means the ids we attached are no longer on the composer. An
+          // unknown/never-attached sidecar must NOT count as gone: that is the
+          // state during the collapse itself (the draft empties while the hold is
+          // being established), and treating it as a send would clear the fold the
+          // instant it was created.
+          const sidecarGone = ours !== undefined && ours.length > 0 && ours.every((id) => !ids.includes(id));
+          // `ours.length > 0` is what excludes the SPILL layer: a spill never
+          // attaches a sidecar, so it never has ids here, so it can never look like
+          // a send. That matters because a spill also ends with an emptied draft and
+          // a removed attachment -- the send check must not steal its revision.
+          if (current === "" && sidecarGone && (folded || held)) {
+            onSendCommitted(sessionId);
+            diag({ sendCommitted: true });
+            previous = "";
+            return;
+          }
+        }
+        // The spill pump below must still see this revision in every other case,
+        // including an empty one: its own settle callback needs the pass it is
+        // waiting for, and skipping it here would stall the upload.
         const beforePaste = previous;
         const run = insertedRun(beforePaste, current);
         const recorded = inbox.take();
@@ -1401,6 +1446,22 @@ window.__ModuleLoader__.load({
             // Remember the sidecar ids so the chip's × can detach them: dismissing
             // must delete the paste from the submission, not only the composer.
             onSidecar: (ids) => sidecarIds.set(sessionId, ids),
+            sidecarIds,
+            // A completed send retires everything this plugin owns for the session.
+            // Stock has already cleared the draft and taken the attachments, so
+            // there is nothing to restore and nothing to detach: the sidecar went
+            // out WITH the message. Only our own bookkeeping survives, and it must
+            // not, or the next paste inherits it.
+            onSendCommitted: () => {
+              holdStore.clear(sessionId);
+              foldStore.clear(sessionId);
+              expandStore.clear(sessionId);
+              // The ids are dropped rather than detached: the attachment was
+              // submitted, so detaching it now would be deleting a file the user
+              // just sent. (removeAttachment on a committed id is also a no-op, but
+              // relying on that would be luck, not design.)
+              sidecarIds.delete(sessionId);
+            },
           }),
         );
         return true;

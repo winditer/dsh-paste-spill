@@ -154,9 +154,12 @@ function leafText(tree) {
  * consumes (`getSnapshot`/`subscribe`) plus the `draftRev` counter the real
  * `compose()` publishes, which watchDraft uses to skip no-op notifications.
  */
-function createDraftStore(initial) {
-  let state = { draft: initial, draftRev: 0 };
+function createDraftStore(initial, attachmentIds = []) {
+  let state = { draft: initial, draftRev: 0, attachmentIds };
   const listeners = new Set();
+  const emit = () => {
+    for (const listener of [...listeners]) listener();
+  };
   return {
     getSnapshot: () => state,
     subscribe(listener) {
@@ -164,8 +167,34 @@ function createDraftStore(initial) {
       return () => listeners.delete(listener);
     },
     setDraft(text) {
-      state = { draft: text, draftRev: state.draftRev + 1 };
-      for (const listener of [...listeners]) listener();
+      state = { ...state, draft: text, draftRev: state.draftRev + 1 };
+      emit();
+    },
+    /**
+     * Admit attachments the way stock does: the ids become VISIBLE in the published
+     * snapshot, but WITHOUT bumping the draft revision or notifying.
+     *
+     * Both details matter. A stub that swallows the ids makes the composer look
+     * permanently empty of attachments, which is indistinguishable from "the send
+     * took them" -- the sidecar would appear to vanish the moment it was attached.
+     * And notifying here would re-enter the watcher, which would re-attach: an
+     * infinite loop that is purely an artifact of the stub.
+     */
+    addAttachments(ids) {
+      state = { ...state, attachmentIds: [...state.attachmentIds, ...ids] };
+      return true;
+    },
+    removeAttachment(id) {
+      state = { ...state, attachmentIds: state.attachmentIds.filter((x) => x !== id) };
+      return true;
+    },
+    /**
+     * Mirror stock's own post-send commit: the draft is cleared AND the accepted
+     * attachments leave the composer, in one commit.
+     */
+    commitSend() {
+      state = { ...state, draft: "", draftRev: state.draftRev + 1, attachmentIds: [] };
+      emit();
     },
   };
 }
@@ -451,7 +480,7 @@ test("watchDraft removes the text only after the upload reports ready", async ()
   const listeners = [];
   const restores = [];
   const stop = watchDraft({
-    shell: { state: draftStore, addAttachments: () => true, setDraft: (text) => draftStore.setDraft(text) },
+    shell: { state: draftStore, addAttachments: (ids) => draftStore.addAttachments(ids), setDraft: (text) => draftStore.setDraft(text) },
     foldStore,
     sessionId: "sess-1",
     conversation,
@@ -491,7 +520,7 @@ test("watchDraft keeps the text inline when the upload fails", async () => {
   const stop = watchDraft({
     shell: {
       state: draftStore,
-      addAttachments: () => true,
+      addAttachments: (ids) => draftStore.addAttachments(ids),
       setDraft: (text) => draftStore.setDraft(text),
       removeAttachment: () => true,
     },
@@ -932,7 +961,7 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
   const shell = {
     state: draftStore,
     setDraft: (text) => draftStore.setDraft(text),
-    addAttachments: () => true,
+    addAttachments: (ids) => draftStore.addAttachments(ids),
   };
   // The sidecar attach runs on collapse, so this stub needs the real draft-
   // attachment surface: without it the collapse correctly REFUSES (it will not
@@ -1047,7 +1076,7 @@ test("a blank session still gets a watcher, so the hero composer folds", () => {
           shell: () => {
             shellCalls += 1;
             if (shellCalls === 1) throw new Error("scope not mounted");
-            return { state: draftStore, setDraft: (text) => draftStore.setDraft(text), addAttachments: () => true };
+            return { state: draftStore, setDraft: (text) => draftStore.setDraft(text), addAttachments: (ids) => draftStore.addAttachments(ids) };
           },
         },
         createDrafts: (_sessionId, files) => files.map((file, i) => ({ id: `sidecar-${i}`, file })),
@@ -1797,7 +1826,7 @@ test("expanding clears the fold so the chip unmounts once the text is back", () 
   const shell = {
     state: draftStore,
     setDraft: (text) => draftStore.setDraft(text),
-    addAttachments: () => true,
+    addAttachments: (ids) => draftStore.addAttachments(ids),
   };
   try {
     apply({
@@ -1866,7 +1895,7 @@ test("a fresh large paste after an expand folds again, so the chip is not suppre
   const shell = {
     state: draftStore,
     setDraft: (text) => draftStore.setDraft(text),
-    addAttachments: () => true,
+    addAttachments: (ids) => draftStore.addAttachments(ids),
   };
   try {
     apply({
@@ -1904,4 +1933,140 @@ test("a fresh large paste after an expand folds again, so the chip is not suppre
     t: (key) => key,
   });
   assert.notEqual(chipOf(tree), null, "and its chip is shown, not permanently suppressed");
+});
+
+// --- Sending clears the fold entirely -----------------------------------------
+//
+// The requirement in full: "发送后，不管是文本chip，还是输入框，发送到turn中，输入框全部
+// 清空". Sending is a COMPLETED interaction, so the hold, the record and the expanded
+// flag must all be gone afterwards.
+//
+// Before this existed nothing observed a completed send at all. Every clear site was
+// a user gesture (expand, dismiss, or the watcher noticing the text left the draft),
+// and the watcher deliberately skips cleanup while a hold is active -- so a send left
+// the hold and record alive forever. That single gap caused every reported symptom:
+// a phantom occupying the composer, a chip that would not go, and sidecars that piled
+// up because each new paste collided with the stale state.
+
+/** Build an applied plugin wired to a draft store, returning the slot entry face. */
+function setUpFold({ draft = "", attachments = [] } = {}) {
+  const { apply } = loadBundle().exports;
+  let entry = null;
+  const hostStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = hostStub;
+  const draftStore = createDraftStore(draft, attachments);
+  const shell = {
+    state: draftStore,
+    setDraft: (text) => draftStore.setDraft(text),
+    addAttachments: (ids) => draftStore.addAttachments(ids),
+    removeAttachment: () => true,
+  };
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_key, register) => register(), register: (e) => { entry = e; } },
+      sessions: { list: { getSnapshot: () => ({ current: "s1" }), subscribe: () => () => {} } },
+      conversation: {
+        input: { shell: () => shell },
+        createDrafts: (_s, files) => files.map((file, i) => ({ id: `d-${i}`, file })),
+        releaseDraftAttachments: () => {},
+      },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+  return { face: entry.inject("s1"), draftStore, shell };
+}
+
+test("sending clears the hold, the record and the flag, so nothing survives the turn", () => {
+  const { face, draftStore } = setUpFold();
+  const body = "s".repeat(6000);
+  draftStore.setDraft(body);
+  assert.ok(face.hooks.pasteFold.getSnapshot()["s1"], "the paste folded");
+  assert.equal(face.getHeld("s1"), body, "and is held while collapsed");
+
+  // The user sends. Stock clears the draft and drops the accepted attachment.
+  draftStore.commitSend();
+
+  assert.equal(face.getHeld("s1"), undefined, "the hold is released");
+  assert.equal(face.hooks.pasteFold.getSnapshot()["s1"], undefined, "the fold record is gone");
+  assert.equal(face.hooks.foldExpanded.getSnapshot()["s1"], undefined, "and so is the expanded flag");
+  assert.equal(draftStore.getSnapshot().draft, "", "the composer is empty");
+});
+
+test("after sending, the chip is gone and does not come back on its own", () => {
+  const { face, draftStore } = setUpFold();
+  draftStore.setDraft("t".repeat(6000));
+  draftStore.commitSend();
+
+  const tree = loadBundle().exports.__internals.PasteFoldChip({
+    sessionId: "s1",
+    usePasteFold: (select) => select(face.hooks.pasteFold.getSnapshot()),
+    useFoldExpanded: (select) => select(face.hooks.foldExpanded.getSnapshot()),
+    onToggle: face.onToggle,
+    onDismiss: face.onDismiss,
+    getHeld: face.getHeld,
+    t: (key) => key,
+  });
+  assert.equal(chipOf(tree), null, "the chip is unmounted after a send");
+});
+
+test("a paste after a send folds again, and leaves no stale attachment behind", () => {
+  // "删除后重新粘贴，发送会重复出现 json chip": the stale state from the previous
+  // interaction collided with the new one. A send must be a clean slate.
+  const { face, draftStore } = setUpFold();
+  draftStore.setDraft("u".repeat(6000));
+  draftStore.commitSend();
+
+  const second = "v".repeat(6000);
+  draftStore.setDraft(second);
+  assert.ok(face.hooks.pasteFold.getSnapshot()["s1"], "the new paste folds");
+  assert.equal(face.getHeld("s1"), second, "and holds the NEW text, not the old one");
+  assert.equal(draftStore.getSnapshot().draft, "", "with the composer empty again");
+});
+
+test("the full summary contract: chip -> × empties, chip -> expand restores, send clears all", () => {
+  // The requirement stated as one sequence. Each step is covered above; this test
+  // exists to pin the SEQUENCE, because the failures reported live were about state
+  // surviving between steps rather than about any single step being wrong.
+  const { face, draftStore } = setUpFold();
+  const body = "c".repeat(6000);
+
+  // Paste: the text shows as a chip and the composer is empty.
+  draftStore.setDraft(body);
+  assert.equal(draftStore.getSnapshot().draft, "", "1. pasting empties the composer");
+  assert.ok(face.hooks.pasteFold.getSnapshot()["s1"], "1. and shows a chip");
+  assert.equal(face.getHeld("s1"), body, "1. with the text held verbatim");
+
+  // Expand: the chip goes and the text comes back COMPLETE.
+  face.onToggle("s1", true);
+  assert.equal(draftStore.getSnapshot().draft, body, "2. expanding restores the text in full");
+  assert.equal(face.hooks.pasteFold.getSnapshot()["s1"], undefined, "2. and the chip is gone");
+  assert.equal(face.getHeld("s1"), undefined, "2. with nothing left held");
+
+  // Send: everything is cleared.
+  draftStore.commitSend();
+  assert.equal(draftStore.getSnapshot().draft, "", "3. sending leaves the composer empty");
+  assert.equal(face.getHeld("s1"), undefined, "3. nothing held");
+  assert.equal(face.hooks.pasteFold.getSnapshot()["s1"], undefined, "3. no chip");
+});
+
+test("dismissing with × empties the composer and deletes the paste", () => {
+  const { face, draftStore } = setUpFold();
+  draftStore.setDraft("d".repeat(6000));
+  assert.equal(draftStore.getSnapshot().draft, "", "already empty while collapsed");
+
+  face.onDismiss("s1");
+  assert.equal(face.getHeld("s1"), undefined, "× releases the hold");
+  assert.equal(face.hooks.pasteFold.getSnapshot()["s1"], undefined, "× drops the record");
+  assert.equal(draftStore.getSnapshot().draft, "", "and the composer stays empty");
 });
