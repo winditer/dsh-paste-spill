@@ -45,7 +45,7 @@ Codex 在输入框粘贴大段文本时会自动转成文件（Desktop 生成 `P
 
 | 层 | 阈值 | 行为 |
 |---|---|---|
-| 折叠层 | ≥ **4,000** UTF-8 字节 | 输入框出现一张"已折叠大文本"卡片，**全文留在草稿中**，提交时原样内联给模型 |
+| 折叠层 | ≥ **4,000** UTF-8 字节 | 输入框出现**一个**芯片（内容预览 + "在文本框中显示 ›" + `×`），**编辑器清空**、文本由插件持有；点芯片写回全文，点 `×` 删除（持有 + 附件）；折叠时自动挂 sidecar 附件保证提交不为空 |
 | 转文件层 | ≥ **50,000** UTF-8 字节 | 文本变成**真附件**落盘，消息里是 `file` 块；turn tail 出现可点卡片，点击在右侧栏预览 |
 
 两层**独立**（SPEC §4.3：`两层不要合并成一个开关`）。4,000 是纯 UI 折叠，零语义变化；50,000 改变模型所见，必须显式。
@@ -170,18 +170,30 @@ ctx.slots.inject("conversation.input.overlay", () => ctx.slots.register({
 | 编辑器内的真 chip | `editor` 是 `SessionInputShell` 私有字段，插件拿不到；要往别人的 Lexical 实例注册 node 并**重建提交内容**，正是破坏 `/goal` 解析的做法（Codex #25346）。**不做** |
 | `conversation.input.overlay` | `kind: "list"`、`scope: "session"`，与 stock 的 `input-trigger`/`commands`/`message-feedback` 共用；渲染点在 `[data-composer-card]` **内部**、编辑区之上。**采用** |
 
-**卡片形态**：单行紧凑芯片，复用 stock 附件卡的视觉语言（`.5px solid var(--dsw-alias-border-l2)`、`border-radius:16px`、`background:var(--dsw-specific-input-major)`、`height:32px`、`padding:0 12px`、`gap:10px`），内容为 `已折叠大文本 · 6008 字节 · 174 行 ▸`，展开后标题换成"已展开大文本"、箭头换成 `▾`。整个芯片是一个 `<button>`（`aria-expanded`，键盘可达），点击切换展开/收起。
+**卡片形态（已修订，参照 Codex）**：**单个**芯片，两行高（48px），不再有"已折叠大文本 · N 字节 · N 行"这种状态行。复用 stock 附件卡的视觉语言（`.5px solid var(--dsw-alias-border-l2)`、`background:var(--dsw-specific-input-major)`、`border-radius:12px`），内容是：
+
+```
+[≡]  {"readings": {"b…        (×)
+     在文本框中显示 ›
+```
+
+- 上行 = **内容预览**（`foldPreview`：把折叠文本压成一行、40 字符后加省略号），让用户认得折叠的是哪一段；纯空白文本才退回标签文案。
+- 下行 = **动作**`在文本框中显示 ›`。
+- 右上角 `×` = 关闭。
+- 结构是 `div` 容器 + **两个兄弟 `<button>`**（展开按钮、关闭按钮），不是嵌套按钮 —— 嵌套 `<button>` 是非法 HTML。展开按钮占满芯片主体，键盘可达（`aria-expanded`）。
+
+**两个意图必须分开**：点主体 = **展开写回**；点 `×` = **关闭即删除**（释放持有 **+ 卸掉 sidecar 附件**）。`×` 的 onClick 必须 `stopPropagation()`，否则同一次点击会既删除又展开。删除必须连附件一起 —— 否则输入框看着"已删除"、下一次发送却仍带着该文件。
 
 **定位**：`conversation.input.overlay` 的锚点是**浮动层**（`.p_FcLG_overlayAnchor{height:0;position:absolute;inset:0 0 auto}`），而卡片本身 `position:relative`，所以芯片用绝对定位落在卡片顶部，并让卡片为它**预留一条带**：
 
 ```css
-[data-composer-card][data-dshps-chip]{padding-top:44px}   /* 8 + 32 + 4 */
-.dshps-chip{position:absolute;top:8px;left:12px;right:12px;height:32px;…}
+[data-composer-card][data-dshps-chip]{padding-top:60px}   /* 8 + 48 + 4 */
+.dshps-chip{position:absolute;top:8px;left:12px;width:fit-content;height:48px;…}
 ```
 
-`:has()` 不是必须的：`data-dshps-chip` 由 `applyFoldToCard` 直接打在卡片上，所以"芯片是否占位"用的是自身属性，只和 `data-dshps-folded` 一样是同一个组件写的。带高由 `CHIP_TOP_PX + CHIP_HEIGHT_PX + CHIP_GAP_PX` 三个 JS 常量算出并**插值进**样式串，避免与定位各写一份而失步（测试断言 `padding-top ≥ top + height`）。
+`:has()` 不是必须的：`data-dshps-chip` 由 `applyFoldToCard` 直接打在卡片上，所以"芯片是否占位"用的是自身属性，只和 `data-dshps-folded` 一样是同一个组件写的。带高由 `CHIP_TOP_PX + CHIP_HEIGHT_PX + CHIP_GAP_PX` 三个 JS 常量算出并**插值进**样式串，避免与定位各写一份而失步（测试断言 `padding-top ≥ top + height`）。宽度用 `fit-content` 而非 `left+right` 双钉，否则会被拉成横贯整卡的 banner。
 
-**为什么折叠时展开入口有两个、而框外没有**：芯片本身（按钮）是主入口；另一个是折叠区底部的渐隐带（见 4.3.2）。框外不再有任何提示元素。
+**为什么折叠时展开入口有两个、而框外没有**：芯片主体（按钮）是主入口；另一个是折叠区底部的渐隐带（见 4.3.2）。框外不再有任何提示元素。
 
 #### 4.3.2 折叠样式与渐隐带
 
@@ -202,7 +214,7 @@ ctx.slots.inject("conversation.input.overlay", () => ctx.slots.register({
 
 **渐隐带**用 `mousedown` **捕获阶段**命中判定（`clientY >= rect.bottom - FADE_PX`）后 `preventDefault()` 再展开。用捕获阶段是因为等到冒泡时插入点已被放置、容器已滚动，渐隐带会从指针下移开。**只有渐隐带可点**：可见文字行的点击完全照旧，因此折叠后仍能点进输入框追加"总结一下"，不会误展开。
 
-**展开后芯片仍在、带仍保留**：芯片在展开态依然是"收起"入口，所以 `applyFoldToCard` 的第三个参数 `hasChip` 与 `collapsed` 分开。否则一展开就松开预留带，文字会跳到一枚浮动芯片下面。
+**展开后带是否保留**：`applyFoldToCard` 的第三个参数 `hasChip` 仍与 `collapsed` 分开。展开会把持有文本写回编辑器、芯片随即消失，所以带在下一帧释放；分开传参保证的是"带只跟芯片的**存在**走"，而不是跟某个布尔状态走 —— 否则短暂的不一致就会让文字在带与无带之间跳一下。折叠态下 `hasChip` 与 `collapsed` 同时为真，带保留是主路径。
 
 **卸载清理**：会话切走时由一个卸载 effect 清掉 `data-dshps-folded` 与 `data-dshps-chip`。残留属性会把**下一个**会话的输入框裁掉一大截，而屏幕上没有任何东西解释这件事。
 

@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "hold-and-restore-1";
+    const BUILD_REV = "codex-chip-1";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -60,20 +60,18 @@ window.__ModuleLoader__.load({
     }
 
     const zh = {
+      // Shown only when the preview is unavailable (a whitespace-only paste).
       foldTitle: "已折叠大文本",
-      foldTitleExpanded: "已展开大文本",
-      foldMeta: "{bytes} 字节 · {lines} 行",
-      // Tooltip on the chip, and the chip is the only place this is said now:
-      // the build that rendered a paragraph ABOVE the input box was rejected.
-      foldHint: "点击展开全文 · 提交时按原样发送",
-      foldHintExpanded: "点击折叠全文 · 提交时按原样发送",
+      // The affordance line, matching the reference chip's "在文本框中显示 ›".
+      foldExpandAction: "在文本框中显示",
+      foldDismissLabel: "删除这段文本",
+      foldHint: "点击展开全文到输入框 · 提交时按原样发送",
     };
     const en = {
       foldTitle: "Large text folded",
-      foldTitleExpanded: "Large text expanded",
-      foldMeta: "{bytes} bytes · {lines} lines",
-      foldHint: "Click to expand · sent as-is",
-      foldHintExpanded: "Click to collapse · sent as-is",
+      foldExpandAction: "Show in text box",
+      foldDismissLabel: "Delete this text",
+      foldHint: "Click to expand into the text box · sent as-is",
     };
 
     /** UTF-8 byte length — the one measurement all thresholds use. */
@@ -157,6 +155,24 @@ window.__ModuleLoader__.load({
       return holdStore.has(sessionId) === true;
     }
 
+    /** Max characters of pasted content shown on the chip's preview line. */
+    const PREVIEW_CHARS = 40;
+
+    /**
+     * One-line preview of the folded text, for the chip's title.
+     *
+     * The reference chip shows the opening characters of the content rather than a
+     * size summary, so the user can recognize WHAT was folded. Newlines and runs of
+     * whitespace collapse to single spaces because the chip is one line tall and an
+     * embedded newline would otherwise make the ellipsis meaningless.
+     */
+    function foldPreview(text) {
+      if (typeof text !== "string" || text === "") return "";
+      const flat = text.replace(/\s+/g, " ").trim();
+      if (flat === "") return "";
+      return flat.length <= PREVIEW_CHARS ? flat : `${flat.slice(0, PREVIEW_CHARS)}\u2026`;
+    }
+
     /**
      * DOM attribute carrying the collapsed state on the composer card. The card
      * (not our own subtree) is the only element that can clamp the editor, because
@@ -200,8 +216,9 @@ window.__ModuleLoader__.load({
     /** Top offset of the chip inside the card, in px — mirrors the card's own
      * stock `padding-top`. */
     const CHIP_TOP_PX = 8;
-    /** Chip height in px, matching the stock attachment chips' visual weight. */
-    const CHIP_HEIGHT_PX = 32;
+    /** Chip height in px. Two lines (content preview + action), matching the
+     * reference chip rather than a single-line summary row. */
+    const CHIP_HEIGHT_PX = 48;
     /** Gap between the chip and the content below it, in px. */
     const CHIP_GAP_PX = 4;
     /**
@@ -333,6 +350,38 @@ window.__ModuleLoader__.load({
       setDraft(next);
       holdStore.clear(sessionId);
       return "restored";
+    }
+
+    /**
+     * Dismiss a fold: "关闭即删除" — the chip's × discards the paste for real.
+     *
+     * Deleting means deleting, not just hiding: the held text is released, the
+     * sidecar attachment that carries the paste into the submission is detached,
+     * and the fold state is cleared so no chip remains. Leaving the sidecar behind
+     * would be the worst outcome of the three -- the composer would look empty and
+     * chip-free while the next send still carried a file the user had discarded.
+     *
+     * The clear order is deliberate: state is cleared LAST, so a throwing detach
+     * leaves the chip on screen (the user can retry) rather than vanishing while
+     * the attachment survives.
+     *
+     * @returns "dismissed" when something was discarded, "none" otherwise.
+     */
+    function dismissFold({ sessionId, holdStore, attachmentIds, removeAttachment, clearFold }) {
+      const hadHold = holdStore.has(sessionId);
+      const ids = Array.isArray(attachmentIds) ? attachmentIds : [];
+      if (!hadHold && ids.length === 0) return "none";
+      const detached = [];
+      for (const id of ids) {
+        try {
+          if (removeAttachment(id) !== false) detached.push(id);
+        } catch {
+          /* best-effort: the hold still goes, and a stale chip is the visible failure */
+        }
+      }
+      holdStore.clear(sessionId);
+      if (typeof clearFold === "function") clearFold();
+      return "dismissed";
     }
 
     /**
@@ -545,7 +594,7 @@ window.__ModuleLoader__.load({
      *
      * @returns "inline" | "fold" | "file".
      */
-    function reactToDraft({ previous, current, run, recorded, sessionId, conversation, shell, foldStore, expandStore, holdStore, index = 1, onUploadSettled }) {
+    function reactToDraft({ previous, current, run, recorded, sessionId, conversation, shell, foldStore, expandStore, holdStore, index = 1, onUploadSettled, onSidecar }) {
       // The watcher is the single authority for the fold record's lifetime: it is
       // the only place that sees every draft revision, so it can clear the record
       // the moment the padded text is gone. The card deliberately does NOT rely on
@@ -615,8 +664,12 @@ window.__ModuleLoader__.load({
           // than to an empty composer holding text nothing would send.
           if (holdStore !== undefined && holdStore !== null && shell !== undefined && shell !== null && typeof shell.setDraft === "function") {
             const attached = attachSidecar({ conversation, sessionId, shell, text: candidate, index });
-            diag({ foldSidecarAttached: attached });
-            if (attached) {
+            diag({ foldSidecarAttached: attached !== null && attached !== undefined });
+            // Report the admitted ids so the caller can detach them on dismiss.
+            if (attached !== null && attached !== undefined && typeof onSidecar === "function") {
+              onSidecar(attached);
+            }
+            if (attached !== null && attached !== undefined) {
               try {
                 const outcome = collapseFold({
                   record: { text: candidate },
@@ -674,7 +727,7 @@ window.__ModuleLoader__.load({
      *
      * @returns an unsubscribe function.
      */
-    function watchDraft({ shell, foldStore, expandStore, holdStore, sessionId, conversation, nextIndex, onRestore, inbox }) {
+    function watchDraft({ shell, foldStore, expandStore, holdStore, sessionId, conversation, nextIndex, onRestore, onSidecar, inbox }) {
       if (shell === undefined || shell === null || shell.state === undefined) return () => {};
       const store = shell.state;
       const initial = store.getSnapshot();
@@ -713,6 +766,7 @@ window.__ModuleLoader__.load({
           expandStore,
           holdStore,
           index: nextIndex(),
+          onSidecar,
           onUploadSettled: (ok) => {
             if (ok !== true) return;
             try {
@@ -764,15 +818,15 @@ window.__ModuleLoader__.load({
      */
     function attachSidecar({ conversation, sessionId, shell, text, index }) {
       if (conversation === undefined || conversation === null || shell === null || shell === undefined) return false;
-      if (typeof conversation.createDrafts !== "function" || typeof shell.addAttachments !== "function") return false;
+      if (typeof conversation.createDrafts !== "function" || typeof shell.addAttachments !== "function") return null;
       let drafts;
       try {
         drafts = conversation.createDrafts(sessionId, [spillFile(text, index)]);
       } catch (error) {
         diag({ sidecarCreateDraftsThrew: String(error && error.message) });
-        return false;
+        return null;
       }
-      if (!Array.isArray(drafts) || drafts.length === 0) return false;
+      if (!Array.isArray(drafts) || drafts.length === 0) return null;
       const ids = drafts.map((draft) => draft.id);
       // A locked submit plane refuses the attachment; treating that as success
       // would empty the composer with nothing carrying the text.
@@ -782,9 +836,10 @@ window.__ModuleLoader__.load({
         } catch {
           /* releasing is best-effort; the refusal already means nothing was added */
         }
-        return false;
+        return null;
       }
-      return true;
+      // The admitted ids are returned so the chip's × can detach exactly this file.
+      return ids;
     }
 
     /**
@@ -908,7 +963,7 @@ window.__ModuleLoader__.load({
      * data source: the watcher clears the record when the folded text leaves the
      * draft, which is what hides the chip.
      */
-    function PasteFoldChip({ sessionId, usePasteFold, useFoldExpanded, setFoldExpanded, onToggle, getHeld, t }) {
+    function PasteFoldChip({ sessionId, usePasteFold, useFoldExpanded, setFoldExpanded, onToggle, onDismiss, getHeld, t }) {
       const record = readSessionSlice(usePasteFold, sessionId);
       const expanded = readSessionSlice(useFoldExpanded, sessionId);
       const present = foldApplies(record) || (typeof getHeld === "function" && getHeld(sessionId) !== undefined);
@@ -921,6 +976,12 @@ window.__ModuleLoader__.load({
       const applyToggle = (next) => {
         if (typeof onToggle === "function") onToggle(sessionId, next);
         if (typeof setFoldExpanded === "function") setFoldExpanded(sessionId, next);
+      };
+      // Dismiss is its own action, never routed through the toggle: "关闭即删除"
+      // and "展开写回" are opposites, and sharing a callback would make the × a
+      // coin flip between them.
+      const applyDismiss = () => {
+        if (typeof onDismiss === "function") onDismiss(sessionId);
       };
 
       // useLayoutEffect, not useEffect: the attributes must be on the card in the
@@ -976,18 +1037,14 @@ window.__ModuleLoader__.load({
 
       const label = t === undefined ? (key) => key : t;
       const open = expanded === true;
-      // The chip's labels must survive the record being retired. Collapsing REMOVES
+      // The PREVIEW text, from whichever source still holds it. Collapsing removes
       // the text from the draft, which is exactly the condition that makes the
-      // watcher clear the fold record — so a held fold often has no record, and
-      // reading bytes/lines off one would crash the composer. The held text is the
-      // fallback source, measured the same way the record was.
+      // watcher clear the record — so a held fold often has no record, and reading
+      // `record.text` alone would leave the chip previewless.
       const heldText = typeof getHeld === "function" ? getHeld(sessionId) : undefined;
-      const meta =
-        record !== undefined && record !== null
-          ? { bytes: record.bytes, lines: record.lines }
-          : typeof heldText === "string"
-            ? { bytes: utf8Bytes(heldText), lines: countLines(heldText) }
-            : { bytes: 0, lines: 0 };
+      const previewSource =
+        record !== undefined && record !== null && typeof record.text === "string" ? record.text : heldText;
+      const preview = foldPreview(previewSource);
       return React.createElement(
         React.Fragment,
         null,
@@ -1002,33 +1059,76 @@ window.__ModuleLoader__.load({
         }),
         present
           ? React.createElement(
-              "button",
+              "div",
               {
-                type: "button",
                 className: "dshps-chip",
                 "data-paste-spill-chip": true,
                 "data-paste-spill-toggle": open ? "expanded" : "collapsed",
-                "aria-expanded": open,
-                title: label(open ? "foldHintExpanded" : "foldHint"),
-                onClick: () => {
-                  applyToggle(!open);
-                },
               },
+              // The body is the expand target: clicking it puts the full text back
+              // into the text box and this chip goes away. A real <button> so the
+              // action is keyboard-reachable.
               React.createElement(
-                "span",
-                { className: "dshps-chip-title" },
-                label(open ? "foldTitleExpanded" : "foldTitle"),
+                "button",
+                {
+                  type: "button",
+                  className: "dshps-chip-open",
+                  "data-paste-spill-open": true,
+                  "aria-expanded": open,
+                  title: label("foldHint"),
+                  onClick: () => {
+                    applyToggle(true);
+                  },
+                },
+                React.createElement(
+                  "span",
+                  { className: "dshps-chip-glyph", "aria-hidden": true },
+                  React.createElement(
+                    "svg",
+                    { viewBox: "0 0 16 16", width: "16", height: "16", fill: "none" },
+                    React.createElement("path", {
+                      d: "M3 5.5h10M3 10.5h10",
+                      stroke: "currentColor",
+                      strokeWidth: "1.2",
+                      strokeLinecap: "round",
+                    }),
+                  ),
+                ),
+                React.createElement(
+                  "span",
+                  { className: "dshps-chip-body" },
+                  React.createElement(
+                    "span",
+                    { className: "dshps-chip-preview" },
+                    preview === "" ? label("foldTitle") : preview,
+                  ),
+                  React.createElement(
+                    "span",
+                    { className: "dshps-chip-action" },
+                    label("foldExpandAction"),
+                    React.createElement("span", { className: "dshps-chip-chevron", "aria-hidden": true }, "\u203A"),
+                  ),
+                ),
               ),
-              React.createElement("span", { className: "dshps-chip-dot", "aria-hidden": true }, "\u00B7"),
+              // "关闭即删除": discards the paste (hold + sidecar) rather than hiding
+              // it. Nested inside the chip but NOT inside the open button, so a
+              // click here cannot also expand.
               React.createElement(
-                "span",
-                { className: "dshps-chip-meta" },
-                label("foldMeta", { bytes: meta.bytes, lines: meta.lines }),
-              ),
-              React.createElement(
-                "span",
-                { className: "dshps-chip-chevron", "aria-hidden": true },
-                open ? "\u25BE" : "\u25B8",
+                "button",
+                {
+                  type: "button",
+                  className: "dshps-chip-dismiss",
+                  "data-paste-spill-dismiss": true,
+                  "aria-label": label("foldDismissLabel"),
+                  title: label("foldDismissLabel"),
+                  onClick: (event) => {
+                    // The chip's own onClick would otherwise expand on the same
+                    // click: dismissing and expanding are mutually exclusive.
+                    if (event !== undefined && typeof event.stopPropagation === "function") event.stopPropagation();
+                    applyDismiss();
+                  },
+                },
+                "\u00D7",
               ),
             )
           : null,
@@ -1050,6 +1150,12 @@ window.__ModuleLoader__.load({
       // text is NOT in the draft, so it cannot ride on the record (which the watcher
       // retires exactly when text leaves the draft).
       const holdStore = createHoldStore();
+      /**
+       * Attachment ids the sidecar admitted, per session. Tracked so the chip's ×
+       * can detach exactly the file this collapse attached: "关闭即删除" has to
+       * delete the paste from the SUBMISSION too, not just from the composer.
+       */
+      const sidecarIds = new Map();
       /** Restore-aware toggle: the ONE place a fold collapses or expands. */
       const toggleFold = (sessionId, next) => {
         if (sessionId === undefined || sessionId === null) return;
@@ -1071,10 +1177,11 @@ window.__ModuleLoader__.load({
             text: record.text,
             index: nextIndex(),
           });
-          if (!attached) {
+          if (attached === null || attached === undefined) {
             diag({ manualCollapseRefused: true });
             return;
           }
+          sidecarIds.set(sessionId, attached);
           const outcome = collapseFold({
             record,
             sessionId,
@@ -1116,6 +1223,34 @@ window.__ModuleLoader__.load({
         if (sessionId === undefined || sessionId === null) return;
         if (next) expandStore.set(sessionId, true);
         else expandStore.clear(sessionId);
+      };
+      /**
+       * The chip's × handler: "关闭即删除".
+       *
+       * Detaches the sidecar this collapse attached, in addition to releasing the
+       * hold. Without the detach the paste would be "deleted" while a file carrying
+       * it still rode the next send, and the composer would show nothing to explain
+       * it — the exact failure the sidecar exists to prevent, inverted. The ids are
+       * tracked per session because `attachSidecar` admits them on collapse.
+       */
+      const dismissSessionFold = (sessionId) => {
+        if (sessionId === undefined || sessionId === null) return;
+        const shell = shellOf(ctx, sessionId);
+        const outcome = dismissFold({
+          sessionId,
+          holdStore,
+          attachmentIds: sidecarIds.get(sessionId) ?? [],
+          removeAttachment: (id) => {
+            if (shell === null || typeof shell.removeAttachment !== "function") return false;
+            return shell.removeAttachment(id);
+          },
+          clearFold: () => {
+            foldStore.clear(sessionId);
+            expandStore.clear(sessionId);
+          },
+        });
+        sidecarIds.delete(sessionId);
+        diag({ foldDismissed: outcome });
       };
       let counter = 0;
       const nextIndex = () => {
@@ -1236,6 +1371,9 @@ window.__ModuleLoader__.load({
             nextIndex,
             inbox,
             onRestore: () => diag({ spilledTextRemoved: true }),
+            // Remember the sidecar ids so the chip's × can detach them: dismissing
+            // must delete the paste from the submission, not only the composer.
+            onSidecar: (ids) => sidecarIds.set(sessionId, ids),
           }),
         );
         return true;
@@ -1323,18 +1461,34 @@ window.__ModuleLoader__.load({
           // of the composer's own affordances rather than a plugin banner.
           "border:.5px solid var(--dsw-alias-border-l2,#0000001f);" +
           "background:var(--dsw-specific-input-major,transparent);" +
-          "border-radius:16px;padding:0 12px;gap:10px;align-items:center;display:flex;" +
-          "text-align:left;font:inherit;color:inherit;cursor:pointer;overflow:hidden;" +
-          "z-index:1}" +
+          "border-radius:12px;align-items:center;display:flex;" +
+          "text-align:left;font:inherit;color:inherit;overflow:hidden;z-index:1}" +
           ".dshps-chip:hover{border-color:var(--dsw-alias-border-l1,#00000033)}" +
-          ".dshps-chip:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}" +
-          // One line only. The chip is a fixed 32px tall, so a wrap would be
-          // clipped rather than grow; the meta is the part allowed to give way
-          // (ellipsis) because the title and the chevron are the affordance.
-          ".dshps-chip-title{flex:none;white-space:nowrap;font-weight:500;color:var(--dsw-alias-label-primary)}" +
-          ".dshps-chip-dot{flex:none;color:var(--dsw-alias-label-tertiary)}" +
-          ".dshps-chip-meta{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary)}" +
-          ".dshps-chip-chevron{flex:none;margin-left:auto;padding-left:2px;color:var(--dsw-alias-label-tertiary);font-size:11px}" +
+          // The body is the expand affordance: a flat button filling the chip so the
+          // whole surface (except the × corner) is the click target.
+          ".dshps-chip-open{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:10px;" +
+          "height:100%;padding:0 4px 0 10px;border:none;background:transparent;font:inherit;" +
+          "color:inherit;cursor:pointer;text-align:left}" +
+          ".dshps-chip-open:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:-2px;border-radius:12px}" +
+          ".dshps-chip-glyph{flex:none;display:inline-flex;align-items:center;justify-content:center;" +
+          "width:24px;height:24px;border-radius:6px;background:var(--dsw-alias-bg-base,#0000000a);" +
+          "color:var(--dsw-alias-label-secondary)}" +
+          // Two stacked lines: the content preview on top, the action underneath —
+          // the reference chip's shape. Both single-line, so the fixed height holds.
+          ".dshps-chip-body{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px}" +
+          ".dshps-chip-preview{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;" +
+          "white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:13px;line-height:18px}" +
+          ".dshps-chip-action{display:flex;align-items:center;gap:2px;color:var(--dsw-alias-label-tertiary);" +
+          "font-size:12px;line-height:16px;white-space:nowrap}" +
+          ".dshps-chip-chevron{flex:none;font-size:11px}" +
+          // "关闭即删除": a small circular × in the chip's top-right, like the
+          // reference. Sized and padded to stay a comfortable hit target.
+          ".dshps-chip-dismiss{flex:none;display:inline-flex;align-items:center;justify-content:center;" +
+          "width:20px;height:20px;margin-right:8px;padding:0;border:none;border-radius:999px;" +
+          "background:var(--dsw-alias-label-primary,#000);color:var(--dsw-alias-bg-base,#fff);" +
+          "font-size:13px;line-height:1;cursor:pointer;opacity:.85}" +
+          ".dshps-chip-dismiss:hover{opacity:1}" +
+          ".dshps-chip-dismiss:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}" +
           // The anchor itself must occupy no space and never intercept a click; it
           // exists only to locate the composer card from inside it.
           ".dshps-fold-anchor{height:0;width:0;pointer-events:none}" +
@@ -1394,10 +1548,11 @@ window.__ModuleLoader__.load({
               setFoldExpanded,
               // The restore-aware toggle. `onToggle` is what makes the chip's click
               // press the real edit (write the text back), and `getHeld` is how the
-              // chip keeps its byte/line labels after the record is retired by the
-              // collapse. Both are plain functions, not stores: the chip does not
-              // need to re-render on a hold change, it re-renders on the fold store.
+              // chip previews content after the record is retired by the collapse.
+              // Both are plain functions, not stores: the chip does not need to
+              // re-render on a hold change, it re-renders on the fold store.
               onToggle: toggleFold,
+              onDismiss: dismissSessionFold,
               getHeld: (id) => holdStore.get(id),
             }),
           },
@@ -1420,6 +1575,8 @@ window.__ModuleLoader__.load({
       createHoldStore,
       collapseFold,
       expandFold,
+      dismissFold,
+      foldPreview,
       readSessionSlice,
       applyFoldToCard,
       FOLD_ATTR,

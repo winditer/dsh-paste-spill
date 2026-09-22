@@ -104,6 +104,28 @@ function chipOf(tree) {
   return null;
 }
 
+/**
+ * The expand affordance inside the chip. The chip is now a container (a div)
+ * holding the open button and the dismiss button, so a test that wants the
+ * "expand" action has to reach one level further in than `chipOf`.
+ */
+function openButtonOf(tree) {
+  const chip = chipOf(tree);
+  for (const child of chip?.children ?? []) {
+    if (child !== null && typeof child === "object" && child.props?.["data-paste-spill-open"]) return child;
+  }
+  return null;
+}
+
+/** The dismiss (×) control inside the chip. */
+function dismissButtonOf(tree) {
+  const chip = chipOf(tree);
+  for (const child of chip?.children ?? []) {
+    if (child !== null && typeof child === "object" && child.props?.["data-paste-spill-dismiss"]) return child;
+  }
+  return null;
+}
+
 /** The zero-size locator element the component always renders. */
 function anchorOf(tree) {
   for (const child of tree?.children ?? []) {
@@ -728,12 +750,13 @@ test("the chip renders from the fold record alone, without a draft hook", () => 
   // Collect leaf strings rather than matching the whole serialized tree: the
   // JSON form escapes the quotes inside the interpolated label arguments.
   const text = leafText(chip);
-  assert.match(text, /foldTitle/);
-  assert.match(text, /"bytes":5000/);
-  assert.match(text, /"lines":2/);
-  // "Sent as-is" is carried by the chip's tooltip now. The build that rendered it
-  // as a paragraph ABOVE the input box was rejected.
-  assert.match(chip.props.title, /foldHint/);
+  // The chip now previews the CONTENT (Codex-style) instead of a byte/line
+  // summary, and offers the "show in text box" affordance.
+  assert.match(text, /foldPreview|foldTitle/, "the chip previews the folded text");
+  assert.match(text, /foldExpandAction/, "and names the expand action");
+  // "Sent as-is" moved onto the expand control's tooltip. The build that rendered
+  // it as a paragraph ABOVE the input box was rejected.
+  assert.match(openButtonOf(tree).props.title, /foldHint/);
 });
 
 test("the composer entry exposes store-shaped hooks, not plain functions", () => {
@@ -959,25 +982,26 @@ test("REGRESSION: a 6000-byte paste folds even when the session binding predates
   assert.notEqual(chip, null, "the fold chip must render for a 6000-byte paste");
 
   const text = leafText(chip);
-  assert.match(text, /foldTitle/, "the chip shows inside the composer card");
-  assert.match(text, /"bytes":6000/, "and reports the real pasted size");
+  assert.match(text, /foldExpandAction/, "the chip shows inside the composer card");
+  // The preview is the REAL content (the 6000 "x"s the test pasted), ellipsized —
+  // that is the point of the preview line.
+  assert.match(text, /^x{10,}/, "previewing the content it is holding");
   // SEMANTICS CHANGE (user requirement): folding now EMPTIES the composer and the
   // plugin holds the text, so the draft is expected to be empty here. The chip is
   // the affordance that writes it back.
   assert.equal(draftStore.getSnapshot().draft, "", "a fold clears the composer");
   // ...and the round trip must close, or clearing the composer would be data loss.
   // Clicking the chip routes through the restore-aware toggle and puts it back.
-  chipOf(
-    component({
-      sessionId: "session-abc",
-      usePasteFold: (select) => select(face.hooks.pasteFold.getSnapshot()),
-      useFoldExpanded: (select) => select(face.hooks.foldExpanded.getSnapshot()),
-      setFoldExpanded: face.setFoldExpanded,
-      onToggle: face.onToggle,
-      getHeld: face.getHeld,
-      t: (key) => key,
-    }),
-  ).props.onClick();
+  const restoredTree = component({
+    sessionId: "session-abc",
+    usePasteFold: (select) => select(face.hooks.pasteFold.getSnapshot()),
+    useFoldExpanded: (select) => select(face.hooks.foldExpanded.getSnapshot()),
+    setFoldExpanded: face.setFoldExpanded,
+    onToggle: face.onToggle,
+    getHeld: face.getHeld,
+    t: (key) => key,
+  });
+  openButtonOf(restoredTree).props.onClick();
   assert.equal(
     draftStore.getSnapshot().draft,
     body,
@@ -1221,9 +1245,11 @@ test("the chip is positioned inside the card, and the card reserves a band for i
   assert.match(chip[1], /width:fit-content/, "the chip hugs its content");
   assert.match(chip[1], /max-width:calc\(100% - 24px\)/, "but cannot overflow the card");
   assert.ok(!/right:\d/.test(chip[1]), "no `right` offset, which would stretch it full width");
-  // 32px tall and single-line: a wrapped label would be clipped, not wrapped.
-  assert.match(chip[1], /height:32px/);
-  assert.match(css, /\.dshps-chip-title\{[^}]*white-space:nowrap/, "the title stays on one line");
+  // Two lines tall now (content preview + action), matching the reference chip,
+  // so each line is explicitly single-line rather than relying on the height.
+  assert.match(chip[1], /height:48px/);
+  assert.match(css, /\.dshps-chip-preview\{[^}]*white-space:nowrap/, "the preview stays on one line");
+  assert.match(css, /\.dshps-chip-action\{[^}]*white-space:nowrap/, "and so does the action line");
 
   // The two numbers must agree, or the chip overlaps the content below it. This is
   // the whole reason both are computed from the same constants.
@@ -1262,30 +1288,26 @@ test("a mounted but expanded fold keeps its band, so the text does not jump", ()
   assert.equal(card.attrs.has(CHIP_ATTR), false, "teardown must not leave a stale band");
 });
 
-test("the chip toggles the expanded store rather than mutating the draft", () => {
+test("the chip expands the fold rather than mutating the draft itself", () => {
+  // The chip never edits the draft: it asks the plugin's toggle to do it, because
+  // expanding is a restore (the text is out of the editor and held) and only the
+  // plugin knows where it is. A chip that called setDraft directly would blank the
+  // content it was supposed to bring back.
   const { PasteFoldChip } = loadBundle().exports.__internals;
   const calls = [];
-  const record = { bytes: 6000, lines: 3, sentinels: ["x"] };
+  const record = { bytes: 6000, lines: 3, text: '{"a":1}', sentinels: ["x"] };
   const render = (expanded) => PasteFoldChip({
     sessionId: "sess-1",
     usePasteFold: (select) => select({ "sess-1": record }),
     useFoldExpanded: (select) => select(expanded === undefined ? {} : { "sess-1": expanded }),
-    setFoldExpanded: (sessionId, next) => calls.push([sessionId, next]),
+    onToggle: (sessionId, next) => calls.push([sessionId, next]),
     t: (key) => key,
   });
 
-  // Collapsed: the affordance is "expand".
-  const collapsed = chipOf(render(undefined));
-  assert.equal(collapsed.props["aria-expanded"], false);
-  collapsed.props.onClick();
-  assert.deepEqual(calls, [["sess-1", true]], "clicking a collapsed chip expands it");
-
-  // Expanded: the affordance flips to "collapse", and the label with it.
-  const expanded = chipOf(render(true));
-  assert.equal(expanded.props["aria-expanded"], true);
-  assert.match(leafText(expanded), /foldTitleExpanded/);
-  expanded.props.onClick();
-  assert.deepEqual(calls.at(-1), ["sess-1", false], "clicking an expanded chip collapses it");
+  const open = openButtonOf(render(undefined));
+  assert.equal(open.props["aria-expanded"], false);
+  open.props.onClick();
+  assert.deepEqual(calls, [["sess-1", true]], "clicking the chip asks the plugin to restore the text");
 });
 
 test("the chip's effects stamp the stock composer card it renders inside", () => {
@@ -1473,7 +1495,7 @@ test("the chip's expand path restores rather than only flipping a flag", () => {
     onToggle: (sessionId, next) => writes.push([sessionId, next]),
     t: (key) => key,
   });
-  chipOf(tree).props.onClick();
+  openButtonOf(tree).props.onClick();
   assert.deepEqual(writes, [["sess-1", true]], "the click routes through the restore-aware toggle");
 });
 
@@ -1576,4 +1598,101 @@ test("a refused sidecar leaves the text in the composer instead of emptying it",
 
   assert.equal(draftStore.getSnapshot().draft, body, "the text stays inline, so nothing is lost");
   assert.equal(released, 1, "and the refused attachment is released rather than leaked");
+});
+
+// --- The collapsed chip: preview + dismiss + expand (Codex-style) --------------
+//
+// Final shape requested by the user, replacing the "已折叠大文本 · N 字节 · N 行"
+// banner row: while text is folded the composer shows ONE chip that previews the
+// content and offers two actions — click to put the full text back in the text
+// box, and × to discard it entirely. There is no separate status line above it.
+
+test("the collapsed chip previews the content instead of a byte/line summary", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const record = { bytes: 6000, lines: 1, text: '{"readings": {"backward": [1,2,3]}}', sentinels: ["x"] };
+  const tree = PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select({}),
+    t: (key) => key,
+  });
+  const text = leafText(chipOf(tree));
+  assert.match(text, /readings/, "the chip previews the pasted content");
+  assert.doesNotMatch(text, /foldMeta/, "and no longer shows the byte/line summary row");
+});
+
+test("the collapsed chip offers an expand affordance that restores the text", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const toggles = [];
+  const record = { bytes: 6000, lines: 1, text: '{"a":1}', sentinels: ["x"] };
+  const tree = PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select({}),
+    onToggle: (sessionId, next) => toggles.push([sessionId, next]),
+    t: (key) => key,
+  });
+  const open = openButtonOf(tree);
+  assert.ok(open, "the chip renders an expand control");
+  // The whole chip body is the expand target, exactly like the reference chip.
+  open.props.onClick();
+  assert.deepEqual(toggles, [["sess-1", true]], "clicking the chip expands it into the text box");
+});
+
+test("the chip's dismiss button deletes the paste and does not expand it", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const toggles = [];
+  const dismissals = [];
+  const record = { bytes: 6000, lines: 1, text: '{"a":1}', sentinels: ["x"] };
+  const tree = PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select({}),
+    onToggle: (sessionId, next) => toggles.push([sessionId, next]),
+    onDismiss: (sessionId) => dismissals.push(sessionId),
+    t: (key) => key,
+  });
+  const dismiss = dismissButtonOf(tree);
+  assert.ok(dismiss, "the chip renders a dismiss control");
+  // The dismiss button is nested INSIDE the expand button, so it must stop the
+  // click from also expanding: "关闭即删除" must never double as "展开".
+  let stopped = false;
+  dismiss.props.onClick({ stopPropagation: () => { stopped = true; } });
+  assert.equal(stopped, true, "dismiss stops propagation so the chip does not also expand");
+  assert.deepEqual(dismissals, ["sess-1"], "and it deletes the paste");
+  assert.deepEqual(toggles, [], "without triggering the expand path");
+});
+
+test("dismissing a fold releases the hold and the sidecar attachment", () => {
+  const { dismissFold } = loadBundle().exports.__internals;
+  const holdStore = loadBundle().exports.__internals.createHoldStore();
+  holdStore.set("sess-1", "PASTED");
+  const cleared = [];
+  const detached = [];
+  const outcome = dismissFold({
+    sessionId: "sess-1",
+    holdStore,
+    attachmentIds: ["a-1"],
+    removeAttachment: (id) => { detached.push(id); return true; },
+    clearFold: () => cleared.push(true),
+  });
+  assert.equal(outcome, "dismissed");
+  assert.equal(holdStore.has("sess-1"), false, "the held text is gone");
+  assert.deepEqual(detached, ["a-1"], "and the sidecar file is detached, so the paste is fully deleted");
+  assert.deepEqual(cleared, [true], "the fold state is cleared, so no chip remains");
+});
+
+test("dismissing is a no-op when nothing is held or attached", () => {
+  const { dismissFold } = loadBundle().exports.__internals;
+  const holdStore = loadBundle().exports.__internals.createHoldStore();
+  const detached = [];
+  const outcome = dismissFold({
+    sessionId: "sess-1",
+    holdStore,
+    attachmentIds: [],
+    removeAttachment: (id) => { detached.push(id); return true; },
+    clearFold: () => {},
+  });
+  assert.equal(outcome, "none");
+  assert.deepEqual(detached, [], "nothing to detach");
 });
