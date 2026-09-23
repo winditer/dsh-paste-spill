@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-fold-4";
+    const BUILD_REV = "chip-fold-6";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -36,6 +36,14 @@ window.__ModuleLoader__.load({
       try {
         const raw = window.localStorage.getItem(DIAG_KEY);
         const next = raw === null ? {} : JSON.parse(raw);
+        // Clear the failure-reason key whenever a chip outcome is reported.
+        //
+        // `diag` merges, so a reason recorded by one attempt survives into every
+        // later snapshot and reads as if it were current. That misled a real
+        // debugging session: after the #337 timing fix the reason still showed #337
+        // while the insert had in fact succeeded. A reason is only meaningful beside
+        // the outcome it explains, so reporting an outcome retires it.
+        if ("foldChipInserted" in patch || "foldChipDeferred" in patch) next.foldChipReason = undefined;
         Object.assign(next, patch);
         window.localStorage.setItem(DIAG_KEY, JSON.stringify(next));
       } catch {
@@ -168,12 +176,17 @@ window.__ModuleLoader__.load({
     /**
      * Session-keyed container for the text a collapse took out of the editor.
      *
-     * Under display-only folding the text stays in the composer, so nothing is
-     * normally held. The container is kept because the chip's expand path and the
-     * watcher's "the text is intentionally out of the draft" guard both read it, and
-     * a future design that empties the composer again needs exactly this separate
-     * lifetime (the record is retired precisely when text leaves the draft, so the
-     * held text cannot ride on it).
+     * This is the guard the watcher reads as "the text is intentionally out of the
+     * draft". It MUST be set whenever the text leaves the composer, which for the
+     * chip design is the moment the chip is inserted: the chip replaces the draft
+     * with a lone U+FFFC, and the watcher's staleness test (`foldTextPresent`) is
+     * false for a draft that no longer contains the record's sentinel. Without a
+     * live hold the watcher therefore retires the record in that gap, and the chip's
+     * visible affordance never renders (verified in-app: stock's native chip node
+     * appeared while our preview/action/x did not).
+     *
+     * Separate from the record on purpose: the record is retired precisely when text
+     * leaves the draft, so the held text cannot ride on it.
      */
     function createHoldStore() {
       const held = new Map();
@@ -686,6 +699,22 @@ window.__ModuleLoader__.load({
             chipRef,
             chipInserted: false,
           });
+          // Raise a HOLD now, before the insertion, for two reasons:
+          //
+          //  * the watcher must not retire this record in the gap between here and the
+          //    deferred insert. Its staleness test compares the record's sentinels
+          //    against the draft, and the chip's insertion replaces the draft with a
+          //    lone U+FFFC -- a draft that no longer contains the text sentinels still
+          //    recorded at this moment. A live hold is the documented authority for
+          //    "the text is intentionally out of the draft", so it suppresses exactly
+          //    that false positive.
+          //  * the chip's visible affordance reads the hold as a fallback source, so
+          //    the preview line has text to show even before the record settles.
+          //
+          // It is released on both exits (expand, x) and by a send.
+          if (holdStore !== undefined && holdStore !== null && typeof holdStore.set === "function") {
+            holdStore.set(sessionId, chipWanted);
+          }
           // Insert the chip OUT of the current editor update, then reconcile the record.
           //
           // This deferral is the fix for Lexical error #337, and it is a timing
@@ -711,7 +740,13 @@ window.__ModuleLoader__.load({
                 : false;
               if (!chipInserted) {
                 // Nothing to reconcile: the record already describes the clamp
-                // fallback and the held text was rolled back by insertFoldChip.
+                // fallback and the held text was rolled back by insertFoldChip. The
+                // hold is released too, so the watcher goes back to owning the record
+                // by the ordinary rule (the text is still inline, so its sentinels
+                // keep it alive).
+                if (holdStore !== undefined && holdStore !== null && typeof holdStore.clear === "function") {
+                  holdStore.clear(sessionId);
+                }
                 diag({ foldChipDeferred: "refused" });
                 return;
               }
@@ -1368,6 +1403,10 @@ window.__ModuleLoader__.load({
             if (shell !== null && typeof shell.setDraft === "function") shell.setDraft(held);
             releaseFoldText(record.chipRef);
           }
+          // The text is back in the composer, so the hold's reason to exist is gone.
+          // Leaving it set would tell the watcher the text is intentionally out of the
+          // draft, and it would then never retire this record.
+          holdStore.clear(sessionId);
           expandStore.clear(sessionId);
           foldStore.clear(sessionId);
           diag({ manualExpand: "expanded", foldExpandRestored: typeof held === "string" });

@@ -548,6 +548,67 @@ test("the chip insert is DEFERRED, because inserting inside the editor's own upd
   assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, true);
 });
 
+test("the chip raises a hold, so the watcher cannot retire the record before the insert lands", async () => {
+  // The in-app symptom this pins: stock's native chip node appeared, but OUR chip
+  // (preview + expand action + ×) never did. Cause: the record is written before the
+  // deferred insert, and the chip's insertion replaces the draft with a lone U+FFFC
+  // -- a draft that no longer matches the text sentinels recorded at that moment. The
+  // watcher's staleness test is therefore false, and without a live hold it retires
+  // the record in that gap, so `foldApplies(record)` goes false and no chip renders.
+  const { reactToDraft, createSessionStore, createHoldStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const holdStore = createHoldStore();
+  const run = "w".repeat(5000);
+
+  const shell = {
+    rev: 2,
+    get state() { return { getSnapshot: () => ({ draft: run, draftRev: shell.rev }) }; },
+    insertReference: () => true,
+    setDraft() {},
+  };
+
+  reactToDraft({
+    previous: "", current: run, run, sessionId: "sess-1",
+    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+    shell, foldStore, holdStore,
+  });
+  // The hold must already be live, synchronously, BEFORE the deferred insert runs --
+  // that instant is exactly when the watcher could otherwise judge the record stale.
+  assert.equal(holdStore.has("sess-1"), true, "the hold must be raised before the insert is deferred");
+  assert.equal(holdStore.get("sess-1"), run, "and must carry the text the chip represents");
+
+  await Promise.resolve();
+  // It survives the insert (the chip now owns the text) and is only released on an exit.
+  assert.equal(holdStore.has("sess-1"), true);
+  assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, true);
+});
+
+test("a refused insert releases the hold, so the watcher resumes owning the record", async () => {
+  // On the clamp-only fallback the text stays inline. Keeping a hold there would tell
+  // the watcher the text is intentionally out of the draft, so the record could never
+  // be retired and the stale chip would outlive the text.
+  const { reactToDraft, createSessionStore, createHoldStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const holdStore = createHoldStore();
+  const run = "v".repeat(5000);
+
+  const shell = {
+    rev: 6,
+    get state() { return { getSnapshot: () => ({ draft: run, draftRev: shell.rev }) }; },
+    insertReference: () => false,
+    setDraft() {},
+  };
+
+  reactToDraft({
+    previous: "", current: run, run, sessionId: "sess-1",
+    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+    shell, foldStore, holdStore,
+  });
+  await Promise.resolve();
+  assert.equal(holdStore.has("sess-1"), false, "the fallback must not leave a hold behind");
+  assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, false);
+});
+
 test("the chip path replaces the draft with a placeholder and holds the text out of it", async () => {
   const { reactToDraft, createSessionStore, foldTextByRef } = loadBundle().exports.__internals;
   const foldStore = createSessionStore();
