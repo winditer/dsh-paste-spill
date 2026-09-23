@@ -40,6 +40,49 @@ function loadBundle(reactExtras = {}) {
 }
 
 /**
+ * Apply the bundle against a context whose `inputTriggers` records registrations.
+ *
+ * The fold chip only exists if the source actually reaches the roster, so these
+ * tests need the source object itself. The rest of the context is the same minimal
+ * stub the other apply-level tests use.
+ * @param options - `{ registered }`, the array the stub appends sources to.
+ * @returns the loaded bundle, so callers can reach `__internals`.
+ */
+function applyWithTriggerStub({ registered }) {
+  const { exports } = loadBundle();
+  const ctx = {
+    inputTriggers: {
+      registerSource(source) {
+        registered.push(source);
+        return () => {};
+      },
+    },
+    locale: { register: () => {} },
+    effect: (fn) => { fn(); return () => {}; },
+    slots: { inject: (_k, register) => register(), register: () => {} },
+    conversation: { input: { shell: () => undefined } },
+    sessions: { list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} } },
+  };
+  // apply() installs its stylesheet, so it needs a document. Kept here rather than
+  // in a shared global so these tests cannot leak a stub into the others.
+  const documentStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null, querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild: () => {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = documentStub;
+  try {
+    exports.apply(ctx);
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+  return { exports };
+}
+
+/**
  * Materialize the bundle with a react stub whose effects actually RUN.
  *
  * The default stub no-ops useLayoutEffect/useEffect, which is right for asserting
@@ -210,7 +253,100 @@ test("the bundle registers under the package name and exports a plugin", () => {
   const { record, exports } = loadBundle();
   assert.equal(record.id, "dsh-client-ui-paste-spill");
   assert.equal(typeof exports.apply, "function");
-  assert.deepEqual(exports.inject, ["slots", "conversation", "sessions", "locale"]);
+  assert.deepEqual(exports.inject, ["slots", "conversation", "sessions", "locale", "inputTriggers"]);
+});
+
+test("the fold chip source is registered with the trigger pipeline", async () => {
+  const registered = [];
+  applyWithTriggerStub({ registered });
+  assert.equal(registered.length, 1, "exactly one fold source is registered");
+  const [source] = registered;
+  // The roster keys sources by (trigger, name) and throws on duplicates, so the
+  // pair must be unique across all installed plugins.
+  assert.equal(source.name, "folded-text");
+  assert.equal(typeof source.trigger, "string");
+  assert.equal(typeof source.codec.serialize, "function");
+  // A source that contributed menu candidates would surface a stray trigger entry.
+  assert.deepEqual(await source.candidates(), []);
+});
+
+test("the chip serializer returns the original pasted text, and refuses once released", async () => {
+  const registered = [];
+  const { exports } = applyWithTriggerStub({ registered });
+  const { codec } = registered[0];
+
+  const original = "line one\nline two\nline three\n";
+  exports.__internals.holdFoldText("ref-1", original);
+  // This is the value stock splices into the submitted message in place of the
+  // chip's U+FFFC placeholder, so it must round-trip byte-for-byte.
+  assert.equal(await codec.serialize("ref-1"), original);
+
+  // After × or expand the text is released, and serializing must NOT silently
+  // produce something else -- a missing ref is an error, not an empty string.
+  exports.__internals.releaseFoldText("ref-1");
+  await assert.rejects(() => codec.serialize("ref-1"));
+});
+
+test("inserting a fold chip holds the text BEFORE the chip exists, then wins the CAS", async () => {
+  const registered = [];
+  const { exports } = applyWithTriggerStub({ registered });
+  const { codec } = registered[0];
+
+  // A shell stub faithful to stock: `state.getSnapshot()` exposes draft/draftRev,
+  // and `insertReference` applies only when the span's revision matches -- the same
+  // CAS stock enforces, which is why a refusal is a normal outcome, not a bug.
+  const calls = [];
+  const shell = {
+    rev: 7,
+    draft: "AAA",
+    state: { getSnapshot: () => ({ draft: shell.draft, draftRev: shell.rev }) },
+    insertReference(ref, span) {
+      // Record what the serializer could resolve AT INSERT TIME. If the hold were
+      // taken after insertion, this lookup would miss.
+      calls.push({ ref, span, resolvableAtInsert: exports.__internals.foldTextByRef.has(ref.ref) });
+      if (span.draftRev !== shell.rev) return false;
+      return true;
+    },
+  };
+
+  const text = "pasted body\n".repeat(400);
+  const ok = exports.__internals.insertFoldChip({ shell, text, ref: "r-7" });
+  assert.equal(ok, true);
+  assert.equal(calls.length, 1, "exactly one insertion attempt");
+  assert.equal(calls[0].resolvableAtInsert, true, "the text must be held BEFORE the chip is inserted");
+  // The span must cover the whole draft and carry the live revision, or stock's CAS refuses.
+  assert.deepEqual(calls[0].span, { start: 0, end: 3, draftRev: 7 });
+  assert.equal(await codec.serialize("r-7"), text);
+});
+
+test("a refused chip insertion releases the hold, so no ref is left dangling", () => {
+  const registered = [];
+  const { exports } = applyWithTriggerStub({ registered });
+
+  // The CAS loses: stock refuses when the revision moved between our read and call.
+  const shell = {
+    rev: 9,
+    draft: "AAA",
+    state: { getSnapshot: () => ({ draft: "AAA", draftRev: 8 }) },
+    insertReference: () => false,
+  };
+  const ok = exports.__internals.insertFoldChip({ shell, text: "x".repeat(5000), ref: "r-9" });
+  assert.equal(ok, false);
+  // A dangling hold would let a later message resolve a ref that no chip carries.
+  assert.equal(exports.__internals.foldTextByRef.has("r-9"), false);
+});
+
+test("a shell that throws on insertion also releases the hold", () => {
+  const registered = [];
+  const { exports } = applyWithTriggerStub({ registered });
+  const shell = {
+    rev: 1,
+    draft: "AAA",
+    state: { getSnapshot: () => ({ draft: "AAA", draftRev: 1 }) },
+    insertReference: () => { throw new Error("editor busy"); },
+  };
+  assert.equal(exports.__internals.insertFoldChip({ shell, text: "y".repeat(5000), ref: "r-1" }), false);
+  assert.equal(exports.__internals.foldTextByRef.has("r-1"), false);
 });
 
 test("thresholds are the agreed UTF-8 byte values", () => {
@@ -340,7 +476,7 @@ test("reactToDraft leaves small insertions alone", () => {
   assert.deepEqual(foldStore.getSnapshot(), {});
 });
 
-test("reactToDraft records fold state for a large insertion without uploading", () => {
+test("reactToDraft records fold state for a large insertion without uploading", async () => {
   const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
   const foldStore = createSessionStore();
   const run = "x".repeat(5000);
@@ -350,11 +486,226 @@ test("reactToDraft records fold state for a large insertion without uploading", 
     run,
     sessionId: "sess-1",
     conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+    // A shell with no projection cannot take a chip, so this covers the FALLBACK:
+    // the text stays inline and the record keeps the text as its own sentinel.
     shell: {},
     foldStore,
   });
   assert.equal(outcome, "fold");
-  assert.deepEqual(foldStore.getSnapshot()["sess-1"], { bytes: 5000, lines: 1, sentinels: [run], text: run });
+  // The record is written SYNCHRONOUSLY with the clamp-only shape, because the chip
+  // insertion is deferred: the fallback must already be correct at this instant.
+  const record = foldStore.getSnapshot()["sess-1"];
+  assert.equal(record.bytes, 5000);
+  assert.equal(record.lines, 1);
+  assert.deepEqual(record.sentinels, [run]);
+  assert.equal(record.text, run);
+  assert.equal(record.chipInserted, false);
+  // A shell with no projection can never take a chip, so the deferral must leave it
+  // that way rather than half-applying something.
+  await Promise.resolve();
+  assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, false);
+});
+
+test("the chip insert is DEFERRED, because inserting inside the editor's own update throws Lexical #337", async () => {
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const run = "z".repeat(5000);
+
+  // Faithful reproduction of the real failure: `reactToDraft` is called from the
+  // draft store's notification, which stock publishes SYNCHRONOUSLY from inside the
+  // editor's update listener. So at call time the editor is mid-update, which makes
+  // stock's `applyEdit` take its short-circuit branch (`fn(); return;`) and run the
+  // `$`-body without assigning the active editor -- Lexical then throws #337.
+  let inUpdate = false;
+  let sawUpdateDuringCall = null;
+  const shell = {
+    rev: 5,
+    get state() { return { getSnapshot: () => ({ draft: run, draftRev: shell.rev }) }; },
+    insertReference() {
+      sawUpdateDuringCall = inUpdate;
+      if (inUpdate) throw new Error("Minified Lexical error #337");
+      return true;
+    },
+    setDraft() {},
+  };
+
+  inUpdate = true;
+  assert.equal(
+    reactToDraft({
+      previous: "", current: run, run, sessionId: "sess-1",
+      conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+      shell, foldStore,
+    }),
+    "fold",
+  );
+  // The insert must NOT have been attempted while the update was in flight.
+  assert.equal(sawUpdateDuringCall, null, "the chip insert must not run inside the editor update");
+  inUpdate = false;
+  // Once control returns to the microtask queue the update has committed, and the
+  // insert is safe to attempt.
+  await Promise.resolve();
+  assert.equal(sawUpdateDuringCall, false, "the deferred insert must run OUTSIDE the update");
+  assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, true);
+});
+
+test("the chip path replaces the draft with a placeholder and holds the text out of it", async () => {
+  const { reactToDraft, createSessionStore, foldTextByRef } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const run = "x".repeat(5000);
+
+  // A shell faithful to stock: the chip inserts over the whole draft at the live
+  // revision, and clearing happens through setDraft.
+  let draft = run;
+  const shell = {
+    rev: 3,
+    get state() { return { getSnapshot: () => ({ draft, draftRev: shell.rev }) }; },
+    insertReference(ref, span) {
+      if (span.draftRev !== shell.rev) return false;
+      // The span covers the WHOLE draft, so replacing it with the chip IS the removal.
+      draft = "\uFFFC";
+      return true;
+    },
+    // Faithful to stock: `setDraft` does `root.clear()` and rebuilds from plain text,
+    // and it strips REFERENCE_PLACEHOLDER_RE -- whose range includes U+FFFC. So any
+    // placeholder is destroyed by it, and a stray `setDraft("")` after a chip insert
+    // would silently empty the composer (that was a real in-app bug).
+    setDraft(text) {
+      draft = String(text).replace(/[\uE100-\uE11D\uFFFC]/gu, "");
+    },
+  };
+
+  const outcome = reactToDraft({
+    previous: "",
+    current: run,
+    run,
+    sessionId: "sess-1",
+    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+    shell,
+    foldStore,
+  });
+  assert.equal(outcome, "fold");
+  // The insertion is deferred out of the editor's in-flight update (Lexical #337),
+  // so the chip lands on the next microtask.
+  await Promise.resolve();
+
+  const record = foldStore.getSnapshot()["sess-1"];
+  assert.equal(record.chipInserted, true);
+  assert.equal(typeof record.chipRef, "string");
+  // The original text is no longer displayed in the input box -- the user's
+  // requirement. What remains is the chip's lone placeholder, which is what keeps
+  // stock's `empty` test false so the send button stays live.
+  assert.equal(draft, "\uFFFC");
+  // The text is held under the ref the chip carries, so the serializer can produce
+  // the ORIGINAL body at submit time.
+  assert.equal(foldTextByRef.get(record.chipRef), run);
+  // Presence is judged on the placeholder now, not on the text that left the draft.
+  assert.deepEqual(record.sentinels, ["\uFFFC"]);
+});
+
+test("a refused chip insertion leaves the text inline rather than losing it", async () => {
+  const { reactToDraft, createSessionStore, foldTextByRef } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const run = "y".repeat(5000);
+
+  // The CAS always loses here, which is a real outcome when the editor normalizes
+  // the draft between our read and our call.
+  let draft = run;
+  const shell = {
+    rev: 4,
+    get state() { return { getSnapshot: () => ({ draft, draftRev: shell.rev }) }; },
+    insertReference: () => false,
+    setDraft(text) { draft = text; },
+  };
+
+  assert.equal(
+    reactToDraft({
+      previous: "", current: run, run, sessionId: "sess-1",
+      conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+      shell, foldStore,
+    }),
+    "fold",
+  );
+  await Promise.resolve();
+  const record = foldStore.getSnapshot()["sess-1"];
+  assert.equal(record.chipInserted, false);
+  // The editor must be untouched: the text is still the only copy, so clearing it
+  // would destroy the paste outright.
+  assert.equal(draft, run);
+  // The ref is minted before the deferred insert (settle needs it to reconcile), so
+  // what must hold is that its HOLD was rolled back -- a dangling hold would let a
+  // later send resolve a ref no chip actually carries.
+  assert.equal(loadBundle().exports.__internals.foldTextByRef.has(record.chipRef), false);
+  assert.deepEqual(record.sentinels, [run]);
+});
+
+test("the chip previews the first 20 characters of the paste", () => {
+  const { PREVIEW_CHARS, foldPreview } = loadBundle().exports.__internals;
+  assert.equal(PREVIEW_CHARS, 20, "the preview line is 20 characters by request");
+
+  const long = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const preview = foldPreview(long);
+  assert.equal(preview, "abcdefghijklmnopqrst\u2026", "20 characters, then an ellipsis");
+  assert.equal(preview.length, 21, "20 characters plus the ellipsis glyph");
+
+  // A paste shorter than the budget is shown whole, with no misleading ellipsis.
+  assert.equal(foldPreview("short"), "short");
+  // Whitespace collapses to single spaces so the one-line chip cannot be pushed
+  // around by an embedded newline.
+  assert.equal(foldPreview("a\n\nb   c"), "a b c");
+  assert.equal(foldPreview(""), "");
+});
+
+test("× on a chip clears the placeholder, so the chip is really gone", () => {
+  const { removePastedText } = loadBundle().exports.__internals;
+  // While a chip is mounted the draft is a lone U+FFFC, NOT the original text. So
+  // `removePastedText` cannot find the paste, and its honest fallback is "" -- which
+  // is what actually deletes the chip's placeholder from the editor.
+  assert.equal(removePastedText("\uFFFC", "the original pasted text", ""), "");
+  // A clamp-only fold still holds the real text, and that path excises precisely.
+  assert.equal(removePastedText("keep me PASTE keep me", "PASTE", ""), "keep me  keep me");
+});
+
+test("dismissFold releases the chip's hold, so a deleted paste cannot come back", () => {
+  const { dismissFold, createHoldStore, holdFoldText, releaseFoldText } = loadBundle().exports.__internals;
+  const holdStore = createHoldStore();
+  holdStore.set("sess-1", true);
+  holdFoldText("r-1", "pasted".repeat(1000));
+
+  let released = 0;
+  const outcome = dismissFold({
+    sessionId: "sess-1",
+    holdStore,
+    readDraft: () => "",
+    removeText: (current) => current,
+    writeDraft: () => true,
+    clearFold: () => {},
+    releaseChip: () => { released += 1; releaseFoldText("r-1"); },
+  });
+  assert.equal(outcome, "dismissed");
+  assert.equal(released, 1, "the hold must be released exactly once");
+  // Without this the held text would outlive the deletion, and a later send would
+  // resolve it and re-send what the user discarded.
+  assert.equal(loadBundle().exports.__internals.foldTextByRef.has("r-1"), false);
+});
+
+test("dismissFold releases the hold even when it finds nothing to delete", () => {
+  // × on an already-empty fold must still not leave a dangling ref behind.
+  const { dismissFold, createHoldStore, holdFoldText, foldTextByRef } = loadBundle().exports.__internals;
+  const holdStore = createHoldStore();
+  holdFoldText("r-2", "x");
+  let released = 0;
+  const outcome = dismissFold({
+    sessionId: "sess-1",
+    holdStore,
+    readDraft: () => "",
+    removeText: (current) => current,
+    writeDraft: () => true,
+    clearFold: () => {},
+    releaseChip: () => { released += 1; },
+  });
+  assert.equal(outcome, "none");
+  assert.equal(released, 1);
+  assert.equal(foldTextByRef.has("r-2"), true, "this test's own hold is untouched");
 });
 
 test("reactToDraft uploads a spill-sized insertion", () => {
@@ -1053,10 +1404,19 @@ test("the collapse rule outranks the stock scroll rule it overrides", () => {
     else globalThis.document = previousDocument;
   }
 
-  const rule = /\[data-composer-card\]\[data-dshps-folded\]\s*\[data-input-scroll\]\{([^}]*)\}/.exec(css);
+  const rule = /\[data-composer-card\]\[data-dshps-folded\](?::not\(\[data-dshps-chip\]\))?\s*\[data-input-scroll\]\{([^}]*)\}/.exec(css);
   assert.ok(rule, "the collapsed scroll rule must be installed");
   assert.match(rule[1], /max-height:\d+px/, "and must actually clamp the height");
   assert.match(rule[1], /mask-image/, "and fade the cut edge");
+  // The clamp is a FALLBACK: it exists for a fold whose chip could not be inserted,
+  // where the text stays inline. On a chip fold the editor is empty, so clamping
+  // would serve no purpose beyond squeezing the chip's own band.
+  assert.match(rule[0], /:not\(\[data-dshps-chip\]\)/, "the clamp must not apply to a chip fold");
+  // Two lines, per the user's request. Pinned because it is derived (84px was
+  // ~3 lines) rather than measured, so a careless edit shifting it back would
+  // silently change what the fold shows.
+  const clamp = /max-height:(\d+)px/.exec(rule[1]);
+  assert.equal(Number(clamp[1]), 60, "the fold must show two lines");
   // Specificity: attributes count like classes, so count them in the selector.
   const selector = rule[0].slice(0, rule[0].indexOf("{"));
   const attributes = selector.match(/\[[^\]]+\]/g) ?? [];

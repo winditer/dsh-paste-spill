@@ -45,7 +45,7 @@ Codex 在输入框粘贴大段文本时会自动转成文件（Desktop 生成 `P
 
 | 层 | 阈值 | 行为 |
 |---|---|---|
-| 折叠层 | 4,000 – 50,000 UTF-8 字节 | 输入框出现**一个**芯片（内容预览 + "在文本框中显示 ›" + `×`）。**纯展示层：文本原样留在编辑器里**，只是外观被 CSS 钳制折起；点芯片解除折叠、芯片消失，点 `×` 把文本剪出输入框。**不挂任何附件** |
+| 折叠层 | 4,000 – 50,000 UTF-8 字节 | 输入框里**只剩一枚 chip**（前 20 个字符 + "在文本框中显示 ›" + `×`），**原文本不显示**；原文由插件持有，提交时按原文发出。**无任何附件** |
 | 转文件层 | ≥ **50,000** UTF-8 字节 | 文本变成**真附件**落盘，消息里是 `file` 块；turn tail 出现可点卡片，点击在右侧栏预览 |
 
 两层**独立**（SPEC §4.3：`两层不要合并成一个开关`）。4,000 是纯 UI 折叠，零语义变化；50,000 改变模型所见，必须显式。
@@ -218,36 +218,42 @@ ctx.slots.inject("conversation.input.overlay", () => ctx.slots.register({
 
 **卸载清理**：会话切走时由一个卸载 effect 清掉 `data-dshps-folded` 与 `data-dshps-chip`。残留属性会把**下一个**会话的输入框裁掉一大截，而屏幕上没有任何东西解释这件事。
 
-#### 4.3.3 折叠的语义：纯展示（**最终版，推翻"真清空 + sidecar"**）
+#### 4.3.3 折叠的语义：chip 节点（**最终版**）
 
-> **本节记录三次修订；最终形态是"纯展示"，前两版勿再实现。**
+> **本节记录四次修订；最终形态是"chip 节点"，前三版勿再实现。**
 
-**最终形态**：折叠**不动草稿**。文本一直留在编辑器里，插件只做两件事：
+**最终形态**：粘贴 4000–50000 时，**整段草稿被替换成一枚 chip 节点**，原文移出编辑器、由插件按 `ref` 持有，提交时原样发出去。
 
-1. 给输入框套一个 CSS 钳制（`data-dshps-folded` → `max-height` + 渐隐遮罩），让它看起来被折起；
-2. 在 `conversation.input.overlay` 渲染一枚芯片。
+**为什么 chip 是唯一可行的构造**：用户要求"输入框里不显示原文"，但 stock 只序列化编辑器内容（`compose()` 里 `draft: this.projection.clipboardText`），插件**无法拦截提交**。所以"输入框里没有文本"与"还能发送"必须同时成立 —— 而 chip 恰好同时满足：
 
-点芯片 = **解除钳制**，芯片卸载；草稿从头到尾一字未动。
-
-**为什么这是正确形态**：
-
-- stock 的提交路径直接序列化编辑器内容（`compose()` 里 `draft: this.projection.clipboardText`），插件无法旁路。**只要文本在编辑器里，发送就必然是原文** —— 发送折叠态或展开态，turn 里都是原始文本。
-- **不含任何附件**，所以 turn 里**不可能**出现文件 chip。
-- **不再需要脆弱的发送判定**：早先那版要靠"我们挂的附件 id 消失了"来推断发送发生（因为被清空的草稿与折叠看起来完全一样）；现在文本在草稿里，发送就是 stock 的常规清空，一个信号即可判定。
-
-**为什么"展开"不写回文本**：`setDraft` 的实现是**整段重建编辑器**（stock 里 `root.clear()` 后逐行重填）。对一次纯外观切换而言，调用它既没必要、又会丢掉光标位置与撤销历史。
-
-**被推翻的版本一（仅表现层 + 卡外提示）**：故意"只表现、不动文本"，但在框外另加提示行 —— 用户要求框内一枚芯片、框外无物，故改。
-
-**被推翻的版本二（真清空 + sidecar 附件）**：按"折叠后输入框中清空"的字面要求，真的把文本移出编辑器，并用附件链路挂一个 sidecar 承载文本，保证空输入框也发得出去。**它在实机上产生三个症状**：
-
-| 症状 | 根因 |
+| 需求 | chip 如何满足 |
 |---|---|
-| 输入框里有"看不见但光标会停住"的内容；发送后 turn 出现 JSON 块 | sidecar 是**真附件**，stock 会把它渲染成 JSON 文件 chip |
-| 展开后删空输入框，发送按钮仍可点，点了就发 JSON | sidecar **还在**，而 stock 判定可发送是 `draft.trim()==="" && attachments.length===0`；空草稿 + 有附件 → 走**仅附件发送**分支 |
-| 反复折叠累积 `folded-text-1/3/5/7/9.json` | 展开**故意保留** sidecar，再次折叠挂新的时旧 id 被覆盖、旧附件再也无法卸载 |
+| 输入框里没有原文 | chip 是单个节点，原文不在草稿里 |
+| 仍可发送 | chip 给草稿贡献 `U+FFFC`，而 `"\uFFFC".trim() !== ""`，故 `empty === false` |
+| turn 里是原文 | 提交时 `inputTriggers.serializeReference(source, ref)` 返回持有表里的原文，替换占位符 |
+| 不产生文件 chip | 全程无附件 |
 
-**教训**：对"只是换个外观"这一层，**任何附件都是缺陷**。
+**这与 stock 自己的图片 chip、`@file` chip 是同一机制**，接的是公开扩展点 `ctx.get("inputTriggers").registerSource(source)`，**不需要改 stock**。
+
+**source 的形状**（参照 `dsh-client-ui-reference`）：
+
+```js
+{
+  trigger: "/", name: "folded-text",     // (trigger,name) 在 roster 中必须唯一
+  candidates: () => Promise.resolve([]), // 不贡献菜单项
+  codec: {
+    clipboardText: (ref) => `[folded-text:${ref}]`,
+    serialize(ref) { /* 返回原文；缺失时 reject，绝不返回 "" */ }
+  }
+}
+```
+
+**插入的两个真机约束（都由测试钉住）**：
+
+1. **必须在编辑器 update 之外插入**。`reactToDraft` 由草稿订阅触发，而 stock 的 `onEditorUpdate` 在**编辑器自己 update 内部**同步发布草稿；此刻调 `insertReference`，`applyEdit` 会走短路分支（`if (this.editor._updating) { fn(); return; }`），该分支**不设置 active editor**（`oi = e` 只在 `editor.update()` 里发生），Lexical 于是抛 **#337**。解法：推迟到微任务。
+2. **插入后不能再 `setDraft("")`**。span 覆盖 `[0, draft.length)`，**换入 chip 本身就是删除文本**；再调 `setDraft("")` 会清掉刚插入的 chip（`setDraft` 内部 `root.clear()` 后从纯文本重建，且剥掉 `REFERENCE_PLACEHOLDER_RE`，其范围含 `U+FFFC`），输入框变全空。
+
+**被推翻的前三版**（简述）：①仅表现层 + 卡外提示；②真清空 + sidecar 附件（产生 JSON chip、按钮不禁用、sidecar 累积三个症状）；③CSS 钳制纯展示（不满足"输入框里不显示原文"）。
 
 ### 4.4 客户端依赖与取用（已核对的 API 路径）
 
