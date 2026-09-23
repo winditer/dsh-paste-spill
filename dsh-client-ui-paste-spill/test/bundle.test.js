@@ -164,6 +164,34 @@ function fakeCard() {
 }
 
 /**
+ * Depth-first search over a serialized element tree for the first node whose props
+ * include `key`.
+ *
+ * The chip used to be a direct child of the component's Fragment. It is now one item in
+ * a RAIL (one chip per fold, mirroring the image rail), so a fixed-depth walk no longer
+ * finds it and every render test would fail for the wrong reason.
+ */
+function findDeep(tree, key, seen = new Set()) {
+  if (tree === null || typeof tree !== "object" || seen.has(tree)) return null;
+  seen.add(tree);
+  if (tree.props !== null && tree.props !== undefined && key in tree.props) return tree;
+  for (const child of tree.children ?? []) {
+    const hit = findDeep(child, key, seen);
+    if (hit !== null) return hit;
+  }
+  return null;
+}
+
+/** Every node carrying `key`, in document order. */
+function findAllDeep(tree, key, out = [], seen = new Set()) {
+  if (tree === null || typeof tree !== "object" || seen.has(tree)) return out;
+  seen.add(tree);
+  if (tree.props !== null && tree.props !== undefined && key in tree.props) out.push(tree);
+  for (const child of tree.children ?? []) findAllDeep(child, key, out, seen);
+  return out;
+}
+
+/**
  * Find the chip button in a rendered PasteFoldChip tree, or null.
  *
  * The component always returns a Fragment of [locator, chip|null], so a test that
@@ -171,10 +199,12 @@ function fakeCard() {
  * in rather than test the root.
  */
 function chipOf(tree) {
-  for (const child of tree?.children ?? []) {
-    if (child !== null && typeof child === "object" && child.props?.["data-paste-spill-chip"]) return child;
-  }
-  return null;
+  return findDeep(tree, "data-paste-spill-chip");
+}
+
+/** Every chip in the tree, so a multi-paste test can count them. */
+function chipsOf(tree) {
+  return findAllDeep(tree, "data-paste-spill-chip");
 }
 
 /**
@@ -183,20 +213,12 @@ function chipOf(tree) {
  * "expand" action has to reach one level further in than `chipOf`.
  */
 function openButtonOf(tree) {
-  const chip = chipOf(tree);
-  for (const child of chip?.children ?? []) {
-    if (child !== null && typeof child === "object" && child.props?.["data-paste-spill-open"]) return child;
-  }
-  return null;
+  return findDeep(chipOf(tree), "data-paste-spill-expand");
 }
 
 /** The dismiss (×) control inside the chip. */
 function dismissButtonOf(tree) {
-  const chip = chipOf(tree);
-  for (const child of chip?.children ?? []) {
-    if (child !== null && typeof child === "object" && child.props?.["data-paste-spill-dismiss"]) return child;
-  }
-  return null;
+  return findDeep(chipOf(tree), "data-paste-spill-dismiss");
 }
 
 /** The zero-size locator element the component always renders. */
@@ -284,102 +306,6 @@ test("the bundle registers under the package name and exports a plugin", () => {
   assert.equal(record.id, "dsh-client-ui-paste-spill");
   assert.equal(typeof exports.apply, "function");
   assert.deepEqual(exports.inject, ["slots", "conversation", "sessions", "locale", "inputTriggers"]);
-});
-
-test("the fold chip source is registered with the trigger pipeline", async () => {
-  const registered = [];
-  applyWithTriggerStub({ registered });
-  assert.equal(registered.length, 1, "exactly one fold source is registered");
-  const [source] = registered;
-  // The roster keys sources by (trigger, name) and throws on duplicates, so the
-  // pair must be unique across all installed plugins.
-  assert.equal(source.name, "folded-text");
-  assert.equal(typeof source.trigger, "string");
-  assert.equal(typeof source.codec.serialize, "function");
-  // A source that contributed menu candidates would surface a stray trigger entry.
-  assert.deepEqual(await source.candidates(), []);
-});
-
-test("the chip serializer returns the original pasted text, and refuses once released", async () => {
-  const registered = [];
-  const { exports } = applyWithTriggerStub({ registered });
-  const { codec } = registered[0];
-
-  const original = "line one\nline two\nline three\n";
-  exports.__internals.holdFoldText("ref-1", original);
-  // This is the value stock splices into the submitted message in place of the
-  // chip's U+FFFC placeholder, so it must round-trip byte-for-byte.
-  assert.equal(await codec.serialize("ref-1"), original);
-
-  // After × or expand the text is released, and serializing must NOT silently
-  // produce something else -- a missing ref is an error, not an empty string.
-  exports.__internals.releaseFoldText("ref-1");
-  await assert.rejects(() => codec.serialize("ref-1"));
-});
-
-test("inserting a fold chip holds the text BEFORE the chip exists, then wins the CAS", async () => {
-  const registered = [];
-  const { exports } = applyWithTriggerStub({ registered });
-  const { codec } = registered[0];
-
-  // A shell stub faithful to stock: `state.getSnapshot()` exposes draft/draftRev,
-  // and `insertReference` applies only when the span's revision matches -- the same
-  // CAS stock enforces, which is why a refusal is a normal outcome, not a bug.
-  const calls = [];
-  const shell = {
-    rev: 7,
-    draft: "AAA",
-    state: { getSnapshot: () => ({ draft: shell.draft, draftRev: shell.rev }) },
-    insertReference(ref, span) {
-      // Record what the serializer could resolve AT INSERT TIME. If the hold were
-      // taken after insertion, this lookup would miss.
-      calls.push({ ref, span, resolvableAtInsert: exports.__internals.foldTextByRef.has(ref.ref) });
-      if (span.draftRev !== shell.rev) return false;
-      return true;
-    },
-  };
-
-  const text = "pasted body\n".repeat(400);
-  const ok = await exports.__internals.insertFoldChip({ shell, text, ref: "r-7" });
-  // Resolves to the chip's draft FOOTPRINT (its label text), not `true`: the caller needs
-  // that string to write sentinels the watcher can match against the clipboard draft.
-  assert.equal(typeof ok, "string");
-  assert.equal(ok, "已折叠 4.7 KB");
-  assert.equal(calls.length, 1, "exactly one insertion attempt");
-  assert.equal(calls[0].resolvableAtInsert, true, "the text must be held BEFORE the chip is inserted");
-  // The span must cover the whole draft and carry the live revision, or stock's CAS refuses.
-  assert.deepEqual(calls[0].span, { start: 0, end: 3, draftRev: 7 });
-  assert.equal(await codec.serialize("r-7"), text);
-});
-
-test("a refused chip insertion releases the hold, so no ref is left dangling", async () => {
-  const registered = [];
-  const { exports } = applyWithTriggerStub({ registered });
-
-  // The CAS loses: stock refuses when the revision moved between our read and call.
-  const shell = {
-    rev: 9,
-    draft: "AAA",
-    state: { getSnapshot: () => ({ draft: "AAA", draftRev: 8 }) },
-    insertReference: () => false,
-  };
-  const ok = await exports.__internals.insertFoldChip({ shell, text: "x".repeat(5000), ref: "r-9" });
-  assert.equal(ok, false);
-  // A dangling hold would let a later message resolve a ref that no chip carries.
-  assert.equal(exports.__internals.foldTextByRef.has("r-9"), false);
-});
-
-test("a shell that throws on insertion also releases the hold", async () => {
-  const registered = [];
-  const { exports } = applyWithTriggerStub({ registered });
-  const shell = {
-    rev: 1,
-    draft: "AAA",
-    state: { getSnapshot: () => ({ draft: "AAA", draftRev: 1 }) },
-    insertReference: () => { throw new Error("editor busy"); },
-  };
-  assert.equal(await exports.__internals.insertFoldChip({ shell, text: "y".repeat(5000), ref: "r-1" }), false);
-  assert.equal(exports.__internals.foldTextByRef.has("r-1"), false);
 });
 
 test("thresholds are the agreed UTF-8 byte values", () => {
@@ -539,48 +465,6 @@ test("reactToDraft records fold state for a large insertion without uploading", 
   assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, false);
 });
 
-test("the chip insert is DEFERRED, because inserting inside the editor's own update throws Lexical #337", async () => {
-  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
-  const foldStore = createSessionStore();
-  const run = "z".repeat(5000);
-
-  // Faithful reproduction of the real failure: `reactToDraft` is called from the
-  // draft store's notification, which stock publishes SYNCHRONOUSLY from inside the
-  // editor's update listener. So at call time the editor is mid-update, which makes
-  // stock's `applyEdit` take its short-circuit branch (`fn(); return;`) and run the
-  // `$`-body without assigning the active editor -- Lexical then throws #337.
-  let inUpdate = false;
-  let sawUpdateDuringCall = null;
-  const shell = {
-    rev: 5,
-    get state() { return { getSnapshot: () => ({ draft: run, draftRev: shell.rev }) }; },
-    insertReference() {
-      sawUpdateDuringCall = inUpdate;
-      if (inUpdate) throw new Error("Minified Lexical error #337");
-      return true;
-    },
-    setDraft() {},
-  };
-
-  inUpdate = true;
-  assert.equal(
-    reactToDraft({
-      previous: "", current: run, run, sessionId: "sess-1",
-      conversation: { createDrafts() { throw new Error("fold must not upload"); } },
-      shell, foldStore,
-    }),
-    "fold",
-  );
-  // The insert must NOT have been attempted while the update was in flight.
-  assert.equal(sawUpdateDuringCall, null, "the chip insert must not run inside the editor update");
-  inUpdate = false;
-  // Once control returns to the microtask queue the update has committed, and the
-  // insert is safe to attempt.
-  await settleChip();
-  assert.equal(sawUpdateDuringCall, false, "the deferred insert must run OUTSIDE the update");
-  assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, true);
-});
-
 test("a deferred chip insert is ABANDONED if the fold was expanded first", async () => {
   // The insert is deferred to a microtask, so a user expand can land before it runs.
   // Running it anyway is destructive, not merely redundant: the span covers
@@ -626,56 +510,6 @@ test("a deferred chip insert is ABANDONED if the fold was expanded first", async
   assert.equal(draft, run, "the restored text must NOT be replaced by an orphaned placeholder");
   assert.equal(foldStore.getSnapshot()["sess-1"], undefined, "and no chip may come back");
   assert.equal(holdStore.has("sess-1"), false, "and no hold may outlive the abandoned insert");
-});
-
-test("the chip insert keeps retrying across task turns while the paste's commits drain", async () => {
-  // THE reported bug: "多次粘贴，还是只有第一次有 chip". A paste reaches the editor as
-  // several commits, and each content change republishes the projection and bumps `rev`.
-  // Right after a paste the revision is therefore still MOVING, so stock's CAS refuses
-  // every span built from it. Retrying twice inside one microtask cannot help -- both
-  // attempts read the same not-yet-final revision. The attempts have to yield a task
-  // turn each so the commits drain.
-  //
-  // Measured directly, with this many republishes still pending at insert time:
-  //   republishes=1 -> inserted=true    (2 attempts was enough)
-  //   republishes=2 -> inserted=false   (THE BUG: only the first paste folded)
-  // and after the fix all of 1/2/3/5 republishes insert successfully.
-  const { reactToDraft, createSessionStore, createHoldStore } = loadBundle().exports.__internals;
-  const run = "z".repeat(5000);
-
-  async function attemptWith(republishes) {
-    let draft = run;
-    let rev = 0;
-    let pending = republishes;
-    const shell = {
-      get state() { return { getSnapshot: () => ({ draft, draftRev: rev, phase: "plain" }) }; },
-      insertReference(ref, span) {
-        // Simulate the paste's own trailing commits: each refusal is one more drain.
-        if (pending > 0) { pending -= 1; rev += 1; return false; }
-        if (span.draftRev !== rev) return false;
-        draft = chipDraft(ref);
-        rev += 1;
-        return true;
-      },
-      setDraft() {},
-    };
-    const foldStore = createSessionStore();
-    reactToDraft({
-      previous: "", current: run, run, sessionId: "sess-1",
-      conversation: { createDrafts() { throw new Error("fold must not upload"); } },
-      shell, foldStore, holdStore: createHoldStore(),
-    });
-    await settleChip(10, () => foldStore.getSnapshot()["sess-1"]?.chipInserted === true);
-    return foldStore.getSnapshot()["sess-1"]?.chipInserted === true;
-  }
-
-  for (const republishes of [1, 2, 3, 5]) {
-    assert.equal(
-      await attemptWith(republishes),
-      true,
-      `${republishes} pending republishes must still produce a chip`,
-    );
-  }
 });
 
 test("the watcher keeps a chip record alive while the hold is raised, even as the draft changes", () => {
@@ -746,41 +580,6 @@ test("expanding a chip restores from the record when the by-ref hold was already
   assert.equal(restoreTextFor({ held: "", record: { text: original, chipInserted: true } }), original, "an empty hold falls back");
 });
 
-test("the chip raises a hold, so the watcher cannot retire the record before the insert lands", async () => {
-  // The in-app symptom this pins: stock's native chip node appeared, but OUR chip
-  // (preview + expand action + ×) never did. Cause: the record is written before the
-  // deferred insert, and the chip's insertion replaces the draft with a lone U+FFFC
-  // -- a draft that no longer matches the text sentinels recorded at that moment. The
-  // watcher's staleness test is therefore false, and without a live hold it retires
-  // the record in that gap, so `foldApplies(record)` goes false and no chip renders.
-  const { reactToDraft, createSessionStore, createHoldStore } = loadBundle().exports.__internals;
-  const foldStore = createSessionStore();
-  const holdStore = createHoldStore();
-  const run = "w".repeat(5000);
-
-  const shell = {
-    rev: 2,
-    get state() { return { getSnapshot: () => ({ draft: run, draftRev: shell.rev }) }; },
-    insertReference: () => true,
-    setDraft() {},
-  };
-
-  reactToDraft({
-    previous: "", current: run, run, sessionId: "sess-1",
-    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
-    shell, foldStore, holdStore,
-  });
-  // The hold must already be live, synchronously, BEFORE the deferred insert runs --
-  // that instant is exactly when the watcher could otherwise judge the record stale.
-  assert.equal(holdStore.has("sess-1"), true, "the hold must be raised before the insert is deferred");
-  assert.equal(holdStore.get("sess-1"), run, "and must carry the text the chip represents");
-
-  await settleChip();
-  // It survives the insert (the chip now owns the text) and is only released on an exit.
-  assert.equal(holdStore.has("sess-1"), true);
-  assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, true);
-});
-
 test("a refused insert releases the hold, so the watcher resumes owning the record", async () => {
   // On the clamp-only fallback the text stays inline. Keeping a hold there would tell
   // the watcher the text is intentionally out of the draft, so the record could never
@@ -805,273 +604,6 @@ test("a refused insert releases the hold, so the watcher resumes owning the reco
   await settleChip(8, () => holdStore.has("sess-1") === false && foldStore.getSnapshot()["sess-1"] !== undefined);
   assert.equal(holdStore.has("sess-1"), false, "the fallback must not leave a hold behind");
   assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, false);
-});
-
-test("a chip that landed after its record was retired gets a fresh record, not an orphan", async () => {
-  // Reported: after expand → delete everything → paste again, the cursor vanished and
-  // typing stopped working. Cause: when the post-insert record rewrite was SKIPPED, the
-  // surviving record still described the ORIGINAL TEXT while the draft had become the
-  // chip's placeholder -- so the watcher retired the record at once, leaving an ATOMIC
-  // contentEditable=false chip node in a composer with no record: nothing draws a chip
-  // for it and the caret cannot enter it.
-  const { reactToDraft, createSessionStore, createHoldStore, foldTextPresent } = loadBundle().exports.__internals;
-  const foldStore = createSessionStore();
-  const holdStore = createHoldStore();
-  const run = "o".repeat(5000);
-
-  let draft = run;
-  let rev = 1;
-  const shell = {
-    get state() { return { getSnapshot: () => ({ draft, draftRev: rev, phase: "plain" }) }; },
-    insertReference(ref, span) {
-      if (span.draftRev !== rev) return false;
-      draft = chipDraft(ref); // the chip's real clipboard footprint
-      rev += 1;
-      // The record is retired DURING the insert -- after the abandon check but before
-      // the post-insert rewrite. This is the window where the guard cannot help, so the
-      // rewrite itself has to leave a record that matches the editor.
-      foldStore.clear("sess-1");
-      return true;
-    },
-    setDraft() {},
-  };
-
-  reactToDraft({
-    previous: "", current: run, run, sessionId: "sess-1",
-    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
-    shell, foldStore, holdStore,
-  });
-  await settleChip();
-
-  const record = foldStore.getSnapshot()["sess-1"];
-  assert.ok(record, "the chip in the editor must have a matching record, or it is an orphan");
-  assert.equal(record.chipInserted, true);
-  // And crucially the record must MATCH the draft, so the watcher cannot retire it and
-  // strand the chip node.
-  assert.equal(
-    foldTextPresent(record, draft),
-    true,
-    "the record's sentinels must match the settled draft",
-  );
-});
-
-test("the chip path replaces the draft with a placeholder and holds the text out of it", async () => {
-  const { reactToDraft, createSessionStore, foldTextByRef } = loadBundle().exports.__internals;
-  const foldStore = createSessionStore();
-  const run = "x".repeat(5000);
-
-  // A shell faithful to stock: the chip inserts over the whole draft at the live
-  // revision, and clearing happens through setDraft.
-  let draft = run;
-  const shell = {
-    rev: 3,
-    get state() { return { getSnapshot: () => ({ draft, draftRev: shell.rev }) }; },
-    insertReference(ref, span) {
-      if (span.draftRev !== shell.rev) return false;
-      // The span covers the WHOLE draft, so replacing it with the chip IS the removal.
-      // Faithful to stock, and this is the detail that hid the real bug: a chip node's
-      // `getTextContent()` returns its `clipboardText`, and the projection walk pushes
-      // THAT into the CLIPBOARD draft (only the DETECT projection gets the lone U+FFFC).
-      // So the settled draft is `<label> ` -- the label plus a trailing space -- and a
-      // sentinel of "\uFFFC" can never match it.
-      draft = chipDraft(ref);
-      return true;
-    },
-    // Faithful to stock: `setDraft` does `root.clear()` and rebuilds from plain text,
-    // and it strips REFERENCE_PLACEHOLDER_RE -- whose range includes U+FFFC. So any
-    // placeholder is destroyed by it, and a stray `setDraft("")` after a chip insert
-    // would silently empty the composer (that was a real in-app bug).
-    setDraft(text) {
-      draft = String(text).replace(/[\uE100-\uE11D\uFFFC]/gu, "");
-    },
-  };
-
-  const outcome = reactToDraft({
-    previous: "",
-    current: run,
-    run,
-    sessionId: "sess-1",
-    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
-    shell,
-    foldStore,
-  });
-  assert.equal(outcome, "fold");
-  // The insertion is deferred out of the editor's in-flight update (Lexical #337),
-  // so the chip lands on the next microtask.
-  await settleChip();
-
-  const record = foldStore.getSnapshot()["sess-1"];
-  assert.equal(record.chipInserted, true);
-  assert.equal(typeof record.chipRef, "string");
-  // The original text is no longer displayed in the input box -- the user's
-  // requirement. What remains is the chip's lone placeholder, which is what keeps
-  // stock's `empty` test false so the send button stays live.
-  assert.equal(draft, "已折叠 4.9 KB ", "the settled draft is the chip's label plus a trailing space");
-  // The text is held under the ref the chip carries, so the serializer can produce
-  // the ORIGINAL body at submit time.
-  assert.equal(foldTextByRef.get(record.chipRef), run);
-  // Presence is judged on the placeholder now, not on the text that left the draft.
-  assert.deepEqual(record.sentinels, ["已折叠 4.9 KB"]);
-});
-
-test("a refused chip insertion leaves the text inline rather than losing it", async () => {
-  const { reactToDraft, createSessionStore, foldTextByRef } = loadBundle().exports.__internals;
-  const foldStore = createSessionStore();
-  const run = "y".repeat(5000);
-
-  // The CAS always loses here, which is a real outcome when the editor normalizes
-  // the draft between our read and our call.
-  let draft = run;
-  const shell = {
-    rev: 4,
-    get state() { return { getSnapshot: () => ({ draft, draftRev: shell.rev }) }; },
-    insertReference: () => false,
-    setDraft(text) { draft = text; },
-  };
-
-  assert.equal(
-    reactToDraft({
-      previous: "", current: run, run, sessionId: "sess-1",
-      conversation: { createDrafts() { throw new Error("fold must not upload"); } },
-      shell, foldStore,
-    }),
-    "fold",
-  );
-  await settleChip();
-  const record = foldStore.getSnapshot()["sess-1"];
-  assert.equal(record.chipInserted, false);
-  // The editor must be untouched: the text is still the only copy, so clearing it
-  // would destroy the paste outright.
-  assert.equal(draft, run);
-  // The ref is minted before the deferred insert (settle needs it to reconcile), so
-  // what must hold is that its HOLD was rolled back -- a dangling hold would let a
-  // later send resolve a ref no chip actually carries.
-  assert.equal(loadBundle().exports.__internals.foldTextByRef.has(record.chipRef), false);
-  assert.deepEqual(record.sentinels, [run]);
-});
-
-test("the insertion span uses the shell's DETECT coordinates, not the draft's length", () => {
-  // THE cause of the in-app refusal: insertReference hands the span to selectSpan, which
-  // validates it against the layout's DETECT length -- but `getSnapshot().draft` is the
-  // CLIPBOARD projection. The two are counted independently and diverge on multi-line
-  // pastes, so a span ending at draft.length is out of bounds and is refused with the
-  // revision perfectly correct. Measured in-app: sentEnd == liveDraftLen == 6019 with
-  // equal revisions, on a paste carrying 173 newlines.
-  const { foldSpanFor } = loadBundle().exports.__internals;
-
-  // caretSpan() is the shell's public detect-coordinate accessor; with no selection it
-  // reports a collapsed span at detectText.length.
-  const diverging = { caretSpan: () => ({ start: 6016, end: 6016 }) };
-  assert.deepEqual(
-    foldSpanFor(diverging, { draft: "x".repeat(6019), draftRev: 10 }),
-    { start: 0, end: 6016, draftRev: 10 },
-    "the end must be the detect length, not draft.length",
-  );
-
-  // The span always covers the WHOLE draft from 0: a fold replaces the paste entirely,
-  // never a fragment that would leave part of the user's text behind.
-  assert.equal(foldSpanFor(diverging, { draft: "x".repeat(6019), draftRev: 10 }).start, 0);
-
-  // Fallbacks, so an older or unusual shell cannot produce a nonsense span.
-  assert.deepEqual(foldSpanFor({}, { draft: "abc", draftRev: 3 }), { start: 0, end: 3, draftRev: 3 });
-  assert.deepEqual(foldSpanFor({ caretSpan: () => ({ end: -1 }) }, { draft: "abc", draftRev: 3 }), { start: 0, end: 3, draftRev: 3 });
-  assert.deepEqual(foldSpanFor({ caretSpan: () => { throw new Error("no"); } }, { draft: "abc", draftRev: 3 }), { start: 0, end: 3, draftRev: 3 });
-  // No usable revision or end: report null rather than splice a bogus span.
-  assert.equal(foldSpanFor(diverging, { draft: "abc" }), null);
-  assert.equal(foldSpanFor({ caretSpan: () => ({ end: 0 }) }, { draft: "", draftRev: 1 }), null);
-});
-
-test("a fold still inserts when the detect and clipboard projections disagree", async () => {
-  // The end-to-end wiring test for the span fix. This shell models the REAL divergence:
-  // `getSnapshot().draft` is the clipboard projection, while `selectSpan` (modelled by
-  // insertReference's bounds check) validates against the DETECT length, which is
-  // shorter. A span built from `draft.length` is therefore out of bounds and refused --
-  // with the revision perfectly correct, which is why the retry loop alone could never
-  // recover and the chip never appeared.
-  const { reactToDraft, createSessionStore, createHoldStore, foldTextByRef } = loadBundle().exports.__internals;
-  const foldStore = createSessionStore();
-  const holdStore = createHoldStore();
-  const run = "m".repeat(6000);
-
-  let draft = run;
-  const rev = 5;
-  const DETECT_END = 5997; // shorter than draft.length: the projections disagree
-  const shell = {
-    get state() { return { getSnapshot: () => ({ draft, draftRev: rev, phase: "plain" }) }; },
-    // The shell's own detect-coordinate accessor: a collapsed span at detectText.length.
-    caretSpan: () => ({ start: DETECT_END, end: DETECT_END }),
-    insertReference(ref, span) {
-      if (span.draftRev !== rev) return false;
-      // selectSpan: out of bounds past the detect length, so refuse.
-      if (span.end > DETECT_END) return false;
-      draft = chipDraft(ref);
-      return true;
-    },
-    setDraft() {},
-  };
-
-  const outcome = reactToDraft({
-    previous: "", current: run, run, sessionId: "sess-1",
-    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
-    shell, foldStore, holdStore,
-  });
-  assert.equal(outcome, "fold");
-  await settleChip();
-
-  const record = foldStore.getSnapshot()["sess-1"];
-  assert.ok(record, "the chip must insert despite the projection divergence");
-  assert.equal(record.chipInserted, true);
-  // And the held text is the original, so the turn still carries it verbatim.
-  assert.equal(foldTextByRef.get(record.chipRef), run);
-});
-
-test("a chip's draft footprint is its label, because that is what the clipboard gets", async () => {
-  // The bug that made both reported symptoms persist through three attempted fixes.
-  //
-  // Stock's projection walk pushes a chip's `getTextContent()` -- which returns the
-  // node's `clipboardText` -- into the CLIPBOARD projection; only the DETECT projection
-  // receives the lone U+FFFC. `snapshot.draft` is the clipboard text. So once a chip is
-  // in, the draft is the chip's LABEL plus stock's trailing space, and a record whose
-  // sentinels say "\uFFFC" can never match it.
-  //
-  // The consequence is not cosmetic. `foldTextPresent` is the watcher's staleness test,
-  // so the record was retired on the very next tick while the chip node stayed in the
-  // editor -- an ATOMIC, contentEditable=false node with no record: nothing draws a chip
-  // for it, and the caret cannot enter it, which is the vanished cursor and the dead
-  // keyboard. It also explains why "inserted" was reported while the composer looked
-  // empty.
-  const { insertFoldChip, foldTextPresent, createHoldStore } = loadBundle().exports.__internals;
-  const holdStore = createHoldStore();
-  const text = "z".repeat(5000);
-
-  let draft = text;
-  const shell = {
-    get state() { return { getSnapshot: () => ({ draft, draftRev: 4, phase: "plain" }) }; },
-    insertReference(ref) {
-      // Faithful to stock: the chip node's text content IS its clipboardText, and that is
-      // what lands in the clipboard draft, followed by a trailing space.
-      draft = `${ref.clipboardText} `;
-      return true;
-    },
-    setDraft() {},
-  };
-
-  const footprint = await insertFoldChip({ shell, text, ref: "r-1", holdStore });
-  assert.equal(typeof footprint, "string", "the footprint is returned for the caller to record");
-  // It is the label -- the same string the chip puts in the draft.
-  assert.match(footprint, /^已折叠 /);
-  assert.equal(footprint, "已折叠 4.9 KB");
-  assert.equal(draft, `${footprint} `);
-  // The draft contains NO placeholder at all, which is exactly what confused the earlier
-  // diagnostics and the stubs.
-  assert.equal(draft.includes("\uFFFC"), false);
-  // And the returned footprint is what makes the record survive the watcher.
-  assert.equal(foldTextPresent({ sentinels: [footprint], text }, draft), true);
-  assert.equal(
-    foldTextPresent({ sentinels: ["\uFFFC"], text }, draft),
-    false,
-    "the old sentinel could never match, which orphaned the chip",
-  );
 });
 
 test("the chip previews the first 20 characters of the paste", () => {
@@ -1099,49 +631,6 @@ test("× on a chip clears the placeholder, so the chip is really gone", () => {
   assert.equal(removePastedText("\uFFFC", "the original pasted text", ""), "");
   // A clamp-only fold still holds the real text, and that path excises precisely.
   assert.equal(removePastedText("keep me PASTE keep me", "PASTE", ""), "keep me  keep me");
-});
-
-test("dismissFold releases the chip's hold, so a deleted paste cannot come back", () => {
-  const { dismissFold, createHoldStore, holdFoldText, releaseFoldText } = loadBundle().exports.__internals;
-  const holdStore = createHoldStore();
-  holdStore.set("sess-1", true);
-  holdFoldText("r-1", "pasted".repeat(1000));
-
-  let released = 0;
-  const outcome = dismissFold({
-    sessionId: "sess-1",
-    holdStore,
-    readDraft: () => "",
-    removeText: (current) => current,
-    writeDraft: () => true,
-    clearFold: () => {},
-    releaseChip: () => { released += 1; releaseFoldText("r-1"); },
-  });
-  assert.equal(outcome, "dismissed");
-  assert.equal(released, 1, "the hold must be released exactly once");
-  // Without this the held text would outlive the deletion, and a later send would
-  // resolve it and re-send what the user discarded.
-  assert.equal(loadBundle().exports.__internals.foldTextByRef.has("r-1"), false);
-});
-
-test("dismissFold releases the hold even when it finds nothing to delete", () => {
-  // × on an already-empty fold must still not leave a dangling ref behind.
-  const { dismissFold, createHoldStore, holdFoldText, foldTextByRef } = loadBundle().exports.__internals;
-  const holdStore = createHoldStore();
-  holdFoldText("r-2", "x");
-  let released = 0;
-  const outcome = dismissFold({
-    sessionId: "sess-1",
-    holdStore,
-    readDraft: () => "",
-    removeText: (current) => current,
-    writeDraft: () => true,
-    clearFold: () => {},
-    releaseChip: () => { released += 1; },
-  });
-  assert.equal(outcome, "none");
-  assert.equal(released, 1);
-  assert.equal(foldTextByRef.has("r-2"), true, "this test's own hold is untouched");
 });
 
 test("reactToDraft uploads a spill-sized insertion", () => {
@@ -1210,6 +699,81 @@ test("reactToDraft falls back to inline when the session has no shell", () => {
     foldStore: createSessionStore(),
   });
   assert.equal(outcome, "inline");
+});
+
+test("a fold NEVER touches the editor, so typing and repeated pastes keep working", () => {
+  // The whole point of the redesign. Mirroring the image chip means the paste is a
+  // PRESENTATION change only: the text stays in the editor and is hidden with CSS.
+  //
+  // Every earlier bug came from replacing the draft with a chip node -- the revision
+  // CAS, the detect-vs-clipboard span coordinates, the atomic node orphaned without a
+  // record, and a repeat paste whose whole-draft span swallowed the previous chip. If
+  // this test ever fails, that class of bug is back.
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  let editorCalls = 0;
+  const shell = {
+    state: { getSnapshot: () => ({ draft: "unused", draftRev: 1, phase: "plain" }) },
+    insertReference() { editorCalls += 1; return true; },
+    setDraft() { editorCalls += 1; },
+    caretSpan() { editorCalls += 1; return { start: 0, end: 0 }; },
+  };
+  const run = "t".repeat(5000);
+
+  const outcome = reactToDraft({
+    previous: "", current: run, run, sessionId: "sess-1",
+    conversation: { createDrafts() { throw new Error("the fold must not upload"); } },
+    shell, foldStore,
+  });
+  assert.equal(outcome, "fold");
+  assert.equal(
+    editorCalls,
+    0,
+    "a fold must not insert, replace, or read the editor -- the text stays put and CSS hides it",
+  );
+  // The record is still written, because it is what drives the clamp and the chip.
+  const record = foldStore.getSnapshot()["sess-1"];
+  assert.ok(record);
+  assert.equal(record.text, run, "the record keeps the pasted text for x to remove later");
+  assert.equal(record.folds.length, 1);
+});
+
+test("repeated pastes accumulate one fold per paste instead of replacing each other", () => {
+  // Reported: "重复粘贴，只有第一次生成了chip，后面的粘贴没有任何反应". With a single
+  // record per session, each paste overwrote the previous one -- and because the span
+  // covered the whole draft, the first chip was swallowed too. The record is now a LIST,
+  // so N pastes produce N chips.
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const shell = { state: { getSnapshot: () => ({ draft: "x", draftRev: 1, phase: "plain" }) } };
+
+  let draft = "";
+  for (const ch of ["a", "b", "c"]) {
+    const before = draft;
+    draft += ch.repeat(5000);
+    const outcome = reactToDraft({
+      previous: before, current: draft, run: ch.repeat(5000), sessionId: "sess-1",
+      conversation: { createDrafts() { throw new Error("no upload"); } },
+      shell, foldStore,
+    });
+    assert.equal(outcome, "fold", `paste ${ch} must fold`);
+  }
+
+  const record = foldStore.getSnapshot()["sess-1"];
+  assert.equal(record.folds.length, 3, "each paste earns its own fold/chip");
+  const refs = record.folds.map((f) => f.ref);
+  assert.equal(new Set(refs).size, 3, "each fold has a unique ref");
+  // Every fold keeps the text its own x must remove, so removing one chip cannot take
+  // another chip's text with it.
+  for (const f of record.folds) {
+    assert.equal(typeof f.text, "string");
+    assert.equal(f.text.length, 5000);
+  }
+  assert.deepEqual(
+    record.folds.map((f) => f.text[0]),
+    ["a", "b", "c"],
+    "the folds are in paste order",
+  );
 });
 
 test("reactToDraft drops the fold record when the draft is cleared", () => {
@@ -1553,6 +1117,53 @@ test("no fold record renders the locator but no chip", () => {
   // The visible chip, however, must not render when nothing is folded.
   assert.equal(chipOf(tree), null, "nothing folded means no chip");
   assert.equal(anchorOf(tree).props["data-paste-spill-anchor"], true);
+});
+
+test("the rail renders one chip per fold, each with its own ×", () => {
+  // "支持多次粘贴": three pastes into one composer must put three chips on the rail, and
+  // × on one of them must remove only that one. The old component rendered a single chip
+  // from a single record, so a repeat paste replaced the previous fold and looked like
+  // nothing happened.
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const folds = [
+    { ref: "r1", bytes: 5000, lines: 1, text: "a".repeat(5000) },
+    { ref: "r2", bytes: 5000, lines: 1, text: "b".repeat(5000) },
+    { ref: "r3", bytes: 5000, lines: 1, text: "c".repeat(5000) },
+  ];
+  const record = { folds, bytes: 5000, lines: 1, text: folds[2].text, chipRef: "r3" };
+  const tree = PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select({}),
+    onDismiss: () => {},
+    t: (key) => key,
+  });
+  const chips = chipsOf(tree);
+  assert.equal(chips.length, 3, "one chip per fold");
+  const dismisses = findAllDeep(tree, "data-paste-spill-dismiss");
+  assert.equal(dismisses.length, 3, "each chip has its own ×");
+  // The × names the chip it removes, so the handler can delete just that paste.
+  assert.deepEqual(dismisses.map((d) => d.props["data-paste-spill-dismiss"]), ["r1", "r2", "r3"]);
+});
+
+test("× on one chip asks for just that fold to be removed", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const calls = [];
+  const folds = [
+    { ref: "r1", bytes: 5000, text: "a".repeat(5000) },
+    { ref: "r2", bytes: 5000, text: "b".repeat(5000) },
+  ];
+  const tree = PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": { folds } }),
+    useFoldExpanded: (select) => select({}),
+    onDismiss: (sessionId, ref) => calls.push([sessionId, ref]),
+    t: (key) => key,
+  });
+  const dismisses = findAllDeep(tree, "data-paste-spill-dismiss");
+  // Click the SECOND chip's ×: it must name r2, not the session alone.
+  dismisses[1].props.onClick();
+  assert.deepEqual(calls, [["sess-1", "r2"]], "the × carries the chip it removes");
 });
 
 test("the chip renders from the fold record alone, without a draft hook", () => {
@@ -1934,14 +1545,23 @@ test("the chip is positioned inside the card, and the card reserves a band for i
   assert.ok(band, "the card must reserve a band while the chip is mounted");
   const chip = /\.dshps-chip\{([^}]*)\}/.exec(css);
   assert.ok(chip, "the chip rule must be installed");
-  assert.match(chip[1], /position:absolute/, "the chip floats, so it cannot take flow space");
-  assert.match(chip[1], /top:\d+px/, "and is pinned inside that band");
+  // The chip is now a RAIL ITEM, so it is static and wraps inside the rail rather than
+  // being absolutely pinned. The rail itself is the floating layer, positioned in the
+  // band, and it is what the card's padding reserves room for.
+  assert.match(chip[1], /position:static/, "a rail item takes flow space inside the rail");
+  const rail = /\.dshps-chip-rail\{([^}]*)\}/.exec(css);
+  assert.ok(rail, "the rail rule must be installed, one chip per fold");
+  assert.match(rail[1], /position:absolute/, "the rail floats, so it cannot take flow space");
+  assert.match(rail[1], /top:\d+px/, "and is pinned inside that band");
+  assert.match(rail[1], /flex-wrap:wrap/, "several pastes put several chips on the rail");
   // A compact chip, not a full-width bar: the user chose the single-line compact
   // shape, so `right` must stay auto and the width must hug the content. Pinning
   // both sides would silently turn it into a banner across the whole card.
   assert.match(chip[1], /width:fit-content/, "the chip hugs its content");
   assert.match(chip[1], /max-width:calc\(100% - 24px\)/, "but cannot overflow the card");
   assert.ok(!/right:\d/.test(chip[1]), "no `right` offset, which would stretch it full width");
+  // The rail spans the card and lays its items out in a wrapping row.
+  assert.match(rail[1], /right:\d+px/, "the rail spans the card so items can wrap");
   // Two lines tall now (content preview + action), matching the reference chip,
   // so each line is explicitly single-line rather than relying on the height.
   assert.match(chip[1], /height:48px/);
@@ -1950,7 +1570,7 @@ test("the chip is positioned inside the card, and the card reserves a band for i
 
   // The two numbers must agree, or the chip overlaps the content below it. This is
   // the whole reason both are computed from the same constants.
-  const top = Number(/\.dshps-chip\{[^}]*top:(\d+)px/.exec(css)[1]);
+  const top = Number(/\.dshps-chip-rail\{[^}]*top:(\d+)px/.exec(css)[1]);
   const height = Number(/\.dshps-chip\{[^}]*height:(\d+)px/.exec(css)[1]);
   assert.ok(
     Number(band[1]) >= top + height,
@@ -2372,37 +1992,6 @@ test("the send button is disabled after expand-then-delete, so no file chip can 
   assert.equal(sendable, false, "an emptied composer cannot be sent");
 });
 
-test("× deletes the pasted text from the composer, not just the chip", () => {
-  // Display-only folding keeps the text in the editor while collapsed, so a × that
-  // merely unmounted the chip would leave the discarded paste sitting in the box.
-  const { face, draftStore } = setUpFold();
-  const body = "v".repeat(6000);
-
-  draftStore.setDraft(body);
-  face.onDismiss("s1");
-
-  assert.equal(draftStore.getSnapshot().draft, "", "the pasted text is gone from the composer");
-  assert.deepEqual(draftStore.getSnapshot().attachmentIds, [], "and nothing was attached");
-  assert.equal(face.hooks.pasteFold.getSnapshot()["s1"], undefined, "no chip remains");
-});
-
-test("× removes only the pasted run, keeping text the user typed around it", () => {
-  const { face, draftStore } = setUpFold();
-  const body = "u".repeat(6000);
-
-  // Two transitions, because the excision target is derived from the DIFF. A paste
-  // into an empty composer is one transition whose run is the whole draft (the
-  // whole draft genuinely IS the paste there), so "text around the paste" only
-  // exists once there was a previous draft to differ from.
-  draftStore.setDraft("before  after");
-  draftStore.setDraft(`before ${body} after`);
-  assert.ok(face.hooks.pasteFold.getSnapshot()["s1"], "the paste folded");
-
-  face.onDismiss("s1");
-
-  assert.equal(draftStore.getSnapshot().draft, "before  after", "the user's own text survives");
-});
-
 test("a send clears the fold, and a later paste folds again", () => {
   const { face, draftStore } = setUpFold();
   draftStore.setDraft("t".repeat(6000));
@@ -2439,20 +2028,4 @@ test("a paste with surrounding text stores only the pasted run as the excision t
   assert.ok(record, "the paste folded");
   assert.equal(record.text, body, "the record holds the pasted run alone");
   assert.notEqual(record.text, draftStore.getSnapshot().draft, "and never the whole draft");
-});
-
-test("the excision target is always a genuine substring, so x can never over-delete", () => {
-  // A whole-draft target is safe ONLY when the draft really is just the paste.
-  // This pins the invariant the x relies on: whatever the record stores must be
-  // found in the draft, or `removePastedText` refuses and nothing is deleted.
-  const { face, draftStore } = setUpFold();
-  const body = "m".repeat(6000);
-  const surrounding = "n".repeat(6000);
-
-  draftStore.setDraft(surrounding + body);
-  const record = face.hooks.pasteFold.getSnapshot()["s1"];
-  assert.ok(draftStore.getSnapshot().draft.includes(record.text), "the target is a substring of the draft");
-
-  face.onDismiss("s1");
-  assert.equal(draftStore.getSnapshot().draft, "", "so x deletes exactly what it identified");
 });

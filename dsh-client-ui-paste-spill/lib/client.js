@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-fold-12";
+    const BUILD_REV = "fold-css-1";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -176,48 +176,6 @@ window.__ModuleLoader__.load({
       return record !== undefined && record !== null;
     }
 
-    /**
-     * The span to splice the chip over, in the coordinates `insertReference` expects.
-     *
-     * `insertReference` CAS-checks `span.draftRev` and then hands the span to
-     * `selectSpan`, which validates it against the layout's DETECT length and resolves
-     * its offsets through the detect segments. The span must therefore be in DETECT
-     * coordinates -- but the only length `getSnapshot()` publishes is `draft.length`,
-     * which is the CLIPBOARD projection. Those two are counted independently by the
-     * projection walk, so on real multi-line pastes they can differ, and a span built
-     * from the clipboard length is then out of bounds and refused with the revision
-     * perfectly correct. That is the refusal seen in-app: `sentEnd == liveDraftLen ==
-     * 6019` with equal revisions, on a paste carrying 173 newlines.
-     *
-     * `caretSpan()` is the shell's own public accessor for detect coordinates: with no
-     * live selection it returns a collapsed span at `detectText.length`, i.e. the true
-     * document end in detect units. Using it removes the guess entirely. `start` stays 0
-     * because a fold only ever collapses to a draft that is the paste alone; the whole
-     * draft is what must be replaced.
-     *
-     * @param shell - the session input shell.
-     * @param snapshot - the current published snapshot (revision, and a fallback end).
-     * @returns `{start, end, draftRev}`, or null when no usable revision/end exists.
-     */
-    function foldSpanFor(shell, snapshot) {
-      if (snapshot === undefined || typeof snapshot.draftRev !== "number") return null;
-      // Prefer the detect-coordinate end. Guarded: an older shell may not expose
-      // `caretSpan`, and a malformed answer must not produce a nonsense span.
-      let end = null;
-      try {
-        if (typeof shell.caretSpan === "function") {
-          const caret = shell.caretSpan();
-          if (caret !== null && caret !== undefined && typeof caret.end === "number" && caret.end >= 0) {
-            end = caret.end;
-          }
-        }
-      } catch {
-        end = null;
-      }
-      if (end === null) end = typeof snapshot.draft === "string" ? snapshot.draft.length : null;
-      if (end === null || end <= 0) return null;
-      return { start: 0, end, draftRev: snapshot.draftRev };
-    }
 
     /**
      * Yield for one task turn, so queued editor commits can apply.
@@ -372,6 +330,22 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The preview line for ONE fold record.
+     *
+     * Reads the record's own `text`, which always holds the text that fold owns -- the
+     * text STAYS in the editor now, so the record is the only source needed. (An earlier
+     * design had to fall back to a by-ref hold, because collapsing removed the text from
+     * the draft; nothing is removed any more.)
+     *
+     * @param fold - one entry from `record.folds`.
+     * @returns the flattened, truncated preview, or "" when there is nothing to show.
+     */
+    function foldPreviewOf(fold) {
+      if (fold === null || fold === undefined) return "";
+      return foldPreview(typeof fold.text === "string" ? fold.text : "");
+    }
+
+    /**
      * DOM attribute carrying the collapsed state on the composer card. The card
      * (not our own subtree) is the only element that can clamp the editor, because
      * the scroll container we need to shrink is a stock sibling we must not wrap
@@ -513,154 +487,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /**
-     * Replace the whole editor content with a single fold chip, and hold the text
-     * beside the draft under the chip's `ref`.
-     *
-     * This is the step that makes the composer show ONLY the chip while the real
-     * text still reaches the model. The order matters:
-     *
-     *  1. `holdFoldText` FIRST, so the text is already reachable by the serializer
-     *     before any chip exists. Reversing this would leave a window in which a
-     *     chip is in the composer and its text is not held -- a send in that window
-     *     would reject in `serialize` and fail the whole message.
-     *  2. Insert the chip over the full span at the CURRENT revision.
-     *  3. Only clear the draft once the chip insertion reports success; a refused
-     *     insertion must leave the text untouched in the editor.
-     *
-     * The span must satisfy stock's CAS (`span.draftRev === shell.rev`) and cover
-     * the detected text, because `insertReference` splices a chip over a span
-     * rather than appending a node. A refusal is therefore expected sometimes (the
-     * editor may normalize the draft between our reading and our call), and is not
-     * an error: the caller falls back to leaving the text inline.
-     *
-     * @param options - shell, the text to hold, and a ref to hold it under.
-     * @returns true when the chip was inserted and the draft replaced by it.
-     */
-    async function insertFoldChip({ shell, text, ref }) {
-      const snapshot = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
-      if (snapshot === undefined || typeof snapshot.draftRev !== "number") {
-        diag({ foldChipInserted: false, foldChipReason: "no-revision" });
-        return false;
-      }
-      holdFoldText(ref, text);
-      // The chip's label IS its draft footprint. A `ReferenceChipNode`'s
-      // `getTextContent()` returns its `clipboardText`, and the projection walk adds that
-      // to the CLIPBOARD draft (only the DETECT projection gets the lone U+FFFC). So once
-      // the chip is in, the draft is this label text followed by stock's trailing space --
-      // and presence in the draft must be judged on THIS string. Judging it on "\uFFFC"
-      // (as an earlier version did) can never match the clipboard draft, so the watcher
-      // retired the record at once and left the chip node orphaned: no chip drawn, and the
-      // caret unable to enter the atomic node.
-      const label = `已折叠 ${formatFoldSize(utf8Bytes(text))}`;
-      const reference = {
-        source: "folded-text",
-        ref,
-        label,
-        appearance: "file",
-        clipboardText: label,
-      };
-      const chipFootprint = label;
-      // Read the revision and call insertReference as close together as possible, and
-      // RETRY once if the revision moved in between.
-      //
-      // The editor republishes (and bumps `rev`) whenever the projection's content
-      // changes, which can land between our snapshot read and the call -- a paste
-      // commits more than once, and a normalization pass republishes again. Stock's
-      // CAS then refuses a span built from the stale revision, and the chip silently
-      // never appears. That is exactly the in-app symptom "the first paste folds, the
-      // later ones do not": the richer the draft, the more republishes land in that
-      // window. (Reproduced deterministically: `REFUSED rev: sent=1 live=2`.)
-      //
-      // Retrying is safe and correct rather than a workaround: a bumped revision means
-      // MORE text is present, and the span's job is to cover the whole current draft.
-      // Re-reading rebuilds it against the truth we are actually editing. Only the
-      // revision changes between attempts -- start stays 0 and end tracks the live
-      // draft length -- so a retry cannot excise text the user did not paste.
-      let lastSpan = null;
-      let lastLive = null;
-      // Retry across MICROTASK TURNS, not just twice in a row.
-      //
-      // A paste reaches the editor as several commits, and each content change
-      // republishes the projection and bumps `rev`. Immediately after the paste the
-      // revision is therefore still moving, and two back-to-back attempts inside one
-      // microtask both read the same not-yet-final revision. Waiting a turn between
-      // attempts lets those commits drain, so an attempt finally lands on a settled
-      // revision and the CAS holds.
-      //
-      // The span is built in the shell's OWN detect coordinates (see foldSpanFor), never
-      // from `draft.length`: the two projections are counted independently and diverge on
-      // multi-line pastes, which is what made the CAS refuse with a correct revision.
-      let applied = false;
-      let attempted = 0;
-      for (let attempt = 0; attempt < 8 && !applied; attempt += 1) {
-        const live = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
-        if (live === undefined || typeof live.draftRev !== "number") break;
-        lastLive = live;
-        lastSpan = foldSpanFor(shell, live);
-        if (lastSpan === null) break;
-        if (lastSpan === null) break;
-        attempted += 1;
-        try {
-          applied = shell.insertReference(reference, lastSpan) === true;
-        } catch (error) {
-            // Lexical error #337 is the one expected failure here, and it is a TIMING bug
-            // rather than a capability gap, so it is worth naming: inserting while an
-            // editor update is already in flight makes `applyEdit` take its short-circuit
-            // branch (`if (this.editor._updating) { fn(); return; }`), which runs the
-            // `$`-body WITHOUT first assigning the active editor (`oi = e` only happens
-            // inside `editor.update()`). Lexical then raises #337, "no active editor".
-            // The caller avoids this by deferring the insert out of the update; this catch
-            // stays as a backstop that degrades to the clamp instead of losing text.
-            diag({ foldChipInserted: false, foldChipReason: String(error && error.message) });
-          releaseFoldText(ref);
-          return false;
-        }
-        if (!applied && attempt < 7) {
-          // Let the next drain land before re-reading. A macrotask (setTimeout 0) rather
-          // than a microtask: the editor's own commit queue runs off the task queue, so
-          // a microtask would re-read before those commits have applied and see the same
-          // stale revision. The sync fast path is unaffected: the first attempt runs
-          // inline, and the wait only happens after a refusal.
-          const waited = await settleTurn();
-          if (!waited) break;
-        }
-      }
-      if (!applied) {
-        // Refused on every attempt. insertReference has three guards and WHICH one fired
-        // decides the fix, so record the evidence rather than assuming the revision CAS:
-        //   * phase must be plain|claimed (a paste during an in-flight submit refuses)
-        //   * span.draftRev must equal shell.rev (a republish landing after our read)
-        //   * the span must map onto the current layout (detect-text bounds)
-        // `foldRefuseSentRev` vs `foldRefuseLiveRev` tells the first two apart; the two
-        // lengths tell the third.
-        releaseFoldText(ref);
-        diag({
-          foldChipInserted: false,
-          foldChipReason: "refused",
-          foldRefuseSentRev: lastSpan === null ? undefined : lastSpan.draftRev,
-          foldRefuseLiveRev: lastLive === null ? undefined : lastLive.draftRev,
-          foldRefusePhase: lastLive === null ? undefined : lastLive.phase,
-          foldRefuseSentEnd: lastSpan === null ? undefined : lastSpan.end,
-          foldRefuseLiveDraftLen: lastLive === null || typeof lastLive.draft !== "string" ? undefined : lastLive.draft.length,
-        });
-        return false;
-      }
-      diag({
-        foldChipInserted: true,
-        foldChipHeldBytes: utf8Bytes(text),
-        // The composer's real shape right after the insert. The chip contributes its own
-        // clipboardText (the label) to the CLIPBOARD draft, plus stock's trailing space --
-        // so this is normally `<label> `, NOT `"\uFFFC "`. Recording it is how that was
-        // discovered: the earlier "\uFFFC" assumption made a successful insert look like an
-        // 11-character draft with no chip in it.
-        foldChipFootprint: chipFootprint,
-        foldAfterInsertDraftShape: shell.state === undefined ? undefined : describeDraft(shell.state.getSnapshot().draft),
-      });
-      // Return the chip's real draft footprint, so the caller records sentinels that the
-      // watcher can actually match against the clipboard draft.
-      return chipFootprint;
-    }
 
     /**
      * Diff two consecutive drafts and return the pasted run, or null.
@@ -850,245 +676,81 @@ window.__ModuleLoader__.load({
       if (verdict.action === "inline") return "inline";
       if (verdict.action === "fold") {
         if (sessionId !== undefined) {
-          // `sentinels` are the substrings whose absence means the folded text has
-          // left the draft; the watcher clears the record on that. Both the
-          // measured run and the whole draft are registered, because the two can
-          // differ: the run is a fragment when the paste replaced similar text,
-          // and the draft is the safer signal when the editor normalized the
-          // insertion on the way in. Keeping them as a list rather than one
-          // "best guess" is what makes the card's lifetime robust to either case.
-          const sentinels = candidate === current ? [current] : [candidate, current];
-          // The excision target: prefer the text the user actually pasted (captured
-          // on beforeinput/paste), then the located diff, and only fall back to the
-          // measurement. A whole-draft value is refused when the draft had
-          // pre-existing text, because excising it would delete that text too.
-          const excision =
+          // The record is the WHOLE fold state, and writing it is the only side effect.
+          //
+          // Nothing here touches the editor. That is the point of this design: an
+          // earlier version replaced the draft with a `ReferenceChipNode` so the
+          // composer would show a chip, and every bug in it came from that mutation --
+          // the revision CAS, the detect-vs-clipboard span coordinates, the atomic
+          // node orphaned without a record, and a repeat paste whose whole-draft span
+          // swallowed the previous chip. The text now simply STAYS in the editor and is
+          // hidden with CSS, so there is no editor state to get wrong. Typing, the
+          // caret, undo, and repeated pastes all behave exactly as they do without
+          // this plugin, which is the requirement.
+          //
+          // Sending is unaffected: stock serializes `fx.draft` as a `text` block, and CSS
+          // is presentation only -- so the message body is the pasted text verbatim,
+          // while the composer shows a clamped, chipped appearance.
+          //
+          // The ref must be unique per fold: several folds can measure the same byte
+          // count, so a ref built from bytes alone would collide and make two records
+          // indistinguishable.
+          // A bare timestamp is NOT a sufficient identity: two pastes can land in the same
+          // millisecond, which made two folds share a ref -- so the second fold was
+          // indistinguishable from the first and its chip never appeared. A monotonic
+          // counter is mixed in so identity never depends on clock resolution.
+          foldRefSeq += 1;
+          const chipRef = `${sessionId}:${verdict.bytes}:${Date.now().toString(36)}:${foldRefSeq.toString(36)}`;
+          // `sentinels` are the substrings whose presence in the draft means this fold is
+          // still live. Both the measured run and the whole draft are registered, because
+          // the two can differ: the run is a fragment when the paste replaced similar
+          // text, and the draft is the safer signal when the editor normalized the
+          // insertion on the way in. A LIST rather than one best guess is what makes the
+          // record's lifetime robust to either case.
+          const candidateSentinels = candidate === current ? [current] : [candidate, current];
+          // Prefer the text the user actually pasted (captured on beforeinput/paste),
+          // then the located diff, and only fall back to the measurement.
+          const foldText =
             recorded !== null && recorded !== undefined && typeof recorded.text === "string" && recorded.text !== ""
               ? recorded.text
               : typeof removable === "string" && removable !== "" && removable !== current
                 ? removable
-                : current === candidate && previous !== ""
-                  ? (insertedRun(previous, current) ?? candidate)
+                : typeof run === "string" && run !== null && run !== "" && run !== current
+                  ? run
                   : candidate;
-          // Mint the chip's ref, insert the chip, and only then write the record.
-          //
-          // Order matters: the record's `sentinels` describe "the folded text is still
-          // in the draft", and inserting the chip CHANGES the draft (it becomes a lone
-          // U+FFFC). So the record must be written with the post-insertion truth, or
-          // the watcher would immediately judge it stale and retire the fold we just
-          // created.
-          const chipRef = `${sessionId}:${verdict.bytes}:${Date.now().toString(36)}`;
-          const chipWanted = recorded !== null && recorded !== undefined && typeof recorded.text === "string" && recorded.text !== "" ? recorded.text : excision;
-          // The record is written FIRST and unconditionally, because the insertion
-          // below is deferred: the clamp-only fallback must be correct from this
-          // instant, so that if the deferred insert is refused (or never runs because
-          // the session went away) the composer still shows a fold rather than nothing.
-          foldStore.set(sessionId, {
+          // The record is a LIST per session, because the user can paste several large
+          // runs into one composer and each earns its own chip. Collapsing them into one
+          // record was why a repeat paste replaced the previous fold instead of joining it.
+          const existing = foldStore.getSnapshot()[sessionId];
+          const folds = Array.isArray(existing && existing.folds) ? existing.folds.slice() : [];
+          folds.push({
+            ref: chipRef,
             bytes: verdict.bytes,
             lines: countLines(candidate),
-            sentinels,
-            // The exact text the chip's x will EXCISE from the composer. It must be
-            // a genuine substring of the draft, so this is the removable target
-            // rather than the measured size: `measurableText` may legitimately
-            // answer with the WHOLE draft (its backstop for a jump it cannot shrink
-            // down), and excising that would delete the user's surrounding text too.
-            // Trusting the measurement here is what made x wipe the entire composer
-            // instead of just the pasted run.
-            text: excision,
+            sentinels: candidateSentinels,
+            // The exact text this chip's x removes from the composer. It is a genuine
+            // substring of the draft, which is what keeps x from deleting unrelated text.
+            text: foldText,
+          });
+          foldStore.set(sessionId, {
+            // Kept for the clamp and for older readers: the LAST fold's numbers.
+            bytes: verdict.bytes,
+            lines: countLines(candidate),
+            sentinels: candidateSentinels,
+            text: foldText,
             chipRef,
             chipInserted: false,
+            folds,
           });
-          // Raise a HOLD now, before the insertion, for two reasons:
-          //
-          //  * the watcher must not retire this record in the gap between here and the
-          //    deferred insert. Its staleness test compares the record's sentinels
-          //    against the draft, and the chip's insertion replaces the draft with a
-          //    lone U+FFFC -- a draft that no longer contains the text sentinels still
-          //    recorded at this moment. A live hold is the documented authority for
-          //    "the text is intentionally out of the draft", so it suppresses exactly
-          //    that false positive.
-          //  * the chip's visible affordance reads the hold as a fallback source, so
-          //    the preview line has text to show even before the record settles.
-          //
-          // It is released on both exits (expand, x) and by a send.
-          if (holdStore !== undefined && holdStore !== null && typeof holdStore.set === "function") {
-            holdStore.set(sessionId, chipWanted);
-          }
-          // Insert the chip OUT of the current editor update, then reconcile the record.
-          //
-          // This deferral is the fix for Lexical error #337, and it is a timing
-          // constraint rather than a preference. `reactToDraft` runs from the draft
-          // store's notification, which `onEditorUpdate` publishes synchronously
-          // INSIDE the editor's own update. Calling `insertReference` there means
-          // `applyEdit` sees `editor._updating === true` and takes its short-circuit
-          // branch (`fn(); return;`), which runs the `$`-body WITHOUT assigning the
-          // active editor -- that assignment (`oi = e`) only happens inside
-          // `editor.update()`. Lexical then throws #337, "no active editor", and the
-          // chip silently never appears (verified in-app: `foldChipInserted:false`
-          // with #337 while the text stayed in the composer).
-          //
-          // Deferring to a microtask lets the in-flight update commit first, so our
-          // `insertReference` takes the real `update()` path and the editor is active.
-          if (shell !== undefined && shell !== null) {
-            const settle = async () => {
-              // ABANDON this insertion if its fold is no longer the live one.
-              //
-              // The insert is deferred out of the editor's update, so the world can change
-              // before it runs -- most importantly a user expand, which writes the text
-              // back and retires the record. Running the insert anyway is destructive
-              // rather than merely redundant: the span covers [0, draft.length), so it
-              // replaces the just-restored text with a chip placeholder, and the record is
-              // already gone -- so no chip is drawn, the composer shows nothing, and the
-              // orphaned placeholder keeps stock's `empty` test false, leaving the send
-              // button LIVE over an apparently empty box. That is the reported
-              // "点展开 → 文本没有写回，但此时可以点击发送到 turn".
-              const liveNow = foldStore.getSnapshot()[sessionId];
-              if (liveNow === undefined || liveNow === null || liveNow.chipRef !== chipRef) {
-                if (holdStore !== undefined && holdStore !== null && typeof holdStore.clear === "function") {
-                  holdStore.clear(sessionId);
-                }
-                diag({ foldChipDeferred: "abandoned", foldAbandonLiveRef: liveNow === null || liveNow === undefined ? undefined : liveNow.chipRef });
-                return;
-              }
-              // Re-read the revision now: the deferred call must CAS against the
-              // CURRENT draft, not the one we saw before the update committed.
-              const after = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
-              // Resolves to the chip's draft footprint (a string) on success, false
-              // otherwise -- see insertFoldChip.
-              const chipFootprint = after !== undefined && typeof after.draftRev === "number"
-                ? await insertFoldChip({ shell, text: chipWanted, ref: chipRef })
-                : false;
-              const chipInserted = typeof chipFootprint === "string";
-              // The insert yields while it retries, so re-check the fold is still ours before
-              // treating the result as current. An expand during that window must win:
-              // without this the insert would overwrite the text the user just asked to
-              // see.
-              //
-              // BUT only when the insert did NOT land. Once the chip node is in the
-              // editor it is atomic and contentEditable=false, so abandoning it strands
-              // exactly the node that blocks typing -- the caret cannot enter it and
-              // nothing draws a chip for it. An inserted chip must therefore always be
-              // described by a matching record (the else-branch below re-registers one).
-              const stillLive = foldStore.getSnapshot()[sessionId];
-              if (!chipInserted && (stillLive === undefined || stillLive === null || stillLive.chipRef !== chipRef)) {
-                if (holdStore !== undefined && holdStore !== null && typeof holdStore.clear === "function") {
-                  holdStore.clear(sessionId);
-                }
-                diag({ foldChipDeferred: "abandoned-after-retry" });
-                return;
-              }
-              if (!chipInserted) {
-                // Nothing to reconcile: the record already describes the clamp
-                // fallback and the held text was rolled back by insertFoldChip. The
-                // hold is released too, so the watcher goes back to owning the record
-                // by the ordinary rule (the text is still inline, so its sentinels
-                // keep it alive).
-                if (holdStore !== undefined && holdStore !== null && typeof holdStore.clear === "function") {
-                  holdStore.clear(sessionId);
-                }
-                diag({ foldChipDeferred: "refused" });
-                return;
-              }
-              // NOTHING else to do here: the insertion IS the removal.
-              //
-              // The span covered [0, draft.length), so `insertReference` replaced the
-              // entire draft with the chip node -- the text is already out of the
-              // editor. An earlier version followed this with `setDraft("")` to "clear
-              // the text", which was actively destructive: `setDraft` does
-              // `root.clear()` then rebuilds from plain text, so it deleted the chip
-              // that had just been inserted, leaving the composer completely empty
-              // (verified in-app: neither the text nor the chip was visible). Worse,
-              // `setDraft` also strips REFERENCE_PLACEHOLDER_RE, whose range includes
-              // U+FFFC, so even a literal placeholder could not have survived it.
-              //
-              // Re-write the record against the post-insertion truth: presence is now
-              // judged on the chip's DRAFT FOOTPRINT (its label text), since the original
-              // text has left the draft. It is NOT "\uFFFC": the detect projection gets the
-              // placeholder but the clipboard draft -- which is what `snapshot.draft` is --
-              // gets the chip's `clipboardText`. A sentinel of "\uFFFC" therefore never
-              // matched, the watcher retired the record, and the chip node was orphaned.
-              const live = foldStore.getSnapshot()[sessionId];
-              // Report the reconcile's outcome explicitly. The `chipRef` guard can find the
-              // record already replaced, and a stale record would leave the sentinels
-              // describing the ORIGINAL TEXT while the draft holds the chip -- so the
-              // watcher retires the record and the chip never renders, even though the
-              // insert itself succeeded and `foldChipDeferred` says "inserted".
-              const reconciled = live !== undefined && live !== null && live.chipRef === chipRef;
-              if (reconciled) {
-                foldStore.set(sessionId, { ...live, sentinels: [chipFootprint], chipInserted: true });
-              } else {
-                // The record under our ref is gone, but the chip IS in the editor.
-                // Skipping the rewrite here is not harmless: the surviving record's
-                // sentinels still describe the ORIGINAL TEXT while the draft is now the
-                // chip's placeholder, so the watcher (whose staleness test is exactly
-                // that mismatch) retires the record at once. That leaves an ATOMIC,
-                // contentEditable=false chip node in a composer with no record: nothing
-                // draws a chip for it, and the caret cannot enter it, so typing stops
-                // working and the cursor appears to have vanished. Re-register the record
-                // under our own ref, so the chip the editor actually holds is the chip we
-                // describe.
-                foldStore.set(sessionId, {
-                  bytes: verdict.bytes,
-                  lines: countLines(candidate),
-                  sentinels: [chipFootprint],
-                  text: chipWanted,
-                  chipRef,
-                  chipInserted: true,
-                });
-              }
-              diag({
-                foldChipDeferred: "inserted",
-                foldReconcile: reconciled ? "reconciled" : "replaced",
-                foldReconcileLiveRef: live === null || live === undefined ? undefined : live.chipRef,
-                foldReconcileWantRef: chipRef,
-              });
-            };
-            if (typeof queueMicrotask === "function") queueMicrotask(settle);
-            else Promise.resolve().then(settle);
-          }
-          // The fold's exit: replace the whole draft with a CHIP, holding the text
-          // beside the draft under the chip's ref.
-          //
-          // Why a chip rather than only the CSS clamp: the user's requirement is that
-          // the composer show the chip and not the text. Clamping alone leaves the
-          // text visibly in the editor (the first lines show through the fade). A chip
-          // is the only construct that is NOT literal text yet still counts as draft
-          // content, because the chip node contributes a lone U+FFFC -- and
-          // `"\uFFFC".trim() !== ""`, so stock's sendability test
-          // (`draft.trim()==="" && attachments.length===0`) stays false and the send
-          // button remains live over a composer that shows only the chip. At submit,
-          // stock splices our source's `serialize(ref)` in place of that placeholder,
-          // so the message body is the ORIGINAL text. No attachment is involved, so
-          // no file chip can appear in the turn.
-          //
-          // This is exactly how stock's own image and `@file` chips behave.
-          //
-          // An earlier design emptied the editor and attached a sidecar file instead.
-          // That was a defect for this layer: stock renders an attachment as a JSON
-          // file chip, which is not the text; and the sidecar outlived the fold,
-          // keeping send lit over an emptied composer and routing submit to the
-          // attachment-only path -- which posted that JSON.
           diag({
             foldStoredBytes: verdict.bytes,
             foldStoredFromPaste: recorded !== null && recorded !== undefined,
-            // The insertion is deferred, so the outcome is reported from `settle`
-            // (foldChipDeferred / foldChipInserted) rather than from here.
-            foldChipPending: shell !== undefined && shell !== null,
-            // Whether the draft already held a chip placeholder when this fold was
-            // decided, and how many it holds now. A repeat paste lands on a draft shaped
-            // `<previous chip footprint><new text>`, and that is the one case where the
-            // insertion span and the detect layout can disagree -- so recording it makes
-            // "only the first paste folds" diagnosable instead of a guess.
-            //
-            // NOTE the two projections differ for a chip: the DETECT projection holds
-            // U+FFFC, while the CLIPBOARD draft (which `snapshot.draft` is) holds the
-            // chip's LABEL. Both counts are recorded so the two are never confused again.
-            foldStoredDraftHadChip: typeof current === "string" && current.includes("\uFFFC"),
-            foldStoredChipCount: typeof current === "string" ? (current.match(/\uFFFC/g) ?? []).length : undefined,
-            foldStoredLabelCount: typeof current === "string" ? (current.match(/已折叠 /g) ?? []).length : undefined,
-            foldStoredDraftShape: describeDraft(current),
+            foldCount: folds.length,
+            foldStoredTextLen: typeof foldText === "string" ? foldText.length : undefined,
+            foldStoredDraftLen: typeof current === "string" ? current.length : undefined,
           });
         }
+
         return "fold";
       }
       if (sessionId === undefined || conversation === undefined || conversation === null || shell === undefined || shell === null) {
@@ -1114,6 +776,9 @@ window.__ModuleLoader__.load({
       }
       return started === false ? "inline" : "file";
     }
+
+    /** Monotonic tiebreaker so two folds in the same millisecond get distinct refs. */
+    let foldRefSeq = 0;
 
     /**
      * Subscribe to one session's draft store and react to every transition.
@@ -1367,8 +1032,10 @@ window.__ModuleLoader__.load({
       // Dismiss is its own action, never routed through the toggle: "关闭即删除"
       // and "展开写回" are opposites, and sharing a callback would make the × a
       // coin flip between them.
-      const applyDismiss = () => {
-        if (typeof onDismiss === "function") onDismiss(sessionId);
+      // Passes the chip's own ref, so × removes just that paste. A session-level dismiss
+      // would delete every fold at once, which is not what removing one rail item means.
+      const applyDismiss = (foldRef) => {
+        if (typeof onDismiss === "function") onDismiss(sessionId, foldRef);
       };
 
       // useLayoutEffect, not useEffect: the attributes must be on the card in the
@@ -1422,14 +1089,22 @@ window.__ModuleLoader__.load({
 
       const label = t === undefined ? (key) => key : t;
       const open = expanded === true;
-      // The PREVIEW text, from whichever source still holds it. Collapsing removes
-      // the text from the draft, which is exactly the condition that makes the
-      // watcher clear the record — so a held fold often has no record, and reading
-      // `record.text` alone would leave the chip previewless.
-      const heldText = typeof getHeld === "function" ? getHeld(sessionId) : undefined;
-      const previewSource =
-        record !== undefined && record !== null && typeof record.text === "string" ? record.text : heldText;
-      const preview = foldPreview(previewSource);
+      // ONE CHIP PER FOLD, like the image rail.
+      //
+      // Reads the fold LIST the watcher records. Several large pastes into one composer
+      // each earn their own chip, which is the multi-paste behaviour the image chip has:
+      // "支持多次粘贴". A single-chip renderer was why a repeat paste looked like nothing
+      // happened.
+      // A record written by an older build has no `folds` list; treat the record itself
+      // as a single fold so such a state still renders a chip instead of nothing.
+      const folds = Array.isArray(record && record.folds)
+        ? record.folds
+        : record !== undefined && record !== null
+          ? [record]
+          : [];
+      // The collapsed clamp belongs to the card, not to one chip, so it is driven once
+      // from whether ANY fold exists.
+      const anyFold = folds.length > 0 || present;
       return React.createElement(
         React.Fragment,
         null,
@@ -1442,79 +1117,95 @@ window.__ModuleLoader__.load({
           "data-paste-spill-anchor": true,
           "aria-hidden": true,
         }),
-        present
+        anyFold
           ? React.createElement(
               "div",
-              {
-                className: "dshps-chip",
-                "data-paste-spill-chip": true,
-                "data-paste-spill-toggle": open ? "expanded" : "collapsed",
-              },
-              // The body is the expand target: clicking it puts the full text back
-              // into the text box and this chip goes away. A real <button> so the
-              // action is keyboard-reachable.
-              React.createElement(
-                "button",
-                {
-                  type: "button",
-                  className: "dshps-chip-open",
-                  "data-paste-spill-open": true,
-                  "aria-expanded": open,
-                  title: label("foldHint"),
-                  onClick: () => {
-                    applyToggle(true);
+              { className: "dshps-chip-rail", "data-paste-spill-rail": true },
+              ...folds.map((fold, index) => {
+                const foldRef = fold.ref;
+                const foldPreview = foldPreviewOf(fold);
+                return React.createElement(
+                  "div",
+                  {
+                    key: foldRef,
+                    className: "dshps-chip",
+                    "data-paste-spill-chip": foldRef,
+                    "data-paste-spill-chip-index": index,
                   },
-                },
-                React.createElement(
-                  "span",
-                  { className: "dshps-chip-glyph", "aria-hidden": true },
                   React.createElement(
-                    "svg",
-                    { viewBox: "0 0 16 16", width: "16", height: "16", fill: "none" },
-                    React.createElement("path", {
-                      d: "M3 5.5h10M3 10.5h10",
-                      stroke: "currentColor",
-                      strokeWidth: "1.2",
-                      strokeLinecap: "round",
-                    }),
+                    "button",
+                    {
+                      type: "button",
+                      className: "dshps-chip-open",
+                      "data-paste-spill-expand": foldRef,
+                      // Was the text put back into the composer? The chip is only mounted
+                      // while it is collapsed, so this is false in practice -- but it is
+                      // the honest state for assistive tech, and it is what the affordance
+                      // reports.
+                      "aria-expanded": open === true,
+                      // "按原文发送" lives on the expand control's tooltip. A build that
+                      // rendered it as a paragraph above the input box was rejected.
+                      title: label("foldHint"),
+                      onClick: (event) => {
+                        if (event !== undefined && typeof event.stopPropagation === "function") event.stopPropagation();
+                        applyToggle(true);
+                      },
+                    },
+                    React.createElement(
+                      "span",
+                      { className: "dshps-chip-glyph", "aria-hidden": true },
+                      React.createElement("svg", {
+                        width: 12,
+                        height: 12,
+                        viewBox: "0 0 12 12",
+                        fill: "none",
+                        children: React.createElement("path", {
+                          d: "M2 2h5l3 3v5H2z",
+                          stroke: "currentColor",
+                          strokeWidth: 1.2,
+                          strokeLinejoin: "round",
+                          strokeLinecap: "round",
+                        }),
+                      }),
+                    ),
+                    React.createElement(
+                      "span",
+                      { className: "dshps-chip-body" },
+                      React.createElement(
+                        "span",
+                        { className: "dshps-chip-preview" },
+                        // A record with no readable text (an older build, or a pure
+                        // whitespace paste) still needs a label rather than an empty chip.
+                        foldPreview === "" ? label("foldTitle") : foldPreview,
+                      ),
+                      React.createElement(
+                        "span",
+                        { className: "dshps-chip-action" },
+                        label("foldExpandAction"),
+                        React.createElement("span", { className: "dshps-chip-chevron", "aria-hidden": true }, "\u203A"),
+                      ),
+                    ),
                   ),
-                ),
-                React.createElement(
-                  "span",
-                  { className: "dshps-chip-body" },
+                  // "关闭即删除": discards THIS paste. Per-chip, because with several
+                  // folds a session-level dismiss would delete all of them at once --
+                  // the rail's x removes one item, so ours must too.
                   React.createElement(
-                    "span",
-                    { className: "dshps-chip-preview" },
-                    preview === "" ? label("foldTitle") : preview,
+                    "button",
+                    {
+                      type: "button",
+                      className: "dshps-chip-dismiss",
+                      "data-paste-spill-dismiss": foldRef,
+                      "aria-label": label("foldDismissLabel"),
+                      title: label("foldDismissLabel"),
+                      onClick: (event) => {
+                        if (event !== undefined && typeof event.stopPropagation === "function") event.stopPropagation();
+                        applyDismiss(foldRef);
+                      },
+                    },
+                    "\u00D7",
                   ),
-                  React.createElement(
-                    "span",
-                    { className: "dshps-chip-action" },
-                    label("foldExpandAction"),
-                    React.createElement("span", { className: "dshps-chip-chevron", "aria-hidden": true }, "\u203A"),
-                  ),
-                ),
-              ),
-              // "关闭即删除": discards the paste (hold + sidecar) rather than hiding
-              // it. Nested inside the chip but NOT inside the open button, so a
-              // click here cannot also expand.
-              React.createElement(
-                "button",
-                {
-                  type: "button",
-                  className: "dshps-chip-dismiss",
-                  "data-paste-spill-dismiss": true,
-                  "aria-label": label("foldDismissLabel"),
-                  title: label("foldDismissLabel"),
-                  onClick: (event) => {
-                    // The chip's own onClick would otherwise expand on the same
-                    // click: dismissing and expanding are mutually exclusive.
-                    if (event !== undefined && typeof event.stopPropagation === "function") event.stopPropagation();
-                    applyDismiss();
-                  },
-                },
-                "\u00D7",
-              ),
+                );
+              }),
             )
           : null,
       );
@@ -1532,101 +1223,7 @@ window.__ModuleLoader__.load({
       return `${(kb / 1024).toFixed(1)} MB`;
     }
 
-    /**
-     * Text held by fold chips, keyed by the `ref` the chip carries.
-     *
-     * Why a module-level map rather than session state: the ONLY value that
-     * crosses from an inserted chip into the submitted message is its `ref`
-     * (stock calls `occurrences[].serializeReference(source, ref)` at submit
-     * time). So `ref` is the handle the serializer dereferences, and it must
-     * outlive the React render tree that inserted it.
-     */
-    const foldTextByRef = new Map();
 
-    /**
-     * Hold text under the `ref` a fold chip carries.
-     *
-     * The ref is minted by the plugin and embedded in the chip node, so this is the
-     * only handle the serializer will later have. Re-holding an existing ref is a
-     * programming error, not a user-visible condition.
-     * @param ref - chip reference id.
-     * @param text - the original pasted text.
-     */
-    function holdFoldText(ref, text) {
-      foldTextByRef.set(ref, text);
-    }
-
-    /**
-     * Release held text, so a later serialize of the same ref fails loudly.
-     *
-     * Called by both exits from a fold: expanding (the text is back in the editor,
-     * so the chip is gone) and × (the user discarded it). Failing loudly matters --
-     * returning "" would silently submit a truncated message.
-     * @param ref - chip reference id.
-     */
-    function releaseFoldText(ref) {
-      foldTextByRef.delete(ref);
-    }
-
-    /**
-     * Register the `fold` chip source with stock's trigger pipeline.
-     *
-     * Why a chip at all, instead of clamping the text with CSS: a chip is the only
-     * way to put something in the composer that is not literal text. The chip node
-     * contributes a lone U+FFFC to the draft, and `"\uFFFC".trim() !== ""`, so
-     * stock's `empty` test (`draft.trim() === "" && attachments.length === 0`) is
-     * false and the send button stays LIVE -- while the real text stays out of the
-     * composer and is re-serialized from `ref` at submit. That is exactly how
-     * stock's own image and `@file` chips work, and it needs no stock patch.
-     *
-     * `trigger`/`name` must be unique in the roster (duplicates throw), so the
-     * pair is namespaced with the plugin prefix.
-     * @param ctx - client plugin context.
-     */
-    function registerFoldSource(ctx) {
-      try {
-        const inputTriggers = ctx.inputTriggers !== undefined ? ctx.inputTriggers : ctx.get("inputTriggers");
-        if (inputTriggers === undefined || typeof inputTriggers.registerSource !== "function") {
-          diag({ foldSourceRegistered: false, foldSourceReason: "service-missing" });
-          return;
-        }
-        const source = {
-          // A trigger character is required by the roster, but the fold source is
-          // never reached by typing it: the chip is inserted programmatically over a
-          // span. "/" is the roster the composer already reserves for commands.
-          trigger: "/",
-          name: "folded-text",
-          showGroupTitle: false,
-          // No menu candidates: this source contributes no completions, only the
-          // serializer that turns a chip back into its text.
-          candidates() {
-            return Promise.resolve([]);
-          },
-          codec: {
-            /**
-             * What a copy/undo of this chip puts back into the editor. The model form
-             * is never exposed here.
-             */
-            clipboardText: (ref) => `[folded-text:${ref}]`,
-            /**
-             * The value that reaches the turn. This is the load-bearing one: stock
-             * splices this return value into the submitted message in place of the
-             * chip's placeholder, so it must be the ORIGINAL pasted text, verbatim.
-             */
-            serialize(ref) {
-              const held = foldTextByRef.get(ref);
-              if (held === undefined) return Promise.reject(new Error(`dsh-paste-spill: folded text "${ref}" is no longer held`));
-              diag({ foldSerializeBytes: utf8Bytes(held) });
-              return Promise.resolve(held);
-            },
-          },
-        };
-        ctx.effect(() => inputTriggers.registerSource(source), "dsh-paste-spill: folded-text source");
-        diag({ foldSourceRegistered: true });
-      } catch (error) {
-        diag({ foldSourceRegistered: false, foldSourceReason: String(error && error.message) });
-      }
-    }
 
     /**
      * @param ctx - client plugin context.
@@ -1640,7 +1237,6 @@ window.__ModuleLoader__.load({
       // the slot was registered" both produced no key. Writing it first separates
       // them, and applyFailures below records the other case explicitly.
       diag({ build: BUILD_REV, applyRanAt: Date.now() });
-      registerFoldSource(ctx);
       const foldStore = createSessionStore();
       // Separate store from the fold record on purpose: "is text folded here" and
       // "has the user opened it up" have different lifetimes. Collapsing must not
@@ -1674,57 +1270,21 @@ window.__ModuleLoader__.load({
        */
       const toggleFold = (sessionId, next) => {
         if (sessionId === undefined || sessionId === null) return;
-        if (next === true) {
-          // Expand. When the fold is a CHIP the composer holds only a U+FFFC
-          // placeholder, so expanding must put the real text back before dropping
-          // the fold -- otherwise the placeholder would remain and the user would
-          // have a chip-looking glyph standing in for text that is now nowhere.
-          //
-          // For a clamp-only fold (the chip was refused) the text never left the
-          // editor, so there is nothing to restore and this is purely visual.
-          const record = foldStore.getSnapshot()[sessionId];
-          const held = record !== undefined && record !== null && typeof record.chipRef === "string" ? foldTextByRef.get(record.chipRef) : undefined;
-          // Fall back to the record's own text. The by-ref hold is released by several
-          // paths (a refused insert, an earlier expand), so it is NOT a reliable source
-          // here -- and when the draft is only the chip's placeholder, restoring nothing
-          // leaves an empty composer while the chip disappears: the user sees their text
-          // vanish. `record.text` is written with the record and survives those
-          // releases, so it is the dependable source.
-          const restore = restoreTextFor({ held, record });
-          if (typeof restore === "string") {
-            const shell = shellOf(ctx, sessionId);
-            // Report whether the write is even possible, so a missing shell cannot look
-            // like a successful expand in the diagnostics.
-            const wrote = shell !== null && typeof shell.setDraft === "function";
-            if (wrote) shell.setDraft(restore);
-            if (typeof record.chipRef === "string") releaseFoldText(record.chipRef);
-            diag({
-              foldExpandRestored: wrote,
-              foldExpandSource: typeof held === "string" ? "hold" : "record",
-              // The shape the expand leaves behind. If the chip node survived the write
-              // (or a placeholder was left orphaned), it shows up here as a chipCount,
-              // and an atomic node beside the caret is what blocks further typing.
-              foldExpandDraftShape: shell === null || shell.state === undefined ? undefined : describeDraft(shell.state.getSnapshot().draft),
-            });
-          } else {
-            diag({ foldExpandRestored: false, foldExpandSource: "none" });
-          }
-          // The text is back in the composer, so the hold's reason to exist is gone.
-          // Leaving it set would tell the watcher the text is intentionally out of the
-          // draft, and it would then never retire this record.
-          holdStore.clear(sessionId);
-          expandStore.clear(sessionId);
-          foldStore.clear(sessionId);
-          diag({ manualExpand: "expanded" });
-          return;
-        }
-        // Collapse: re-arm the fold so the chip returns. The text is untouched.
-        const record = foldStore.getSnapshot()[sessionId];
-        const text = record === undefined || record === null ? undefined : record.text;
-        if (typeof text !== "string" || text === "") return;
-        foldStore.set(sessionId, record);
+        // Expanding and collapsing are now PURELY VISUAL.
+        //
+        // The text never left the composer -- that is the whole design -- so there is
+        // nothing to write back and nothing to restore. Expanding just drops the fold
+        // state so the CSS clamp lifts and the chip unmounts, revealing the text that was
+        // in the editor all along.
+        //
+        // This is what removes the entire class of bug the old expand path had: no
+        // `setDraft`, so no rebuilt editor, no caret to lose, no undo history to reset,
+        // and no placeholder that could survive as an orphan. It also means an expand can
+        // never lose text, because it never moves any.
+        foldStore.clear(sessionId);
         expandStore.clear(sessionId);
-        diag({ manualCollapse: "collapsed" });
+        holdStore.clear(sessionId);
+        diag({ manualExpand: "expanded", foldExpandRestored: false, foldExpandSource: "text-stayed-in-draft" });
       };
       const setFoldExpanded = (sessionId, next) => {
         if (sessionId === undefined || sessionId === null) return;
@@ -1739,16 +1299,29 @@ window.__ModuleLoader__.load({
        * unmounted the chip would leave the paste sitting in the input box that the
        * user just discarded.
        */
-      const dismissSessionFold = (sessionId) => {
+      const dismissSessionFold = (sessionId, foldRef) => {
         if (sessionId === undefined || sessionId === null) return;
         const record = foldStore.getSnapshot()[sessionId];
-        const text = record === undefined || record === null ? undefined : record.text;
+        const all = Array.isArray(record && record.folds)
+          ? record.folds
+          : record !== undefined && record !== null
+            ? [record]
+            : [];
+        // Remove just the named chip. With several pastes in one composer, × on one rail
+        // item must delete only THAT paste -- removing the whole fold state would wipe the
+        // other pastes' text as well.
+        const target = typeof foldRef === "string" ? all.find((f) => f.ref === foldRef) : all[all.length - 1];
+        if (target === undefined || target === null) return;
+        const text = typeof target.text === "string" ? target.text : "";
         const shell = shellOf(ctx, sessionId);
         const outcome = dismissFold({
           sessionId,
           holdStore,
+          // Delete exactly this fold's text from the composer. `removePastedText` refuses a
+          // candidate that is the whole draft with a pre-existing prefix, so a bogus target
+          // degrades to leaving the text rather than clearing everything.
           removeText: (current) => {
-            if (typeof text !== "string" || text === "") return current;
+            if (text === "") return current;
             return removePastedText(current, text, "");
           },
           writeDraft: (next) => {
@@ -1760,17 +1333,34 @@ window.__ModuleLoader__.load({
             const draft = shell === null ? undefined : shell.state?.getSnapshot()?.draft;
             return typeof draft === "string" ? draft : "";
           },
+          // Drop only this fold from the list; the session's fold state survives for the
+          // other chips.
           clearFold: () => {
-            foldStore.clear(sessionId);
-            expandStore.clear(sessionId);
+            const remaining = all.filter((f) => f !== target);
+            if (remaining.length === 0) {
+              foldStore.clear(sessionId);
+              expandStore.clear(sessionId);
+              return;
+            }
+            // Keep the convenience fields pointing at the newest surviving fold.
+            const last = remaining[remaining.length - 1];
+            foldStore.set(sessionId, {
+              bytes: last.bytes,
+              lines: last.lines,
+              sentinels: last.sentinels,
+              text: last.text,
+              chipRef: last.ref,
+              chipInserted: false,
+              folds: remaining,
+            });
           },
           // × is a deletion, so the held text goes with it. Only for a real chip: a
           // clamp-only fold never held anything.
           releaseChip: () => {
-            if (record !== undefined && record !== null && typeof record.chipRef === "string") releaseFoldText(record.chipRef);
+            if (typeof target.ref === "string") releaseFoldText(target.ref);
           },
         });
-        diag({ foldDismissed: outcome });
+        diag({ foldDismissed: outcome, foldDismissedRef: foldRef, foldRemaining: foldStore.getSnapshot()[sessionId]?.folds?.length ?? 0 });
       };
       let counter = 0;
       const nextIndex = () => {
@@ -2000,7 +1590,16 @@ window.__ModuleLoader__.load({
           // band from the same constants the chip is positioned with is what keeps
           // the chip from ever painting over the attachments row.
           "[data-composer-card][" + CHIP_ATTR + "]{padding-top:" + CHIP_BAND_PX + "px}" +
-          ".dshps-chip{position:absolute;top:" + CHIP_TOP_PX + "px;left:12px;" +
+          // The RAIL: the band that holds one chip per fold, laid out like the image rail
+          // (dsh-client-ui-attachment's rail) -- a wrapping row of items above the editor.
+          // Absolute so it does not disturb the composer's own flow; the card's padding-top
+          // (above) reserves exactly this band, so the chips never paint over the editor.
+          ".dshps-chip-rail{position:absolute;top:" + CHIP_TOP_PX + "px;left:12px;right:12px;" +
+          "display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;z-index:1}" +
+          // Each chip is a rail item: `position:static` so it participates in the wrap
+          // (the old absolute positioning pinned exactly one chip to one spot, which is
+          // why several folds could not be shown at once).
+          ".dshps-chip{position:static;" +
           // Hug the content (a compact chip, like the attachment chip it imitates)
           // but never extend past the card. `right` stays auto: with both sides
           // pinned the chip would stretch into a full-width bar.
@@ -2129,11 +1728,7 @@ window.__ModuleLoader__.load({
       SPILL_BYTES,
       PREVIEW_CHARS,
       PASTE_NAME_PREFIX,
-      holdFoldText,
-      releaseFoldText,
-      insertFoldChip,
       formatFoldSize,
-      foldTextByRef,
       utf8Bytes,
       decidePaste,
       countLines,
@@ -2142,11 +1737,11 @@ window.__ModuleLoader__.load({
       foldApplies,
       restoreTextFor,
       describeDraft,
-      foldSpanFor,
       holdApplies,
       createHoldStore,
       dismissFold,
       foldPreview,
+      foldPreviewOf,
       readSessionSlice,
       applyFoldToCard,
       FOLD_ATTR,
