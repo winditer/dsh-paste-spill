@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-fold-9";
+    const BUILD_REV = "chip-fold-10";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -65,6 +65,29 @@ window.__ModuleLoader__.load({
       if (decision === "inline" && runBytes < SPILL_BYTES) return;
       transitionCount += 1;
       diag({ transitionCount, lastDecision: decision, lastRunBytes: runBytes, lastTransitionAt: Date.now() });
+    }
+
+    /**
+     * Describe a composer draft for the diagnostics, without dumping its text.
+     *
+     * The exact SHAPE matters and is not visible from an outcome field alone. Stock's
+     * `insertReference` appends a trailing SPACE after the chip whenever the character
+     * following the span is not already one, so a chip fold's draft settles to
+     * `"\uFFFC "` -- TWO code units, not one. Several earlier bugs were misdiagnosed
+     * because a stub modelled it as a single unit, so record the real shape: the code
+     * units, the length, and how many placeholders and spaces are present.
+     */
+    function describeDraft(draft) {
+      if (typeof draft !== "string") return { kind: typeof draft };
+      return {
+        length: draft.length,
+        chipCount: (draft.match(/\uFFFC/g) ?? []).length,
+        spaceCount: (draft.match(/ /g) ?? []).length,
+        newlineCount: (draft.match(/\n/g) ?? []).length,
+        // A compact, text-free fingerprint: placeholders and whitespace only, so the
+        // user's actual content never lands in Local Storage.
+        shape: draft.replace(/[^\uFFFC \n]/gu, "").slice(0, 40),
+      };
     }
 
     const zh = {
@@ -147,6 +170,22 @@ window.__ModuleLoader__.load({
      */
     function foldApplies(record) {
       return record !== undefined && record !== null;
+    }
+
+    /**
+     * Yield for one task turn, so queued editor commits can apply.
+     *
+     * Used between chip-insert attempts. A macrotask, not a microtask: the editor's
+     * commit queue runs off the task queue, so a microtask would re-read the projection
+     * before those commits have drained and observe the same stale revision. Resolves
+     * false when no task queue is available (a bare test harness), which stops the retry
+     * loop instead of hanging.
+     *
+     * @returns a promise resolving true when a turn elapsed.
+     */
+    function settleTurn() {
+      if (typeof setTimeout !== "function") return Promise.resolve(false);
+      return new Promise((resolve) => { setTimeout(() => resolve(true), 0); });
     }
 
     /**
@@ -451,7 +490,7 @@ window.__ModuleLoader__.load({
      * @param options - shell, the text to hold, and a ref to hold it under.
      * @returns true when the chip was inserted and the draft replaced by it.
      */
-    function insertFoldChip({ shell, text, ref }) {
+    async function insertFoldChip({ shell, text, ref }) {
       const snapshot = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
       if (snapshot === undefined || typeof snapshot.draftRev !== "number") {
         diag({ foldChipInserted: false, foldChipReason: "no-revision" });
@@ -484,7 +523,16 @@ window.__ModuleLoader__.load({
       let applied = false;
       let lastSpan = null;
       let lastLive = null;
-      for (let attempt = 0; attempt < 2 && !applied; attempt += 1) {
+      // Retry across MICROTASK TURNS, not just twice in a row.
+      //
+      // A paste reaches the editor as several commits, and each content change
+      // republishes the projection and bumps `rev`. Immediately after the paste the
+      // revision is therefore still moving, and two back-to-back attempts inside one
+      // microtask both read the same not-yet-final revision. Waiting a turn between
+      // attempts lets those commits drain, so an attempt finally lands on a settled
+      // revision and the CAS holds. That is what makes a repeat paste fold instead of
+      // being refused forever.
+      for (let attempt = 0; attempt < 8 && !applied; attempt += 1) {
         const live = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
         if (live === undefined || typeof live.draftRev !== "number") break;
         lastLive = live;
@@ -503,6 +551,15 @@ window.__ModuleLoader__.load({
           diag({ foldChipInserted: false, foldChipReason: String(error && error.message) });
           releaseFoldText(ref);
           return false;
+        }
+        if (!applied && attempt < 7) {
+          // Let the next drain land before re-reading. A macrotask (setTimeout 0) rather
+          // than a microtask: the editor's own commit queue runs off the task queue, so
+          // a microtask would re-read before those commits have applied and see the same
+          // stale revision. The sync fast path is unaffected: the first attempt runs
+          // inline, and the wait only happens after a refusal.
+          const waited = await settleTurn();
+          if (!waited) break;
         }
       }
       if (!applied) {
@@ -525,7 +582,14 @@ window.__ModuleLoader__.load({
         });
         return false;
       }
-      diag({ foldChipInserted: true, foldChipHeldBytes: utf8Bytes(text) });
+      diag({
+        foldChipInserted: true,
+        foldChipHeldBytes: utf8Bytes(text),
+        // The composer's real shape right after the insert. Stock appends a trailing
+        // space beside the chip, so this is normally `"\uFFFC "` -- two units. Recording
+        // it is how a wrong assumption about that shape gets caught.
+        foldAfterInsertDraftShape: shell.state === undefined ? undefined : describeDraft(shell.state.getSnapshot().draft),
+      });
       return true;
     }
 
@@ -797,17 +861,17 @@ window.__ModuleLoader__.load({
           // Deferring to a microtask lets the in-flight update commit first, so our
           // `insertReference` takes the real `update()` path and the editor is active.
           if (shell !== undefined && shell !== null) {
-            const settle = () => {
+            const settle = async () => {
               // ABANDON this insertion if its fold is no longer the live one.
               //
-              // The insert is deferred to a microtask, so the world can change before it
-              // runs -- most importantly a user expand, which writes the text back and
-              // retires the record. Running the insert anyway is destructive rather than
-              // merely redundant: the span covers [0, draft.length), so it replaces the
-              // just-restored text with a chip placeholder, and the record is already
-              // gone -- so no chip is drawn, the composer shows nothing, and the orphaned
-              // placeholder keeps stock's `empty` test false, leaving the send button
-              // LIVE over an apparently empty box. That is the reported
+              // The insert is deferred out of the editor's update, so the world can change
+              // before it runs -- most importantly a user expand, which writes the text
+              // back and retires the record. Running the insert anyway is destructive
+              // rather than merely redundant: the span covers [0, draft.length), so it
+              // replaces the just-restored text with a chip placeholder, and the record is
+              // already gone -- so no chip is drawn, the composer shows nothing, and the
+              // orphaned placeholder keeps stock's `empty` test false, leaving the send
+              // button LIVE over an apparently empty box. That is the reported
               // "点展开 → 文本没有写回，但此时可以点击发送到 turn".
               const liveNow = foldStore.getSnapshot()[sessionId];
               if (liveNow === undefined || liveNow === null || liveNow.chipRef !== chipRef) {
@@ -821,8 +885,26 @@ window.__ModuleLoader__.load({
               // CURRENT draft, not the one we saw before the update committed.
               const after = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
               const chipInserted = after !== undefined && typeof after.draftRev === "number"
-                ? insertFoldChip({ shell, text: chipWanted, ref: chipRef })
+                ? await insertFoldChip({ shell, text: chipWanted, ref: chipRef })
                 : false;
+              // The insert yields while it retries, so re-check the fold is still ours before
+              // treating the result as current. An expand during that window must win:
+              // without this the insert would overwrite the text the user just asked to
+              // see.
+              //
+              // BUT only when the insert did NOT land. Once the chip node is in the
+              // editor it is atomic and contentEditable=false, so abandoning it strands
+              // exactly the node that blocks typing -- the caret cannot enter it and
+              // nothing draws a chip for it. An inserted chip must therefore always be
+              // described by a matching record (the else-branch below re-registers one).
+              const stillLive = foldStore.getSnapshot()[sessionId];
+              if (!chipInserted && (stillLive === undefined || stillLive === null || stillLive.chipRef !== chipRef)) {
+                if (holdStore !== undefined && holdStore !== null && typeof holdStore.clear === "function") {
+                  holdStore.clear(sessionId);
+                }
+                diag({ foldChipDeferred: "abandoned-after-retry" });
+                return;
+              }
               if (!chipInserted) {
                 // Nothing to reconcile: the record already describes the clamp
                 // fallback and the held text was rolled back by insertFoldChip. The
@@ -860,10 +942,29 @@ window.__ModuleLoader__.load({
               const reconciled = live !== undefined && live !== null && live.chipRef === chipRef;
               if (reconciled) {
                 foldStore.set(sessionId, { ...live, sentinels: ["\uFFFC"], chipInserted: true });
+              } else {
+                // The record under our ref is gone, but the chip IS in the editor.
+                // Skipping the rewrite here is not harmless: the surviving record's
+                // sentinels still describe the ORIGINAL TEXT while the draft is now the
+                // chip's placeholder, so the watcher (whose staleness test is exactly
+                // that mismatch) retires the record at once. That leaves an ATOMIC,
+                // contentEditable=false chip node in a composer with no record: nothing
+                // draws a chip for it, and the caret cannot enter it, so typing stops
+                // working and the cursor appears to have vanished. Re-register the record
+                // under our own ref, so the chip the editor actually holds is the chip we
+                // describe.
+                foldStore.set(sessionId, {
+                  bytes: verdict.bytes,
+                  lines: countLines(candidate),
+                  sentinels: ["\uFFFC"],
+                  text: chipWanted,
+                  chipRef,
+                  chipInserted: true,
+                });
               }
               diag({
                 foldChipDeferred: "inserted",
-                foldReconcile: reconciled ? "reconciled" : "skipped",
+                foldReconcile: reconciled ? "reconciled" : "replaced",
                 foldReconcileLiveRef: live === null || live === undefined ? undefined : live.chipRef,
                 foldReconcileWantRef: chipRef,
               });
@@ -906,6 +1007,7 @@ window.__ModuleLoader__.load({
             // paste folds" diagnosable instead of a guess.
             foldStoredDraftHadChip: typeof current === "string" && current.includes("\uFFFC"),
             foldStoredChipCount: typeof current === "string" ? (current.match(/\uFFFC/g) ?? []).length : undefined,
+            foldStoredDraftShape: describeDraft(current),
           });
         }
         return "fold";
@@ -1517,7 +1619,14 @@ window.__ModuleLoader__.load({
             const wrote = shell !== null && typeof shell.setDraft === "function";
             if (wrote) shell.setDraft(restore);
             if (typeof record.chipRef === "string") releaseFoldText(record.chipRef);
-            diag({ foldExpandRestored: wrote, foldExpandSource: typeof held === "string" ? "hold" : "record" });
+            diag({
+              foldExpandRestored: wrote,
+              foldExpandSource: typeof held === "string" ? "hold" : "record",
+              // The shape the expand leaves behind. If the chip node survived the write
+              // (or a placeholder was left orphaned), it shows up here as a chipCount,
+              // and an atomic node beside the caret is what blocks further typing.
+              foldExpandDraftShape: shell === null || shell.state === undefined ? undefined : describeDraft(shell.state.getSnapshot().draft),
+            });
           } else {
             diag({ foldExpandRestored: false, foldExpandSource: "none" });
           }
@@ -1953,6 +2062,7 @@ window.__ModuleLoader__.load({
       foldTextPresent,
       foldApplies,
       restoreTextFor,
+      describeDraft,
       holdApplies,
       createHoldStore,
       dismissFold,

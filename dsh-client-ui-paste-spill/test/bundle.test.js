@@ -3,6 +3,25 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 /**
+ * Wait for a deferred chip insert to finish.
+ *
+ * The insert is deferred out of the editor's update (Lexical #337) and, when its CAS is
+ * refused, it yields a TASK turn between retries so the editor's queued commits can
+ * drain. A single `await Promise.resolve()` therefore does not suffice: that only
+ * flushes microtasks. This drains real task turns, so tests assert the settled state
+ * instead of depending on how many internal yields happen to occur.
+ *
+ * Pass `until` to stop as soon as the outcome is observable, which is the honest way to
+ * wait on an operation that retries a variable number of times.
+ */
+async function settleChip(turns = 8, until = null) {
+  for (let i = 0; i < turns; i += 1) {
+    if (typeof until === "function" && until()) return;
+    await new Promise((resolve) => { setTimeout(resolve, 0); });
+  }
+}
+
+/**
  * Materialize lib/client.js exactly as the browser ModuleLoader would: capture
  * the registered record, then call its factory with a stubbed `require`.
  */
@@ -310,7 +329,7 @@ test("inserting a fold chip holds the text BEFORE the chip exists, then wins the
   };
 
   const text = "pasted body\n".repeat(400);
-  const ok = exports.__internals.insertFoldChip({ shell, text, ref: "r-7" });
+  const ok = await exports.__internals.insertFoldChip({ shell, text, ref: "r-7" });
   assert.equal(ok, true);
   assert.equal(calls.length, 1, "exactly one insertion attempt");
   assert.equal(calls[0].resolvableAtInsert, true, "the text must be held BEFORE the chip is inserted");
@@ -319,7 +338,7 @@ test("inserting a fold chip holds the text BEFORE the chip exists, then wins the
   assert.equal(await codec.serialize("r-7"), text);
 });
 
-test("a refused chip insertion releases the hold, so no ref is left dangling", () => {
+test("a refused chip insertion releases the hold, so no ref is left dangling", async () => {
   const registered = [];
   const { exports } = applyWithTriggerStub({ registered });
 
@@ -330,13 +349,13 @@ test("a refused chip insertion releases the hold, so no ref is left dangling", (
     state: { getSnapshot: () => ({ draft: "AAA", draftRev: 8 }) },
     insertReference: () => false,
   };
-  const ok = exports.__internals.insertFoldChip({ shell, text: "x".repeat(5000), ref: "r-9" });
+  const ok = await exports.__internals.insertFoldChip({ shell, text: "x".repeat(5000), ref: "r-9" });
   assert.equal(ok, false);
   // A dangling hold would let a later message resolve a ref that no chip carries.
   assert.equal(exports.__internals.foldTextByRef.has("r-9"), false);
 });
 
-test("a shell that throws on insertion also releases the hold", () => {
+test("a shell that throws on insertion also releases the hold", async () => {
   const registered = [];
   const { exports } = applyWithTriggerStub({ registered });
   const shell = {
@@ -345,7 +364,7 @@ test("a shell that throws on insertion also releases the hold", () => {
     state: { getSnapshot: () => ({ draft: "AAA", draftRev: 1 }) },
     insertReference: () => { throw new Error("editor busy"); },
   };
-  assert.equal(exports.__internals.insertFoldChip({ shell, text: "y".repeat(5000), ref: "r-1" }), false);
+  assert.equal(await exports.__internals.insertFoldChip({ shell, text: "y".repeat(5000), ref: "r-1" }), false);
   assert.equal(exports.__internals.foldTextByRef.has("r-1"), false);
 });
 
@@ -502,7 +521,7 @@ test("reactToDraft records fold state for a large insertion without uploading", 
   assert.equal(record.chipInserted, false);
   // A shell with no projection can never take a chip, so the deferral must leave it
   // that way rather than half-applying something.
-  await Promise.resolve();
+  await settleChip();
   assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, false);
 });
 
@@ -543,7 +562,7 @@ test("the chip insert is DEFERRED, because inserting inside the editor's own upd
   inUpdate = false;
   // Once control returns to the microtask queue the update has committed, and the
   // insert is safe to attempt.
-  await Promise.resolve();
+  await settleChip();
   assert.equal(sawUpdateDuringCall, false, "the deferred insert must run OUTSIDE the update");
   assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, true);
 });
@@ -588,54 +607,61 @@ test("a deferred chip insert is ABANDONED if the fold was expanded first", async
   foldStore.clear("sess-1");
 
   // Now the stale deferred settle lands.
-  await Promise.resolve();
-  await Promise.resolve();
+  await settleChip();
 
   assert.equal(draft, run, "the restored text must NOT be replaced by an orphaned placeholder");
   assert.equal(foldStore.getSnapshot()["sess-1"], undefined, "and no chip may come back");
   assert.equal(holdStore.has("sess-1"), false, "and no hold may outlive the abandoned insert");
 });
 
-test("the chip insert retries when a republish bumps the revision under it", async () => {
-  // In-app symptom: the FIRST large paste folded, later ones did not. Cause: the
-  // editor republishes (and bumps `rev`) whenever the projection's content changes,
-  // and that can land between our snapshot read and the `insertReference` call.
-  // Stock's CAS then refuses a span built from the stale revision, so the chip
-  // silently never appears. Reproduced deterministically as "REFUSED sent=0 live=1".
+test("the chip insert keeps retrying across task turns while the paste's commits drain", async () => {
+  // THE reported bug: "多次粘贴，还是只有第一次有 chip". A paste reaches the editor as
+  // several commits, and each content change republishes the projection and bumps `rev`.
+  // Right after a paste the revision is therefore still MOVING, so stock's CAS refuses
+  // every span built from it. Retrying twice inside one microtask cannot help -- both
+  // attempts read the same not-yet-final revision. The attempts have to yield a task
+  // turn each so the commits drain.
+  //
+  // Measured directly, with this many republishes still pending at insert time:
+  //   republishes=1 -> inserted=true    (2 attempts was enough)
+  //   republishes=2 -> inserted=false   (THE BUG: only the first paste folded)
+  // and after the fix all of 1/2/3/5 republishes insert successfully.
   const { reactToDraft, createSessionStore, createHoldStore } = loadBundle().exports.__internals;
   const run = "z".repeat(5000);
 
-  let draft = run;
-  let rev = 0;
-  let raced = false;
-  const shell = {
-    get state() { return { getSnapshot: () => ({ draft, draftRev: rev, phase: "plain" }) }; },
-    insertReference(ref, span) {
-      if (!raced) { raced = true; rev += 1; } // the republish lands first, exactly once
-      if (span.draftRev !== rev) return false;
-      draft = "\uFFFC";
-      rev += 1;
-      return true;
-    },
-    setDraft() {},
-  };
+  async function attemptWith(republishes) {
+    let draft = run;
+    let rev = 0;
+    let pending = republishes;
+    const shell = {
+      get state() { return { getSnapshot: () => ({ draft, draftRev: rev, phase: "plain" }) }; },
+      insertReference(ref, span) {
+        // Simulate the paste's own trailing commits: each refusal is one more drain.
+        if (pending > 0) { pending -= 1; rev += 1; return false; }
+        if (span.draftRev !== rev) return false;
+        draft = "\uFFFC";
+        rev += 1;
+        return true;
+      },
+      setDraft() {},
+    };
+    const foldStore = createSessionStore();
+    reactToDraft({
+      previous: "", current: run, run, sessionId: "sess-1",
+      conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+      shell, foldStore, holdStore: createHoldStore(),
+    });
+    await settleChip(10, () => foldStore.getSnapshot()["sess-1"]?.chipInserted === true);
+    return foldStore.getSnapshot()["sess-1"]?.chipInserted === true;
+  }
 
-  const foldStore = createSessionStore();
-  reactToDraft({
-    previous: "", current: run, run, sessionId: "sess-1",
-    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
-    shell, foldStore, holdStore: createHoldStore(),
-  });
-  // Two microtask turns: the deferral, then the retry.
-  await Promise.resolve();
-  await Promise.resolve();
-
-  assert.equal(
-    foldStore.getSnapshot()["sess-1"].chipInserted,
-    true,
-    "a revision bump must not cost us the chip",
-  );
-  assert.equal(draft, "\uFFFC");
+  for (const republishes of [1, 2, 3, 5]) {
+    assert.equal(
+      await attemptWith(republishes),
+      true,
+      `${republishes} pending republishes must still produce a chip`,
+    );
+  }
 });
 
 test("the watcher keeps a chip record alive while the hold is raised, even as the draft changes", () => {
@@ -735,7 +761,7 @@ test("the chip raises a hold, so the watcher cannot retire the record before the
   assert.equal(holdStore.has("sess-1"), true, "the hold must be raised before the insert is deferred");
   assert.equal(holdStore.get("sess-1"), run, "and must carry the text the chip represents");
 
-  await Promise.resolve();
+  await settleChip();
   // It survives the insert (the chip now owns the text) and is only released on an exit.
   assert.equal(holdStore.has("sess-1"), true);
   assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, true);
@@ -762,9 +788,57 @@ test("a refused insert releases the hold, so the watcher resumes owning the reco
     conversation: { createDrafts() { throw new Error("fold must not upload"); } },
     shell, foldStore, holdStore,
   });
-  await Promise.resolve();
+  await settleChip(8, () => holdStore.has("sess-1") === false && foldStore.getSnapshot()["sess-1"] !== undefined);
   assert.equal(holdStore.has("sess-1"), false, "the fallback must not leave a hold behind");
   assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, false);
+});
+
+test("a chip that landed after its record was retired gets a fresh record, not an orphan", async () => {
+  // Reported: after expand → delete everything → paste again, the cursor vanished and
+  // typing stopped working. Cause: when the post-insert record rewrite was SKIPPED, the
+  // surviving record still described the ORIGINAL TEXT while the draft had become the
+  // chip's placeholder -- so the watcher retired the record at once, leaving an ATOMIC
+  // contentEditable=false chip node in a composer with no record: nothing draws a chip
+  // for it and the caret cannot enter it.
+  const { reactToDraft, createSessionStore, createHoldStore, foldTextPresent } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const holdStore = createHoldStore();
+  const run = "o".repeat(5000);
+
+  let draft = run;
+  let rev = 1;
+  const shell = {
+    get state() { return { getSnapshot: () => ({ draft, draftRev: rev, phase: "plain" }) }; },
+    insertReference(ref, span) {
+      if (span.draftRev !== rev) return false;
+      draft = "\uFFFC "; // stock's real settled shape
+      rev += 1;
+      // The record is retired DURING the insert -- after the abandon check but before
+      // the post-insert rewrite. This is the window where the guard cannot help, so the
+      // rewrite itself has to leave a record that matches the editor.
+      foldStore.clear("sess-1");
+      return true;
+    },
+    setDraft() {},
+  };
+
+  reactToDraft({
+    previous: "", current: run, run, sessionId: "sess-1",
+    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+    shell, foldStore, holdStore,
+  });
+  await settleChip();
+
+  const record = foldStore.getSnapshot()["sess-1"];
+  assert.ok(record, "the chip in the editor must have a matching record, or it is an orphan");
+  assert.equal(record.chipInserted, true);
+  // And crucially the record must MATCH the draft, so the watcher cannot retire it and
+  // strand the chip node.
+  assert.equal(
+    foldTextPresent(record, draft),
+    true,
+    "the record's sentinels must match the settled draft",
+  );
 });
 
 test("the chip path replaces the draft with a placeholder and holds the text out of it", async () => {
@@ -781,7 +855,10 @@ test("the chip path replaces the draft with a placeholder and holds the text out
     insertReference(ref, span) {
       if (span.draftRev !== shell.rev) return false;
       // The span covers the WHOLE draft, so replacing it with the chip IS the removal.
-      draft = "\uFFFC";
+      // Faithful to stock: `insertReference` appends a trailing SPACE beside the chip
+      // whenever the character after the span is not already one, so the settled draft
+      // is `"\uFFFC "` -- TWO code units. Modelling it as one hid several real bugs.
+      draft = "\uFFFC ";
       return true;
     },
     // Faithful to stock: `setDraft` does `root.clear()` and rebuilds from plain text,
@@ -805,7 +882,7 @@ test("the chip path replaces the draft with a placeholder and holds the text out
   assert.equal(outcome, "fold");
   // The insertion is deferred out of the editor's in-flight update (Lexical #337),
   // so the chip lands on the next microtask.
-  await Promise.resolve();
+  await settleChip();
 
   const record = foldStore.getSnapshot()["sess-1"];
   assert.equal(record.chipInserted, true);
@@ -813,7 +890,7 @@ test("the chip path replaces the draft with a placeholder and holds the text out
   // The original text is no longer displayed in the input box -- the user's
   // requirement. What remains is the chip's lone placeholder, which is what keeps
   // stock's `empty` test false so the send button stays live.
-  assert.equal(draft, "\uFFFC");
+  assert.equal(draft, "\uFFFC ", "the settled draft is the chip plus stock's trailing space");
   // The text is held under the ref the chip carries, so the serializer can produce
   // the ORIGINAL body at submit time.
   assert.equal(foldTextByRef.get(record.chipRef), run);
@@ -844,7 +921,7 @@ test("a refused chip insertion leaves the text inline rather than losing it", as
     }),
     "fold",
   );
-  await Promise.resolve();
+  await settleChip();
   const record = foldStore.getSnapshot()["sess-1"];
   assert.equal(record.chipInserted, false);
   // The editor must be untouched: the text is still the only copy, so clearing it
