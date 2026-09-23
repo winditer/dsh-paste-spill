@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-fold-6";
+    const BUILD_REV = "chip-fold-7";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -1668,6 +1668,26 @@ window.__ModuleLoader__.load({
         tag.dataset.plugin = "dsh-paste-spill";
         tag.dataset.pluginCss = "dsh-paste-spill";
         tag.textContent =
+          // Hide stock's OWN inline rendering of our chip node.
+          //
+          // A reference node is painted twice over: stock draws it inline in the
+          // editor flow via `ReferenceChip` (`.QiNVUW_chip`, a compact 22px pill), and
+          // we draw the real affordance as the floating overlay below. Left alone the
+          // user sees both at once -- the stock pill ("已折叠 5.9 KB") AND our chip --
+          // which reads as the paste having been split into two separate blocks.
+          //
+          // Scoping is the whole difficulty: stock's chip DOM carries only
+          // `title={label}` (no source or ref attribute), so the label is the only
+          // discrimin-ator available. `title^="已折叠 "` is safe because labels come
+          // from registered sources, and no other installed package emits that prefix
+          // (checked against every @deepseek-ai/* package). Matching on the stock
+          // class as well keeps the rule from touching anything else that happens to
+          // carry a similar title.
+          //
+          // `display:none` rather than `visibility:hidden`: the node must stop
+          // occupying inline space, or the text area would still reserve a 22px line
+          // for a pill nobody can see.
+          "[data-composer-card] .QiNVUW_chip[title^=\"已折叠 \"]{display:none}" +
           // The chip floats (the overlay anchor is `height:0`), so it cannot occupy
           // the flow itself. These two rules are a pair: the chip is positioned in
           // the band, and the card reserves exactly that band as padding. Sizing the

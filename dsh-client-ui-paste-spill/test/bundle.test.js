@@ -1487,6 +1487,46 @@ test("the collapse rule outranks the stock scroll rule it overrides", () => {
   );
 });
 
+test("stock's own inline rendering of our chip node is hidden, so the paste is one block", () => {
+  // A reference node is drawn TWICE: stock paints it inline in the editor flow
+  // (`.QiNVUW_chip`, a 22px pill) and we draw the real affordance as a floating
+  // overlay. Left alone the user sees both, which reads as the paste having been
+  // split into two separate blocks. This rule removes stock's copy.
+  let css = "";
+  const documentStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null, querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild: (tag) => { css = tag.textContent; } },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = documentStub;
+  try {
+    loadBundle().exports.apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_k, register) => register(), register: () => {} },
+      conversation: { input: { shell: () => undefined } },
+      sessions: { list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} } },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  const rule = /\[data-composer-card\]\s*\.QiNVUW_chip\[title\^="已折叠 "\]\{([^}]*)\}/.exec(css);
+  assert.ok(rule, "stock's inline chip must be suppressed");
+  // display:none, not visibility:hidden: the node must stop occupying inline space,
+  // or the editor would still reserve a 22px line for an invisible pill.
+  assert.match(rule[1], /display:\s*none/);
+
+  // Scoping matters: stock's chip DOM carries only `title={label}`, so the label is
+  // the only discriminator. Without BOTH the stock class and the title prefix, the
+  // rule would hide the user's own `@file` / image chips too.
+  assert.match(rule[0], /\.QiNVUW_chip/, "must target stock's chip class");
+  assert.match(rule[0], /title\^=/, "and must be scoped by the title prefix");
+});
+
 test("the chip is positioned inside the card, and the card reserves a band for it", () => {
   // The chip cannot occupy the flow itself: `conversation.input.overlay` is the
   // only in-card slot available and its anchor is `height:0` (a floating layer
