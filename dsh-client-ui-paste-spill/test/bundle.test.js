@@ -548,6 +548,54 @@ test("the chip insert is DEFERRED, because inserting inside the editor's own upd
   assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, true);
 });
 
+test("a deferred chip insert is ABANDONED if the fold was expanded first", async () => {
+  // The insert is deferred to a microtask, so a user expand can land before it runs.
+  // Running it anyway is destructive, not merely redundant: the span covers
+  // [0, draft.length), so it replaces the just-restored text with a chip placeholder
+  // while the record is already gone -- the composer shows nothing, no chip is drawn,
+  // and the orphaned placeholder keeps stock's `empty` test false, leaving the send
+  // button LIVE over an apparently empty box. Reported as "点展开 → 文本没有写回，
+  // 但此时可以点击发送到 turn".
+  const { reactToDraft, createSessionStore, createHoldStore } = loadBundle().exports.__internals;
+  const run = "E".repeat(5000);
+
+  let draft = run;
+  let rev = 0;
+  const shell = {
+    get state() { return { getSnapshot: () => ({ draft, draftRev: rev, phase: "plain" }) }; },
+    setDraft(text) { draft = String(text).replace(/[\uE100-\uE11D\uFFFC]/gu, ""); rev += 1; },
+    insertReference(ref, span) {
+      if (span.draftRev !== rev) return false;
+      draft = "\uFFFC"; // the whole-draft span replaces everything, incl. restored text
+      rev += 1;
+      return true;
+    },
+  };
+
+  const foldStore = createSessionStore();
+  const holdStore = createHoldStore();
+
+  reactToDraft({
+    previous: "", current: run, run, sessionId: "sess-1",
+    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+    shell, foldStore, holdStore,
+  });
+
+  // The user expands BEFORE the deferred settle runs: the text is written back and the
+  // fold state is retired.
+  shell.setDraft(run);
+  holdStore.clear("sess-1");
+  foldStore.clear("sess-1");
+
+  // Now the stale deferred settle lands.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(draft, run, "the restored text must NOT be replaced by an orphaned placeholder");
+  assert.equal(foldStore.getSnapshot()["sess-1"], undefined, "and no chip may come back");
+  assert.equal(holdStore.has("sess-1"), false, "and no hold may outlive the abandoned insert");
+});
+
 test("the chip insert retries when a republish bumps the revision under it", async () => {
   // In-app symptom: the FIRST large paste folded, later ones did not. Cause: the
   // editor republishes (and bumps `rev`) whenever the projection's content changes,

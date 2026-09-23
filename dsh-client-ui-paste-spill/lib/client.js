@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-fold-8";
+    const BUILD_REV = "chip-fold-9";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -798,6 +798,25 @@ window.__ModuleLoader__.load({
           // `insertReference` takes the real `update()` path and the editor is active.
           if (shell !== undefined && shell !== null) {
             const settle = () => {
+              // ABANDON this insertion if its fold is no longer the live one.
+              //
+              // The insert is deferred to a microtask, so the world can change before it
+              // runs -- most importantly a user expand, which writes the text back and
+              // retires the record. Running the insert anyway is destructive rather than
+              // merely redundant: the span covers [0, draft.length), so it replaces the
+              // just-restored text with a chip placeholder, and the record is already
+              // gone -- so no chip is drawn, the composer shows nothing, and the orphaned
+              // placeholder keeps stock's `empty` test false, leaving the send button
+              // LIVE over an apparently empty box. That is the reported
+              // "点展开 → 文本没有写回，但此时可以点击发送到 turn".
+              const liveNow = foldStore.getSnapshot()[sessionId];
+              if (liveNow === undefined || liveNow === null || liveNow.chipRef !== chipRef) {
+                if (holdStore !== undefined && holdStore !== null && typeof holdStore.clear === "function") {
+                  holdStore.clear(sessionId);
+                }
+                diag({ foldChipDeferred: "abandoned", foldAbandonLiveRef: liveNow === null || liveNow === undefined ? undefined : liveNow.chipRef });
+                return;
+              }
               // Re-read the revision now: the deferred call must CAS against the
               // CURRENT draft, not the one we saw before the update committed.
               const after = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
@@ -831,10 +850,23 @@ window.__ModuleLoader__.load({
               // Re-write the record against the post-insertion truth: presence is now
               // judged on the placeholder, since the text has left the draft.
               const live = foldStore.getSnapshot()[sessionId];
-              if (live !== undefined && live !== null && live.chipRef === chipRef) {
+              // Report the reconcile's outcome explicitly. The `chipRef` guard can skip
+              // it (the watcher may have already replaced the record), and a skip leaves
+              // the record's sentinels describing the ORIGINAL TEXT while the draft is
+              // now the chip's placeholder -- so the watcher retires the record and the
+              // chip never renders, even though the insert itself succeeded and
+              // `foldChipDeferred` says "inserted". That mismatch is invisible without
+              // this field, and it is exactly the "inserted but no chip visible" symptom.
+              const reconciled = live !== undefined && live !== null && live.chipRef === chipRef;
+              if (reconciled) {
                 foldStore.set(sessionId, { ...live, sentinels: ["\uFFFC"], chipInserted: true });
               }
-              diag({ foldChipDeferred: "inserted" });
+              diag({
+                foldChipDeferred: "inserted",
+                foldReconcile: reconciled ? "reconciled" : "skipped",
+                foldReconcileLiveRef: live === null || live === undefined ? undefined : live.chipRef,
+                foldReconcileWantRef: chipRef,
+              });
             };
             if (typeof queueMicrotask === "function") queueMicrotask(settle);
             else Promise.resolve().then(settle);
@@ -867,6 +899,13 @@ window.__ModuleLoader__.load({
             // The insertion is deferred, so the outcome is reported from `settle`
             // (foldChipDeferred / foldChipInserted) rather than from here.
             foldChipPending: shell !== undefined && shell !== null,
+            // Whether the draft already held a chip placeholder when this fold was
+            // decided, and how many it holds now. A repeat paste lands on a draft shaped
+            // `<U+FFFC><new text>`, and that is the one case where the insertion span and
+            // the detect layout can disagree -- so recording it makes "only the first
+            // paste folds" diagnosable instead of a guess.
+            foldStoredDraftHadChip: typeof current === "string" && current.includes("\uFFFC"),
+            foldStoredChipCount: typeof current === "string" ? (current.match(/\uFFFC/g) ?? []).length : undefined,
           });
         }
         return "fold";
