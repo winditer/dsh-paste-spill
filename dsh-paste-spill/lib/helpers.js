@@ -7,28 +7,11 @@
 export const PASTE_NAME_PREFIX = "pasted-text-";
 
 /**
- * Filename prefix for the FOLD sidecar.
- *
- * A 4000-50000 byte paste folds: the composer is emptied and the text rides a
- * sidecar attachment. Its card is deliberately hidden in the composer (the user
- * wants only the chip), which is why it needs a name distinct from
- * `PASTE_NAME_PREFIX` — otherwise the hide rule could not be scoped to it without
- * also hiding a spilled paste's card.
- */
-export const FOLD_NAME_PREFIX = "folded-text-";
-
-/** @returns true when the name is a fold sidecar (composer-only, never presented). */
-export function isFoldAttachmentName(name) {
-  return typeof name === "string" && name.startsWith(FOLD_NAME_PREFIX);
-}
-
-/**
  * @returns true when the name is a SPILLED paste — the one kind that earns a card.
  *
- * A `folded-text-` sidecar deliberately does NOT qualify. It must not produce a
- * `deliverables/presented` event, because a fold's whole visible identity is the
- * composer chip: a timeline card as well would present the same paste twice. The
- * sidecar's only job is to carry the text through submit.
+ * There is no fold-sidecar prefix any more: 4000-50000 byte pastes fold by
+ * CLAMPING the composer's appearance and leave their text in the editor, so they
+ * attach no file at all and can never appear in a turn as one.
  */
 export function isSpillAttachmentName(name) {
   return typeof name === "string" && name.startsWith(PASTE_NAME_PREFIX);

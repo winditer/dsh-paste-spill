@@ -23,22 +23,11 @@ window.__ModuleLoader__.load({
     const SPILL_BYTES = 50000;
     /** Filename prefix for a spilled paste. */
     const PASTE_NAME_PREFIX = "pasted-text-";
-    /**
-     * Filename prefix for the FOLD sidecar — deliberately different from
-     * `PASTE_NAME_PREFIX`.
-     *
-     * Both layers attach a file, but only the fold's card is hidden (the user wants
-     * the chip alone for 4000-50000). With one shared prefix the hide rule could
-     * not tell them apart, so it would also hide the >=50000 attachment — the very
-     * card that layer exists to show. Distinct names make
-     * `[title^="folded-text-"]` mean exactly one thing.
-     */
-    const FOLD_NAME_PREFIX = "folded-text-";
     const NS = "dsh-paste-spill";
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "codex-chip-6";
+    const BUILD_REV = "display-only-1";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -107,9 +96,6 @@ window.__ModuleLoader__.load({
      * Light content sniffing so a pasted code block keeps an honest extension.
      * Guessing wrong only costs syntax highlighting, never correctness.
      */
-    function foldFileName(text, index) {
-      return FOLD_NAME_PREFIX + pasteFileName(text, index).slice(PASTE_NAME_PREFIX.length);
-    }
 
     function pasteFileName(text, index) {
       const body = String(text);
@@ -172,6 +158,64 @@ window.__ModuleLoader__.load({
 
     /** Max characters of pasted content shown on the chip's preview line. */
     const PREVIEW_CHARS = 40;
+
+    /**
+     * Session-keyed container for the text a collapse took out of the editor.
+     *
+     * Under display-only folding the text stays in the composer, so nothing is
+     * normally held. The container is kept because the chip's expand path and the
+     * watcher's "the text is intentionally out of the draft" guard both read it, and
+     * a future design that empties the composer again needs exactly this separate
+     * lifetime (the record is retired precisely when text leaves the draft, so the
+     * held text cannot ride on it).
+     */
+    function createHoldStore() {
+      const held = new Map();
+      return {
+        get(sessionId) {
+          if (sessionId === undefined || sessionId === null) return undefined;
+          const entry = held.get(sessionId);
+          return entry === undefined ? undefined : entry.text;
+        },
+        has(sessionId) {
+          return sessionId !== undefined && sessionId !== null && held.has(sessionId);
+        },
+        set(sessionId, text) {
+          if (sessionId === undefined || sessionId === null) return;
+          held.set(sessionId, { text });
+        },
+        clear(sessionId) {
+          held.delete(sessionId);
+        },
+        /** Iterable of `[sessionId, text]`, for teardown and diagnostics. */
+        entries() {
+          return [...held.entries()].map(([id, entry]) => [id, entry.text]);
+        },
+      };
+    }
+
+    /**
+     * Dismiss a fold: "关闭即删除" -- the chip's x discards the paste for real.
+     *
+     * Deleting means deleting the TEXT. Under display-only folding the collapsed
+     * text still sits in the composer, so removing just the chip would leave exactly
+     * what the user asked to discard. The text is cut out of the draft and the fold
+     * state is retired last, so a failed write leaves the chip on screen (retryable)
+     * rather than vanishing while the text survives.
+     *
+     * @returns "dismissed" when something was discarded, "none" otherwise.
+     */
+    function dismissFold({ sessionId, holdStore, readDraft, removeText, writeDraft, clearFold }) {
+      const record = holdStore.has(sessionId);
+      const current = typeof readDraft === "function" ? readDraft() : "";
+      const next = typeof removeText === "function" ? removeText(current) : current;
+      const changed = next !== current;
+      if (!record && !changed) return "none";
+      if (changed && writeDraft(next) === false) return "none";
+      holdStore.clear(sessionId);
+      if (typeof clearFold === "function") clearFold();
+      return "dismissed";
+    }
 
     /**
      * One-line preview of the folded text, for the chip's title.
@@ -271,132 +315,6 @@ window.__ModuleLoader__.load({
       if (chip) card.setAttribute(CHIP_ATTR, "");
       else card.removeAttribute(CHIP_ATTR);
       return true;
-    }
-
-    /**
-     * The text a collapsed fold has taken OUT of the editor, keyed by session.
-     *
-     * Why a store rather than a field on the fold record: the fold record is the
-     * CHIP's data source and its lifetime is bounded by the draft sentinels, but a
-     * held text is by definition ABSENT from the draft — so the very mechanism that
-     * retires the record would immediately conclude the paste is gone and clear it.
-     * The held text therefore needs its own container with its own lifetime, and
-     * "the hold exists" is what keeps the chip alive while collapsed.
-     */
-    function createHoldStore() {
-      const held = new Map();
-      return {
-        get(sessionId) {
-          if (sessionId === undefined || sessionId === null) return undefined;
-          const entry = held.get(sessionId);
-          return entry === undefined ? undefined : entry.text;
-        },
-        has(sessionId) {
-          return sessionId !== undefined && sessionId !== null && held.has(sessionId);
-        },
-        set(sessionId, text) {
-          if (sessionId === undefined || sessionId === null) return;
-          held.set(sessionId, { text });
-        },
-        clear(sessionId) {
-          held.delete(sessionId);
-        },
-        /** Iterable of `[sessionId, text]`, for teardown and diagnostics. */
-        entries() {
-          return [...held.entries()].map(([id, entry]) => [id, entry.text]);
-        },
-      };
-    }
-
-    /**
-     * Collapse one fold: take the pasted text out of the draft and hold it.
-     *
-     * The user's requirement is "折叠后输入框中清空，展开后才显示原始内容", so this
-     * is a REAL edit to the draft, not the clamp the previous build applied. Only
-     * the pasted run is excised (`removePastedText`), never the whole draft: a
-     * paste can be an append after the user's own words, and clearing would
-     * discard them.
-     *
-     * Refuses when it has nothing to hold or the text is not in the draft: holding
-     * an empty string, or clearing a draft that never contained the paste, would
-     * destroy content for no benefit.
-     *
-     * @returns "held" when the editor was cleared, "none" otherwise.
-     */
-    function collapseFold({ record, sessionId, draft, holdStore, setDraft }) {
-      const text = record === undefined || record === null ? undefined : record.text;
-      if (typeof text !== "string" || text === "") return "none";
-      if (typeof draft !== "string" || draft === "") return "none";
-      if (holdStore.has(sessionId)) return "none";
-      // `previous` is "" so the excision locates the FIRST occurrence: while
-      // collapsing there is no meaningful divergence point to prefer.
-      const remaining = removePastedText(draft, text, "");
-      // A refusal from removePastedText (the whole-draft guard) returns the draft
-      // unchanged. Treating that as a successful collapse would hold the text AND
-      // leave it in the editor, i.e. duplicate it on restore.
-      if (remaining === draft) return "none";
-      holdStore.set(sessionId, text);
-      setDraft(remaining);
-      return "held";
-    }
-
-    /**
-     * Expand one fold: put the held text back into the editor.
-     *
-     * Appends after whatever is currently in the draft rather than overwriting it.
-     * A user can type while collapsed (the composer is a normal, empty editor), and
-     * clobbering that typing to restore the paste would trade one silent data loss
-     * for another. Appending keeps both, and matches where the caret already is.
-     *
-     * The hold is released only AFTER the write, so a throwing `setDraft` leaves it
-     * available for a retry instead of losing the text.
-     *
-     * @returns "restored" when the editor was repopulated, "none" otherwise.
-     */
-    function expandFold({ sessionId, draft, holdStore, setDraft }) {
-      if (!holdStore.has(sessionId)) return "none";
-      const text = holdStore.get(sessionId);
-      if (typeof text !== "string" || text === "") {
-        holdStore.clear(sessionId);
-        return "none";
-      }
-      const base = typeof draft === "string" ? draft : "";
-      const next = base === "" ? text : base.endsWith("\n") ? `${base}${text}` : `${base}\n${text}`;
-      setDraft(next);
-      holdStore.clear(sessionId);
-      return "restored";
-    }
-
-    /**
-     * Dismiss a fold: "关闭即删除" — the chip's × discards the paste for real.
-     *
-     * Deleting means deleting, not just hiding: the held text is released, the
-     * sidecar attachment that carries the paste into the submission is detached,
-     * and the fold state is cleared so no chip remains. Leaving the sidecar behind
-     * would be the worst outcome of the three -- the composer would look empty and
-     * chip-free while the next send still carried a file the user had discarded.
-     *
-     * The clear order is deliberate: state is cleared LAST, so a throwing detach
-     * leaves the chip on screen (the user can retry) rather than vanishing while
-     * the attachment survives.
-     *
-     * @returns "dismissed" when something was discarded, "none" otherwise.
-     */
-    function dismissFold({ sessionId, holdStore, attachmentIds, removeAttachment, clearFold }) {
-      const hadHold = holdStore.has(sessionId);
-      const ids = Array.isArray(attachmentIds) ? attachmentIds : [];
-      if (!hadHold && ids.length === 0) return "none";
-      const detached = [];
-      for (const id of ids) {
-        try {
-          if (removeAttachment(id) !== false) detached.push(id);
-        } catch {
-          /* best-effort: the hold still goes, and a stale chip is the visible failure */
-        }
-      }
-      holdStore.clear(sessionId);
-      if (typeof clearFold === "function") clearFold();
-      return "dismissed";
     }
 
     /**
@@ -609,7 +527,7 @@ window.__ModuleLoader__.load({
      *
      * @returns "inline" | "fold" | "file".
      */
-    function reactToDraft({ previous, current, run, recorded, sessionId, conversation, shell, foldStore, expandStore, holdStore, index = 1, onUploadSettled, onSidecar, onBeforeSidecar }) {
+    function reactToDraft({ previous, current, run, recorded, removable, sessionId, conversation, shell, foldStore, expandStore, holdStore, index = 1, onUploadSettled }) {
       // The watcher is the single authority for the fold record's lifetime: it is
       // the only place that sees every draft revision, so it can clear the record
       // the moment the padded text is gone. The card deliberately does NOT rely on
@@ -648,64 +566,49 @@ window.__ModuleLoader__.load({
           // insertion on the way in. Keeping them as a list rather than one
           // "best guess" is what makes the card's lifetime robust to either case.
           const sentinels = candidate === current ? [current] : [candidate, current];
+          // The excision target: prefer the text the user actually pasted (captured
+          // on beforeinput/paste), then the located diff, and only fall back to the
+          // measurement. A whole-draft value is refused when the draft had
+          // pre-existing text, because excising it would delete that text too.
+          const excision =
+            recorded !== null && recorded !== undefined && typeof recorded.text === "string" && recorded.text !== ""
+              ? recorded.text
+              : typeof removable === "string" && removable !== "" && removable !== current
+                ? removable
+                : current === candidate && previous !== ""
+                  ? (insertedRun(previous, current) ?? candidate)
+                  : candidate;
           foldStore.set(sessionId, {
             bytes: verdict.bytes,
             lines: countLines(candidate),
             sentinels,
-            // The exact text the collapse will hold. It is the MEASURED run, not
-            // the whole draft, because the hold is excised from the draft on
-            // collapse and must therefore be a genuine substring of it — the
-            // whole-draft backstop in `measurableText` is a size estimate and would
-            // take the user's own surrounding text with it.
-            text: candidate,
+            // The exact text the chip's x will EXCISE from the composer. It must be
+            // a genuine substring of the draft, so this is the removable target
+            // rather than the measured size: `measurableText` may legitimately
+            // answer with the WHOLE draft (its backstop for a jump it cannot shrink
+            // down), and excising that would delete the user's surrounding text too.
+            // Trusting the measurement here is what made x wipe the entire composer
+            // instead of just the pasted run.
+            text: excision,
           });
-          diag({
-            foldStoredSessionId: sessionId,
-            foldStoredBytes: verdict.bytes,
-            foldStoredFromPaste: recorded !== null && recorded !== undefined,
-          });
-          // Collapse IMMEDIATELY: the user's requirement is that the composer is
-          // already empty once the fold chip appears ("折叠后，输入框中清空"), not
-          // after a second gesture. The hold is what makes the empty editor safe.
+          // DISPLAY-ONLY fold: the text stays in the composer; the chip just
+          // collapses how it LOOKS.
           //
-          // But an empty composer SUBMITS as empty: stock's submit reads the live
-          // editor (`compose()` -> `draft: this.projection.clipboardText`), and the
-          // plugin has no hook on that path. So the collapse also attaches a
-          // sidecar file carrying the same text, which keeps the submission
-          // complete through the one mechanism that is already known to work
-          // (a real `file` block). Order matters: the attachment is admitted
-          // FIRST, and the draft is only cleared once it is, so a refused
-          // attachment degrades to "text stays inline next to the chip" rather
-          // than to an empty composer holding text nothing would send.
-          if (holdStore !== undefined && holdStore !== null && shell !== undefined && shell !== null && typeof shell.setDraft === "function") {
-            // Drop any sidecar from an earlier cycle BEFORE attaching a new one, or
-            // repeated fold cycles accumulate a card each (see clearSidecar).
-            if (typeof onBeforeSidecar === "function") onBeforeSidecar();
-            const attached = attachSidecar({ conversation, sessionId, shell, text: candidate, index });
-            diag({ foldSidecarAttached: attached !== null && attached !== undefined });
-            // Report the admitted ids so the caller can detach them on dismiss.
-            if (attached !== null && attached !== undefined && typeof onSidecar === "function") {
-              onSidecar(attached);
-            }
-            if (attached !== null && attached !== undefined) {
-              try {
-                const outcome = collapseFold({
-                  record: { text: candidate },
-                  sessionId,
-                  draft: current,
-                  holdStore,
-                  setDraft: (text) => shell.setDraft(text),
-                });
-                diag({ foldCollapsed: outcome === "held" });
-              } catch (error) {
-                // A failed collapse leaves the text inline with the chip above it,
-                // which is the previous behaviour and loses nothing. The sidecar is
-                // already attached, so the text would be sent twice -- visible and
-                // harmless, unlike losing it.
-                diag({ foldCollapseThrew: String(error && error.message) });
-              }
-            }
-          }
+          // An earlier design emptied the editor and attached a sidecar file so an
+          // empty composer could still submit. That was wrong for this layer: the
+          // user wants "4000-50000 is only a change of appearance", so any
+          // attachment is a defect -- stock renders an attachment as a JSON file
+          // chip in the turn, which is not the original text. Worse, the sidecar
+          // outlived the fold and kept the send button lit over an emptied composer
+          // (`draft.trim()==="" && attachments.length===0` is stock's sendability
+          // rule), so pressing send routed to the attachment-only path and posted
+          // that JSON.
+          //
+          // Keeping the text in the editor means a send carries the ORIGINAL text as
+          // an ordinary message body, with no attachment anywhere. The collapse is
+          // then purely the CSS clamp above, which is why nothing can leak into the
+          // submission.
+          diag({ foldStoredBytes: verdict.bytes, foldStoredFromPaste: recorded !== null && recorded !== undefined });
         }
         return "fold";
       }
@@ -745,7 +648,7 @@ window.__ModuleLoader__.load({
      *
      * @returns an unsubscribe function.
      */
-    function watchDraft({ shell, foldStore, expandStore, holdStore, sessionId, conversation, nextIndex, onRestore, onSidecar, onBeforeSidecar, onSendCommitted, sidecarIds, inbox }) {
+    function watchDraft({ shell, foldStore, expandStore, holdStore, sessionId, conversation, nextIndex, onRestore, onSendCommitted, inbox }) {
       if (shell === undefined || shell === null || shell.state === undefined) return () => {};
       const store = shell.state;
       const initial = store.getSnapshot();
@@ -762,32 +665,18 @@ window.__ModuleLoader__.load({
         const sameRev = snapshot.draftRev !== undefined && snapshot.draftRev === lastRev;
         // A COMPLETED SEND clears everything this plugin owns for the session.
         //
-        // This MUST run before the revision guard below. Stock's send path removes
-        // the accepted attachment ids through a store publish that does NOT bump the
-        // draft revision (`removeAttachment`/`commitSend` never touch `this.rev`), so
-        // a guard on `draftRev` alone would skip exactly the notification that proves
-        // the send happened. That is why this check never fired in the real app while
-        // the tests passed: the fake store bumped the revision on commit and stock
-        // does not.
+        // Display-only folding makes this simple and robust. The text lives in the
+        // composer, so a send empties the draft via stock's ordinary commit -- one
+        // notification, one signal, and it arrives on a revision change. The older
+        // design needed a fragile "our attachment ids are gone" test because the
+        // text was NOT in the draft and an emptied composer looked exactly like a
+        // collapse; with no attachment in play there is nothing left to guess at.
         //
-        // Nothing else observes a send, and without it the hold and record survive
-        // the message forever: the watcher's own staleness test is skipped while a
-        // hold is active (that guard is what stops a collapse from destroying its
-        // own text), so an emptied-after-send draft looks identical to a collapse.
+        // This still must run before the revision guard: stock's send publishes once
+        // and the guard exists to suppress repeat work, not to filter the signal.
         if (typeof onSendCommitted === "function") {
-          const ids = Array.isArray(snapshot.attachmentIds) ? snapshot.attachmentIds : [];
           const folded = foldStore.getSnapshot()[sessionId] !== undefined;
-          const held = holdStore !== undefined && holdStore !== null && holdStore.has(sessionId) === true;
-          const ours = sidecarIds === undefined ? undefined : sidecarIds.get(sessionId);
-          // "Gone" means the ids we attached are no longer on the composer. An
-          // absent record must NOT count as gone: that is the state while a collapse
-          // establishes its hold, and treating it as a send would clear the fold the
-          // instant it was created. A non-empty `ours` also excludes the >=50000
-          // spill layer, which never attaches a sidecar and so can never look like a
-          // send -- important because a spill also ends with an emptied draft and a
-          // removed attachment, and stealing its revision would stall its upload.
-          const sidecarGone = ours !== undefined && ours.length > 0 && ours.every((id) => !ids.includes(id));
-          if (current === "" && sidecarGone && (folded || held)) {
+          if (current === "" && folded) {
             onSendCommitted(sessionId);
             diag({ sendCommitted: true });
             previous = "";
@@ -813,6 +702,7 @@ window.__ModuleLoader__.load({
           current,
           run,
           recorded,
+          removable,
           sessionId,
           conversation,
           shell,
@@ -820,8 +710,6 @@ window.__ModuleLoader__.load({
           expandStore,
           holdStore,
           index: nextIndex(),
-          onSidecar,
-          onBeforeSidecar,
           onUploadSettled: (ok) => {
             if (ok !== true) return;
             try {
@@ -852,81 +740,6 @@ window.__ModuleLoader__.load({
     /** Synthesize the File a spill paste becomes. */
     function spillFile(text, index) {
       return new File([text], pasteFileName(text, index), { type: "text/plain" });
-    }
-
-    /** The fold sidecar's file: same bytes, distinguishing NAME. */
-    function sidecarFile(text, index) {
-      return new File([text], foldFileName(text, index), { type: "text/plain" });
-    }
-
-    /**
-     * Attach a sidecar file carrying a collapsed fold's text, so the submission
-     * stays complete while the composer itself is empty.
-     *
-     * Why this exists: once the collapse empties the editor, stock's submit sends
-     * an empty message — it serializes the live draft and offers no hook. Reusing
-     * the attachment path is what makes "empty composer" safe, and it is the SAME
-     * proven route the >=50000 spill already uses, so it needs no new remote
-     * surface and no stock change.
-     *
-     * The file is admitted but NOT awaited here: the draft is cleared as soon as
-     * `addAttachments` accepts, because the chip must appear immediately. A slow or
-     * failed upload then surfaces as stock's own retryable attachment chip, which
-     * is exactly the behaviour the spill layer already has.
-     *
-     * @returns true when the composer admitted the attachment.
-     */
-    function attachSidecar({ conversation, sessionId, shell, text, index }) {
-      if (conversation === undefined || conversation === null || shell === null || shell === undefined) return false;
-      if (typeof conversation.createDrafts !== "function" || typeof shell.addAttachments !== "function") return null;
-      let drafts;
-      try {
-        drafts = conversation.createDrafts(sessionId, [sidecarFile(text, index)]);
-      } catch (error) {
-        diag({ sidecarCreateDraftsThrew: String(error && error.message) });
-        return null;
-      }
-      if (!Array.isArray(drafts) || drafts.length === 0) return null;
-      const ids = drafts.map((draft) => draft.id);
-      // A locked submit plane refuses the attachment; treating that as success
-      // would empty the composer with nothing carrying the text.
-      if (shell.addAttachments(ids) === false) {
-        try {
-          if (typeof conversation.releaseDraftAttachments === "function") conversation.releaseDraftAttachments(drafts);
-        } catch {
-          /* releasing is best-effort; the refusal already means nothing was added */
-        }
-        return null;
-      }
-      // The admitted ids are returned so the chip's × can detach exactly this file.
-      return ids;
-    }
-
-    /**
-     * Detach this session's previously-attached sidecar, if any, and forget it.
-     *
-     * Called before every fresh attach. Without it a re-collapse ORPHANED the file
-     * from the previous cycle: `sidecarIds.set` overwrites the entry, so the old id
-     * was no longer reachable by the dismiss path and its card stayed in the
-     * composer. Repeating fold cycles then accumulated folded-text-1/3/5/7/9.json.
-     *
-     * Detaching (rather than just forgetting) is what releases the draft
-     * attachment; a failed removal is ignored because the fresh attach is still the
-     * right next step, and the worst case is one extra hidden card.
-     */
-    function clearSidecar({ sessionId, shell, sidecarIds }) {
-      if (sidecarIds === undefined || sidecarIds === null) return;
-      const previous = sidecarIds.get(sessionId);
-      sidecarIds.delete(sessionId);
-      if (!Array.isArray(previous) || previous.length === 0) return;
-      if (shell === null || shell === undefined || typeof shell.removeAttachment !== "function") return;
-      for (const id of previous) {
-        try {
-          shell.removeAttachment(id);
-        } catch {
-          /* best-effort: the fresh attach is still the right next step */
-        }
-      }
     }
 
     /**
@@ -1232,6 +1045,14 @@ window.__ModuleLoader__.load({
      * @param ctx - client plugin context.
      */
     exports.apply = function apply(ctx) {
+      // Boot marker FIRST, before anything that could throw.
+      //
+      // It used to sit at the end of apply(). When the diagnostics key went missing
+      // while the chip still rendered, that placement made the two possible causes
+      // indistinguishable: "apply never ran" and "apply threw halfway through, after
+      // the slot was registered" both produced no key. Writing it first separates
+      // them, and applyFailures below records the other case explicitly.
+      diag({ build: BUILD_REV, applyRanAt: Date.now() });
       const foldStore = createSessionStore();
       // Separate store from the fold record on purpose: "is text folded here" and
       // "has the user opened it up" have different lifetimes. Collapsing must not
@@ -1248,72 +1069,37 @@ window.__ModuleLoader__.load({
        * can detach exactly the file this collapse attached: "关闭即删除" has to
        * delete the paste from the SUBMISSION too, not just from the composer.
        */
-      const sidecarIds = new Map();
-      /** Restore-aware toggle: the ONE place a fold collapses or expands. */
+      /**
+       * Collapse/expand the fold. PURELY VISUAL -- no draft write, no attachment.
+       *
+       * The text never leaves the composer, so "collapse" and "expand" only move the
+       * `data-dshps-folded` attribute that clamps the editor's height in CSS. That is
+       * what makes the fold safe: whatever the user does next, the composer holds the
+       * real text, so a send posts the original message with no file chip.
+       *
+       * The previous design emptied the editor here and attached a `sidecar` file so
+       * an empty composer could still submit. Both halves were defects for this layer:
+       * the text visibly vanished when the user had asked only for a change of
+       * appearance, and the attachment rendered as a JSON file chip in the turn. The
+       * orphaned sidecar also kept the send button enabled over an emptied composer,
+       * so pressing send posted that JSON.
+       */
       const toggleFold = (sessionId, next) => {
         if (sessionId === undefined || sessionId === null) return;
-        const shell = shellOf(ctx, sessionId);
-        const writeDraft = shell !== null && typeof shell.setDraft === "function" ? (text) => shell.setDraft(text) : null;
-        if (next !== true) {
-          // Collapse: hold the text and empty the editor.
-          if (writeDraft === null) return;
-          const record = foldStore.getSnapshot()[sessionId];
-          if (record === undefined) return;
-          const draft = shell.state?.getSnapshot()?.draft;
-          // A collapse always re-attaches, even if an earlier one did: an expand
-          // leaves the sidecar attached, so re-collapsing without a fresh attach
-          // would leave a stale file plus a cleared composer. Detach the previous
-          // one FIRST, or the old card lingers alongside the new file.
-          clearSidecar({ sessionId, shell, sidecarIds });
-          const attached = attachSidecar({
-            conversation: ctx.conversation,
-            sessionId,
-            shell,
-            text: record.text,
-            index: nextIndex(),
-          });
-          if (attached === null || attached === undefined) {
-            diag({ manualCollapseRefused: true });
-            return;
-          }
-          sidecarIds.set(sessionId, attached);
-          const outcome = collapseFold({
-            record,
-            sessionId,
-            draft: typeof draft === "string" ? draft : "",
-            holdStore,
-            setDraft: writeDraft,
-          });
-          diag({ manualCollapse: outcome });
+        if (next === true) {
+          // Expand: the chip goes away and the full text is simply visible again.
+          expandStore.clear(sessionId);
+          foldStore.clear(sessionId);
+          diag({ manualExpand: "expanded" });
           return;
         }
-        // Expand: write the held text back, then CONSUME the fold. The chip must
-        // unmount, not linger in an "expanded" state: once the text is back in the
-        // composer there is nothing left folded for a chip to represent, and the
-        // user asked for exactly that ("展开后，chip 消失并显示文本的完整内容").
-        //
-        // The held text is captured BEFORE the restore, because `expandFold`
-        // releases the hold — reading it afterwards would always find nothing.
-        const heldNow = holdStore.get(sessionId);
-        if (writeDraft !== null && typeof heldNow === "string" && heldNow !== "") {
-          const draft = shell.state?.getSnapshot()?.draft;
-          const outcome = expandFold({
-            sessionId,
-            draft: typeof draft === "string" ? draft : "",
-            holdStore,
-            setDraft: writeDraft,
-          });
-          diag({ manualExpand: outcome });
-        }
-        // Retire the record and the flag rather than rebuilding them. Rebuilding is
-        // what kept the chip on screen after an expand; and the flag in particular
-        // must NOT be left set, because the watcher reads it — a sticky "already
-        // expanded" marker would make every later paste arrive chip-less.
-        //
-        // Clearing the record is safe here (unlike during a hold): the text is in
-        // the draft again, so the watcher's own staleness test agrees with us.
-        foldStore.clear(sessionId);
+        // Collapse: re-arm the fold so the chip returns. The text is untouched.
+        const record = foldStore.getSnapshot()[sessionId];
+        const text = record === undefined || record === null ? undefined : record.text;
+        if (typeof text !== "string" || text === "") return;
+        foldStore.set(sessionId, record);
         expandStore.clear(sessionId);
+        diag({ manualCollapse: "collapsed" });
       };
       const setFoldExpanded = (sessionId, next) => {
         if (sessionId === undefined || sessionId === null) return;
@@ -1321,31 +1107,39 @@ window.__ModuleLoader__.load({
         else expandStore.clear(sessionId);
       };
       /**
-       * The chip's × handler: "关闭即删除".
+       * The chip's × handler: "关闭即删除" -- the × discards the paste for real.
        *
-       * Detaches the sidecar this collapse attached, in addition to releasing the
-       * hold. Without the detach the paste would be "deleted" while a file carrying
-       * it still rode the next send, and the composer would show nothing to explain
-       * it — the exact failure the sidecar exists to prevent, inverted. The ids are
-       * tracked per session because `attachSidecar` admits them on collapse.
+       * Deletes the TEXT from the composer, not merely the chip. Display-only folding
+       * means the text is still in the editor while collapsed, so a × that only
+       * unmounted the chip would leave the paste sitting in the input box that the
+       * user just discarded.
        */
       const dismissSessionFold = (sessionId) => {
         if (sessionId === undefined || sessionId === null) return;
+        const record = foldStore.getSnapshot()[sessionId];
+        const text = record === undefined || record === null ? undefined : record.text;
         const shell = shellOf(ctx, sessionId);
         const outcome = dismissFold({
           sessionId,
           holdStore,
-          attachmentIds: sidecarIds.get(sessionId) ?? [],
-          removeAttachment: (id) => {
-            if (shell === null || typeof shell.removeAttachment !== "function") return false;
-            return shell.removeAttachment(id);
+          removeText: (current) => {
+            if (typeof text !== "string" || text === "") return current;
+            return removePastedText(current, text, "");
+          },
+          writeDraft: (next) => {
+            if (shell === null || typeof shell.setDraft !== "function") return false;
+            shell.setDraft(next);
+            return true;
+          },
+          readDraft: () => {
+            const draft = shell === null ? undefined : shell.state?.getSnapshot()?.draft;
+            return typeof draft === "string" ? draft : "";
           },
           clearFold: () => {
             foldStore.clear(sessionId);
             expandStore.clear(sessionId);
           },
         });
-        sidecarIds.delete(sessionId);
         diag({ foldDismissed: outcome });
       };
       let counter = 0;
@@ -1353,10 +1147,6 @@ window.__ModuleLoader__.load({
         counter += 1;
         return counter;
       };
-      // Boot marker: proves the running renderer holds THIS build, which is what
-      // made "the plugin was never loaded" distinguishable from "it loaded and
-      // silently did nothing". Cheap, once per page load.
-      diag({ build: BUILD_REV, applyRanAt: Date.now() });
 
       if (ctx.locale !== undefined) {
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-paste-spill: dictionaries");
@@ -1469,9 +1259,6 @@ window.__ModuleLoader__.load({
             onRestore: () => diag({ spilledTextRemoved: true }),
             // Remember the sidecar ids so the chip's × can detach them: dismissing
             // must delete the paste from the submission, not only the composer.
-            onSidecar: (ids) => sidecarIds.set(sessionId, ids),
-            onBeforeSidecar: () => clearSidecar({ sessionId, shell: ctx.conversation?.input?.shell?.(sessionId), sidecarIds }),
-            sidecarIds,
             // A completed send retires everything this plugin owns for the session.
             // Stock has already cleared the draft and taken the attachments, so
             // there is nothing to restore and nothing to detach: the sidecar went
@@ -1485,7 +1272,6 @@ window.__ModuleLoader__.load({
               // submitted, so detaching it now would be deleting a file the user
               // just sent. (removeAttachment on a committed id is also a no-op, but
               // relying on that would be luck, not design.)
-              sidecarIds.delete(sessionId);
             },
           }),
         );
@@ -1616,7 +1402,6 @@ window.__ModuleLoader__.load({
           // (`pasted-text-`), so a user's genuine attachments are untouched --
           // `display:none` rather than `visibility` so the card takes no space and
           // leaves no gap where it used to sit.
-          "[data-composer-card] [title^=\"" + FOLD_NAME_PREFIX + "\"]{display:none}" +
           // Collapsed editor: clamp the stock scroll container to ~3 lines and fade
           // the cut edge into the card so it reads as "there is more below" rather
           // than as a rendering bug. The 84px includes the container's own top
@@ -1694,13 +1479,10 @@ window.__ModuleLoader__.load({
       decidePaste,
       countLines,
       pasteFileName,
-      foldFileName,
       foldTextPresent,
       foldApplies,
       holdApplies,
       createHoldStore,
-      collapseFold,
-      expandFold,
       dismissFold,
       foldPreview,
       readSessionSlice,

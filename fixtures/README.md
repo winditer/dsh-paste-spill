@@ -5,7 +5,7 @@
 | 文件 | 字节数 | 预期 |
 | --- | --- | --- |
 | `paste-3k.json` | 3031 | 无任何变化，正常内联 |
-| `paste-6k.json` | 6008 | 出现**一个**折叠芯片（内容预览 + "在文本框中显示 ›" + `×`），编辑器被清空；sidecar（`folded-text-1.json`）随消息发出，但输入框和**时间线都不显示卡片**。点芯片 → 写回全文、**芯片消失**；点 `×` → 直接删除（持有 + 附件） |
+| `paste-6k.json` | 6008 | 出现**一个**折叠芯片（内容预览 + "在文本框中显示 ›" + `×`），**文本仍在输入框里**（外观被折起）。点芯片 → 解除折叠、**芯片消失**、全文正常显示；点 `×` → 把这段文本**从输入框剪掉**。发送（折叠态或展开态）turn 里都是**原始文本，没有任何文件 chip** |
 | `paste-60k.json` | 60154 | **不出现**折叠芯片；文本落盘为真附件（`pasted-text-1.json`），**输入框 chip 与时间线卡片都正常显示**，草稿里的大文本被移走，提交后点卡片可在右侧栏预览 |
 
 阈值是 **UTF-8 字节**：4000 / 50000。
@@ -32,7 +32,7 @@ RENDERER_STORAGE_DIR="$HOME/Library/Application Support/DSH Desktop/Partitions/d
 - `lastPasteSource` / `lastPasteBytes` — 剪贴板文本是否被观测到，以及来源（`beforeinput` / `paste`）
 - `lastDecision` / `lastRunBytes` — 阈值判定
 - `foldStoredBytes` / `foldCollapsed` — 折叠记录与是否成功清空编辑器
-- `foldSidecarAttached` — 承载文本的 sidecar 附件是否挂上（**为 `false` 则编辑器不会被清空**）
+- `manualCollapse` / `manualExpand` — 点芯片折叠/展开是否生效（`collapsed` / `expanded`）；折叠**不动草稿**
 - `manualExpand` — 点芯片展开时文本是否写回（`restored`）
 - `foldDismissed` — 点 `×` 是否删除了这段粘贴（持有 + 附件）
 - `sendCommitted` — **发送后是否清理了折叠**（持有 + 记录 + 标记全释放）。看到粘贴/保留却始终没有这个键，就说明发送没有被观察到

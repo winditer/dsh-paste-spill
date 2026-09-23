@@ -2,33 +2,22 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   PASTE_NAME_PREFIX,
-  FOLD_NAME_PREFIX,
-  isFoldAttachmentName,
   isSpillAttachmentName,
   pasteAttachmentsOf,
   pasteCallId,
   presentedPayload,
 } from "../lib/helpers.js";
 
-test("the two filename prefixes are the documented literals", () => {
+test("the spill prefix is the documented literal", () => {
   assert.equal(PASTE_NAME_PREFIX, "pasted-text-");
-  assert.equal(FOLD_NAME_PREFIX, "folded-text-");
-  // They must differ, or the composer could not hide one card without the other.
-  assert.notEqual(PASTE_NAME_PREFIX, FOLD_NAME_PREFIX);
 });
 
-test("the two prefixes are classified separately, and neither accepts a stranger", () => {
-  // Only a spilled paste earns a timeline card; a fold sidecar is composer-only.
+test("only a spilled paste is accepted, and never a stranger", () => {
   assert.equal(isSpillAttachmentName("pasted-text-1.txt"), true);
   assert.equal(isSpillAttachmentName("pasted-text-12.md"), true);
-  assert.equal(isSpillAttachmentName("folded-text-1.txt"), false, "a fold sidecar is not a spill");
-
-  assert.equal(isFoldAttachmentName("folded-text-1.json"), true);
-  assert.equal(isFoldAttachmentName("pasted-text-1.txt"), false, "and a spill is not a sidecar");
 
   for (const name of ["notes.txt", "my-pasted-text-1.txt", undefined, 42]) {
     assert.equal(isSpillAttachmentName(name), false, `${name} is not a spill`);
-    assert.equal(isFoldAttachmentName(name), false, `${name} is not a sidecar`);
   }
 });
 
