@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "fold-css-1";
+    const BUILD_REV = "fold-css-2";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -1651,12 +1651,17 @@ window.__ModuleLoader__.load({
           // (`pasted-text-`), so a user's genuine attachments are untouched --
           // `display:none` rather than `visibility` so the card takes no space and
           // leaves no gap where it used to sit.
-          // Collapsed editor, CLAMP-ONLY fallback: when a chip could not be inserted the
-          // text stays inline, and this clamps it to ~2 lines with a faded cut edge
-          // so the fold still reads as a fold. `:not([data-dshps-chip])` keeps this
-          // off a chip fold, where the editor is empty and clamping would only
-          // squeeze the chip's own band.
-          "[data-composer-card][" + FOLD_ATTR + "]:not([" + CHIP_ATTR + "]) " + SCROLL_SELECTOR + "{" +
+          // Collapsed editor: the pasted text STAYS in the editor (that is how it reaches
+          // the turn verbatim), and this is what hides it -- clamped to ~2 lines with a
+          // faded cut edge, so the composer reads as a chip rather than 40k of text.
+          //
+          // This must apply while the chip is present. An earlier version gated it
+          // `:not([data-dshps-chip])`, which was right when a chip meant the editor had
+          // been EMPTIED: clamping an empty editor would only squeeze the chip's band.
+          // But the text is now never removed, so every fold has a chip AND text, and
+          // that guard suppressed the clamp on exactly the case it was needed for --
+          // leaving the whole paste visible and copyable from the text box.
+          "[data-composer-card][" + FOLD_ATTR + "] " + SCROLL_SELECTOR + "{" +
           "max-height:" + FOLD_CLAMP_PX + "px;" +
           "mask-image:linear-gradient(to bottom,#000 calc(100% - " + FADE_PX + "px),transparent);" +
           "-webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - " + FADE_PX + "px),transparent);" +

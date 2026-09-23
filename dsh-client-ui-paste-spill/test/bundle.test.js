@@ -1455,10 +1455,14 @@ test("the collapse rule outranks the stock scroll rule it overrides", () => {
   assert.ok(rule, "the collapsed scroll rule must be installed");
   assert.match(rule[1], /max-height:\d+px/, "and must actually clamp the height");
   assert.match(rule[1], /mask-image/, "and fade the cut edge");
-  // The clamp is a FALLBACK: it exists for a fold whose chip could not be inserted,
-  // where the text stays inline. On a chip fold the editor is empty, so clamping
-  // would serve no purpose beyond squeezing the chip's own band.
-  assert.match(rule[0], /:not\(\[data-dshps-chip\]\)/, "the clamp must not apply to a chip fold");
+  // The clamp is the ONLY thing hiding the text, so it must apply whenever a fold is
+  // collapsed -- including when a chip is present. (It was once a fallback, gated off
+  // chip folds because the editor was empty then; the text is never removed now, so
+  // that guard suppressed it on the one case it exists for.)
+  assert.ok(
+    !rule[0].includes("data-dshps-chip"),
+    "the clamp must apply to chip folds too, or the pasted text stays visible",
+  );
   // Two lines, per the user's request. Pinned because it is derived (84px was
   // ~3 lines) rather than measured, so a careless edit shifting it back would
   // silently change what the fold shows.
@@ -1511,6 +1515,53 @@ test("stock's own inline rendering of our chip node is hidden, so the paste is o
   // rule would hide the user's own `@file` / image chips too.
   assert.match(rule[0], /\.QiNVUW_chip/, "must target stock's chip class");
   assert.match(rule[0], /title\^=/, "and must be scoped by the title prefix");
+});
+
+test("the collapsed clamp applies even though a chip is present", () => {
+  // Regression: "文本框里面复制后出现了内容".
+  //
+  // The clamp rule was gated `:not([data-dshps-chip])`, which was correct under the old
+  // architecture -- a chip meant the editor had been EMPTIED of text, so clamping would
+  // only squeeze the chip's own band. The text now STAYS in the editor and the chip is
+  // its presentation, so every fold has a chip AND text. Under the old guard the clamp
+  // therefore never applied, the full paste stayed visible in the text box, and copying
+  // from it produced the whole text.
+  let css = "";
+  const documentStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null, querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild: (tag) => { css = tag.textContent; } },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = documentStub;
+  try {
+    loadBundle().exports.apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_k, register) => register(), register: () => {} },
+      conversation: { input: { shell: () => undefined } },
+      sessions: { list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} } },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  // Locate the clamp by its own declaration, then read the selector that precedes it.
+  const at = css.indexOf("max-height:" + "60px");
+  assert.ok(at > 0, "the clamp must declare a max-height");
+  const open = css.lastIndexOf("{", at);
+  const selStart = css.lastIndexOf("}", open) + 1;
+  const selector = css.slice(selStart, open);
+  const clamp = [selector + "{" + css.slice(open + 1, css.indexOf("}", at) + 1)];
+  assert.ok(clamp, "a clamp rule must be installed for a folded composer");
+  assert.ok(
+    !clamp[0].includes("data-dshps-chip"),
+    "the clamp must not be skipped when a chip is present, or the pasted text stays visible",
+  );
+  assert.match(clamp[0], /max-height:\d+px/, "and it must actually constrain the height");
+  assert.match(clamp[0], /mask-image/, "with a faded edge so the cut reads as a fold");
 });
 
 test("the chip is positioned inside the card, and the card reserves a band for it", () => {
