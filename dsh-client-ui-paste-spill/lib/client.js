@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-fold-10";
+    const BUILD_REV = "chip-fold-11";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -87,6 +87,10 @@ window.__ModuleLoader__.load({
         // A compact, text-free fingerprint: placeholders and whitespace only, so the
         // user's actual content never lands in Local Storage.
         shape: draft.replace(/[^\uFFFC \n]/gu, "").slice(0, 40),
+        // The literal content of a SHORT draft, so an unexpected settled shape can be
+        // read directly rather than inferred. Bounded to a length no user paste can
+        // reach, so real content never lands in Local Storage.
+        shortLiteral: draft.length <= 24 ? draft : undefined,
       };
     }
 
@@ -170,6 +174,49 @@ window.__ModuleLoader__.load({
      */
     function foldApplies(record) {
       return record !== undefined && record !== null;
+    }
+
+    /**
+     * The span to splice the chip over, in the coordinates `insertReference` expects.
+     *
+     * `insertReference` CAS-checks `span.draftRev` and then hands the span to
+     * `selectSpan`, which validates it against the layout's DETECT length and resolves
+     * its offsets through the detect segments. The span must therefore be in DETECT
+     * coordinates -- but the only length `getSnapshot()` publishes is `draft.length`,
+     * which is the CLIPBOARD projection. Those two are counted independently by the
+     * projection walk, so on real multi-line pastes they can differ, and a span built
+     * from the clipboard length is then out of bounds and refused with the revision
+     * perfectly correct. That is the refusal seen in-app: `sentEnd == liveDraftLen ==
+     * 6019` with equal revisions, on a paste carrying 173 newlines.
+     *
+     * `caretSpan()` is the shell's own public accessor for detect coordinates: with no
+     * live selection it returns a collapsed span at `detectText.length`, i.e. the true
+     * document end in detect units. Using it removes the guess entirely. `start` stays 0
+     * because a fold only ever collapses to a draft that is the paste alone; the whole
+     * draft is what must be replaced.
+     *
+     * @param shell - the session input shell.
+     * @param snapshot - the current published snapshot (revision, and a fallback end).
+     * @returns `{start, end, draftRev}`, or null when no usable revision/end exists.
+     */
+    function foldSpanFor(shell, snapshot) {
+      if (snapshot === undefined || typeof snapshot.draftRev !== "number") return null;
+      // Prefer the detect-coordinate end. Guarded: an older shell may not expose
+      // `caretSpan`, and a malformed answer must not produce a nonsense span.
+      let end = null;
+      try {
+        if (typeof shell.caretSpan === "function") {
+          const caret = shell.caretSpan();
+          if (caret !== null && caret !== undefined && typeof caret.end === "number" && caret.end >= 0) {
+            end = caret.end;
+          }
+        }
+      } catch {
+        end = null;
+      }
+      if (end === null) end = typeof snapshot.draft === "string" ? snapshot.draft.length : null;
+      if (end === null || end <= 0) return null;
+      return { start: 0, end, draftRev: snapshot.draftRev };
     }
 
     /**
@@ -520,7 +567,6 @@ window.__ModuleLoader__.load({
       // Re-reading rebuilds it against the truth we are actually editing. Only the
       // revision changes between attempts -- start stays 0 and end tracks the live
       // draft length -- so a retry cannot excise text the user did not paste.
-      let applied = false;
       let lastSpan = null;
       let lastLive = null;
       // Retry across MICROTASK TURNS, not just twice in a row.
@@ -530,25 +576,33 @@ window.__ModuleLoader__.load({
       // revision is therefore still moving, and two back-to-back attempts inside one
       // microtask both read the same not-yet-final revision. Waiting a turn between
       // attempts lets those commits drain, so an attempt finally lands on a settled
-      // revision and the CAS holds. That is what makes a repeat paste fold instead of
-      // being refused forever.
+      // revision and the CAS holds.
+      //
+      // The span is built in the shell's OWN detect coordinates (see foldSpanFor), never
+      // from `draft.length`: the two projections are counted independently and diverge on
+      // multi-line pastes, which is what made the CAS refuse with a correct revision.
+      let applied = false;
+      let attempted = 0;
       for (let attempt = 0; attempt < 8 && !applied; attempt += 1) {
         const live = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
         if (live === undefined || typeof live.draftRev !== "number") break;
         lastLive = live;
-        lastSpan = { start: 0, end: live.draft.length, draftRev: live.draftRev };
+        lastSpan = foldSpanFor(shell, live);
+        if (lastSpan === null) break;
+        if (lastSpan === null) break;
+        attempted += 1;
         try {
           applied = shell.insertReference(reference, lastSpan) === true;
         } catch (error) {
-          // Lexical error #337 is the one expected failure here, and it is a TIMING bug
-          // rather than a capability gap, so it is worth naming: inserting while an
-          // editor update is already in flight makes `applyEdit` take its short-circuit
-          // branch (`if (this.editor._updating) { fn(); return; }`), which runs the
-          // `$`-body WITHOUT first assigning the active editor (`oi = e` only happens
-          // inside `editor.update()`). Lexical then raises #337, "no active editor".
-          // The caller avoids this by deferring the insert out of the update; this catch
-          // stays as a backstop that degrades to the clamp instead of losing text.
-          diag({ foldChipInserted: false, foldChipReason: String(error && error.message) });
+            // Lexical error #337 is the one expected failure here, and it is a TIMING bug
+            // rather than a capability gap, so it is worth naming: inserting while an
+            // editor update is already in flight makes `applyEdit` take its short-circuit
+            // branch (`if (this.editor._updating) { fn(); return; }`), which runs the
+            // `$`-body WITHOUT first assigning the active editor (`oi = e` only happens
+            // inside `editor.update()`). Lexical then raises #337, "no active editor".
+            // The caller avoids this by deferring the insert out of the update; this catch
+            // stays as a backstop that degrades to the clamp instead of losing text.
+            diag({ foldChipInserted: false, foldChipReason: String(error && error.message) });
           releaseFoldText(ref);
           return false;
         }
@@ -2063,6 +2117,7 @@ window.__ModuleLoader__.load({
       foldApplies,
       restoreTextFor,
       describeDraft,
+      foldSpanFor,
       holdApplies,
       createHoldStore,
       dismissFold,

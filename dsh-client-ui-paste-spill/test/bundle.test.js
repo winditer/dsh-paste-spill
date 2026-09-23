@@ -934,6 +934,81 @@ test("a refused chip insertion leaves the text inline rather than losing it", as
   assert.deepEqual(record.sentinels, [run]);
 });
 
+test("the insertion span uses the shell's DETECT coordinates, not the draft's length", () => {
+  // THE cause of the in-app refusal: insertReference hands the span to selectSpan, which
+  // validates it against the layout's DETECT length -- but `getSnapshot().draft` is the
+  // CLIPBOARD projection. The two are counted independently and diverge on multi-line
+  // pastes, so a span ending at draft.length is out of bounds and is refused with the
+  // revision perfectly correct. Measured in-app: sentEnd == liveDraftLen == 6019 with
+  // equal revisions, on a paste carrying 173 newlines.
+  const { foldSpanFor } = loadBundle().exports.__internals;
+
+  // caretSpan() is the shell's public detect-coordinate accessor; with no selection it
+  // reports a collapsed span at detectText.length.
+  const diverging = { caretSpan: () => ({ start: 6016, end: 6016 }) };
+  assert.deepEqual(
+    foldSpanFor(diverging, { draft: "x".repeat(6019), draftRev: 10 }),
+    { start: 0, end: 6016, draftRev: 10 },
+    "the end must be the detect length, not draft.length",
+  );
+
+  // The span always covers the WHOLE draft from 0: a fold replaces the paste entirely,
+  // never a fragment that would leave part of the user's text behind.
+  assert.equal(foldSpanFor(diverging, { draft: "x".repeat(6019), draftRev: 10 }).start, 0);
+
+  // Fallbacks, so an older or unusual shell cannot produce a nonsense span.
+  assert.deepEqual(foldSpanFor({}, { draft: "abc", draftRev: 3 }), { start: 0, end: 3, draftRev: 3 });
+  assert.deepEqual(foldSpanFor({ caretSpan: () => ({ end: -1 }) }, { draft: "abc", draftRev: 3 }), { start: 0, end: 3, draftRev: 3 });
+  assert.deepEqual(foldSpanFor({ caretSpan: () => { throw new Error("no"); } }, { draft: "abc", draftRev: 3 }), { start: 0, end: 3, draftRev: 3 });
+  // No usable revision or end: report null rather than splice a bogus span.
+  assert.equal(foldSpanFor(diverging, { draft: "abc" }), null);
+  assert.equal(foldSpanFor({ caretSpan: () => ({ end: 0 }) }, { draft: "", draftRev: 1 }), null);
+});
+
+test("a fold still inserts when the detect and clipboard projections disagree", async () => {
+  // The end-to-end wiring test for the span fix. This shell models the REAL divergence:
+  // `getSnapshot().draft` is the clipboard projection, while `selectSpan` (modelled by
+  // insertReference's bounds check) validates against the DETECT length, which is
+  // shorter. A span built from `draft.length` is therefore out of bounds and refused --
+  // with the revision perfectly correct, which is why the retry loop alone could never
+  // recover and the chip never appeared.
+  const { reactToDraft, createSessionStore, createHoldStore, foldTextByRef } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const holdStore = createHoldStore();
+  const run = "m".repeat(6000);
+
+  let draft = run;
+  const rev = 5;
+  const DETECT_END = 5997; // shorter than draft.length: the projections disagree
+  const shell = {
+    get state() { return { getSnapshot: () => ({ draft, draftRev: rev, phase: "plain" }) }; },
+    // The shell's own detect-coordinate accessor: a collapsed span at detectText.length.
+    caretSpan: () => ({ start: DETECT_END, end: DETECT_END }),
+    insertReference(ref, span) {
+      if (span.draftRev !== rev) return false;
+      // selectSpan: out of bounds past the detect length, so refuse.
+      if (span.end > DETECT_END) return false;
+      draft = "\uFFFC ";
+      return true;
+    },
+    setDraft() {},
+  };
+
+  const outcome = reactToDraft({
+    previous: "", current: run, run, sessionId: "sess-1",
+    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+    shell, foldStore, holdStore,
+  });
+  assert.equal(outcome, "fold");
+  await settleChip();
+
+  const record = foldStore.getSnapshot()["sess-1"];
+  assert.ok(record, "the chip must insert despite the projection divergence");
+  assert.equal(record.chipInserted, true);
+  // And the held text is the original, so the turn still carries it verbatim.
+  assert.equal(foldTextByRef.get(record.chipRef), run);
+});
+
 test("the chip previews the first 20 characters of the paste", () => {
   const { PREVIEW_CHARS, foldPreview } = loadBundle().exports.__internals;
   assert.equal(PREVIEW_CHARS, 20, "the preview line is 20 characters by request");
