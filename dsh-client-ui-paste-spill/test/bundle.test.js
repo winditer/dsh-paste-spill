@@ -548,6 +548,116 @@ test("the chip insert is DEFERRED, because inserting inside the editor's own upd
   assert.equal(foldStore.getSnapshot()["sess-1"].chipInserted, true);
 });
 
+test("the chip insert retries when a republish bumps the revision under it", async () => {
+  // In-app symptom: the FIRST large paste folded, later ones did not. Cause: the
+  // editor republishes (and bumps `rev`) whenever the projection's content changes,
+  // and that can land between our snapshot read and the `insertReference` call.
+  // Stock's CAS then refuses a span built from the stale revision, so the chip
+  // silently never appears. Reproduced deterministically as "REFUSED sent=0 live=1".
+  const { reactToDraft, createSessionStore, createHoldStore } = loadBundle().exports.__internals;
+  const run = "z".repeat(5000);
+
+  let draft = run;
+  let rev = 0;
+  let raced = false;
+  const shell = {
+    get state() { return { getSnapshot: () => ({ draft, draftRev: rev, phase: "plain" }) }; },
+    insertReference(ref, span) {
+      if (!raced) { raced = true; rev += 1; } // the republish lands first, exactly once
+      if (span.draftRev !== rev) return false;
+      draft = "\uFFFC";
+      rev += 1;
+      return true;
+    },
+    setDraft() {},
+  };
+
+  const foldStore = createSessionStore();
+  reactToDraft({
+    previous: "", current: run, run, sessionId: "sess-1",
+    conversation: { createDrafts() { throw new Error("fold must not upload"); } },
+    shell, foldStore, holdStore: createHoldStore(),
+  });
+  // Two microtask turns: the deferral, then the retry.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(
+    foldStore.getSnapshot()["sess-1"].chipInserted,
+    true,
+    "a revision bump must not cost us the chip",
+  );
+  assert.equal(draft, "\uFFFC");
+});
+
+test("the watcher keeps a chip record alive while the hold is raised, even as the draft changes", () => {
+  // Both halves of the hold's contract, at the layer that decides record lifetime.
+  // A chip fold's draft is a lone U+FFFC: the record's text sentinels no longer match
+  // it, so without a live hold the watcher retires the record and the chip vanishes.
+  const { reactToDraft, createSessionStore, createHoldStore, foldTextPresent } = loadBundle().exports.__internals;
+  const original = "Q".repeat(5000);
+
+  // The record as the chip fold writes it: sentinels describe the ORIGINAL text.
+  const chipRecord = { bytes: 5000, lines: 1, sentinels: [original], text: original, chipRef: "r", chipInserted: true };
+  assert.equal(
+    foldTextPresent(chipRecord, "\uFFFC"),
+    false,
+    "precondition: the placeholder draft does not match the text sentinels",
+  );
+
+  const foldStore = createSessionStore();
+  const holdStore = createHoldStore();
+  foldStore.set("sess-1", chipRecord);
+  holdStore.set("sess-1", original);
+
+  // With the hold raised, feeding the placeholder draft must NOT retire the record.
+  reactToDraft({
+    previous: original, current: "\uFFFC", run: null, recorded: null,
+    sessionId: "sess-1", conversation: { createDrafts() { throw new Error("no upload"); } },
+    foldStore, holdStore,
+  });
+  assert.ok(foldStore.getSnapshot()["sess-1"], "the hold must protect the record");
+
+  // Once the hold is gone the ordinary rule applies again and the record is retired.
+  holdStore.clear("sess-1");
+  reactToDraft({
+    previous: original, current: "\uFFFC", run: null, recorded: null,
+    sessionId: "sess-1", conversation: { createDrafts() { throw new Error("no upload"); } },
+    foldStore, holdStore,
+  });
+  assert.equal(foldStore.getSnapshot()["sess-1"], undefined, "without a hold the stale record is retired");
+});
+
+test("expanding a chip restores from the record when the by-ref hold was already released", () => {
+  // Reported: "点击在文本框中显示后，输入框中没有出现任何文本". The by-ref hold is
+  // released by several paths (a refused insert, an earlier expand), so expanding
+  // must fall back to the record's own text. Restoring nothing makes the chip vanish
+  // while the composer stays empty -- the user's text looks deleted.
+  const { restoreTextFor } = loadBundle().exports.__internals;
+  const original = "R".repeat(5000);
+
+  // A chip fold whose hold is already gone: the record is the only surviving source.
+  assert.equal(
+    restoreTextFor({ held: undefined, record: { text: original, chipInserted: true } }),
+    original,
+    "the record's text must be the fallback",
+  );
+  // The hold wins when it is still alive.
+  assert.equal(restoreTextFor({ held: "held!", record: { text: original, chipInserted: true } }), "held!");
+  // A clamp-only fold: the text never left the editor, so expanding must write NOTHING
+  // -- writing it back would rebuild the editor and drop the caret and undo history.
+  assert.equal(
+    restoreTextFor({ held: undefined, record: { text: original, chipInserted: false } }),
+    undefined,
+    "a clamp-only fold must not be re-written",
+  );
+  // Degenerate inputs must not produce a write.
+  assert.equal(restoreTextFor({ held: undefined, record: undefined }), undefined);
+  assert.equal(restoreTextFor({ held: undefined, record: null }), undefined);
+  assert.equal(restoreTextFor({ held: undefined, record: { text: "", chipInserted: true } }), undefined);
+  assert.equal(restoreTextFor({ held: "", record: { text: original, chipInserted: true } }), original, "an empty hold falls back");
+});
+
 test("the chip raises a hold, so the watcher cannot retire the record before the insert lands", async () => {
   // The in-app symptom this pins: stock's native chip node appeared, but OUR chip
   // (preview + expand action + ×) never did. Cause: the record is written before the

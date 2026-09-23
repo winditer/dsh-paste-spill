@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-fold-7";
+    const BUILD_REV = "chip-fold-8";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -147,6 +147,36 @@ window.__ModuleLoader__.load({
      */
     function foldApplies(record) {
       return record !== undefined && record !== null;
+    }
+
+    /**
+     * Which text an EXPAND must write back into the composer, if any.
+     *
+     * Two sources, in order:
+     *
+     *  1. `held` -- the by-ref hold. Present only while the chip's text is genuinely
+     *     out of the editor, which is the case a real chip fold creates.
+     *  2. `record.text` -- the record's own copy.
+     *
+     * The fallback matters: the by-ref hold is released by several paths (a refused
+     * insert, an earlier expand), so it is not a reliable source here. When the draft
+     * is only the chip's placeholder and nothing is restored, the chip disappears and
+     * the composer stays EMPTY -- the user's text appears to have been deleted. That is
+     * the reported "点击在文本框中显示后，输入框中没有出现任何文本".
+     *
+     * Returns undefined for a clamp-only fold: the text never left the editor, so
+     * expanding is purely visual. Writing it back there would re-create the editor
+     * contents and drop the caret and undo history for no reason.
+     *
+     * @returns the text to write, or undefined to write nothing.
+     */
+    function restoreTextFor({ held, record }) {
+      if (typeof held === "string" && held !== "") return held;
+      if (record === undefined || record === null) return undefined;
+      // Only a chip fold needs a restore: for a clamp-only fold the text is still in
+      // the editor and the draft is that text, not the placeholder.
+      if (record.chipInserted !== true) return undefined;
+      return typeof record.text === "string" && record.text !== "" ? record.text : undefined;
     }
 
     /**
@@ -428,7 +458,6 @@ window.__ModuleLoader__.load({
         return false;
       }
       holdFoldText(ref, text);
-      const span = { start: 0, end: snapshot.draft.length, draftRev: snapshot.draftRev };
       const reference = {
         source: "folded-text",
         ref,
@@ -436,27 +465,64 @@ window.__ModuleLoader__.load({
         appearance: "file",
         clipboardText: `已折叠 ${formatFoldSize(utf8Bytes(text))}`,
       };
+      // Read the revision and call insertReference as close together as possible, and
+      // RETRY once if the revision moved in between.
+      //
+      // The editor republishes (and bumps `rev`) whenever the projection's content
+      // changes, which can land between our snapshot read and the call -- a paste
+      // commits more than once, and a normalization pass republishes again. Stock's
+      // CAS then refuses a span built from the stale revision, and the chip silently
+      // never appears. That is exactly the in-app symptom "the first paste folds, the
+      // later ones do not": the richer the draft, the more republishes land in that
+      // window. (Reproduced deterministically: `REFUSED rev: sent=1 live=2`.)
+      //
+      // Retrying is safe and correct rather than a workaround: a bumped revision means
+      // MORE text is present, and the span's job is to cover the whole current draft.
+      // Re-reading rebuilds it against the truth we are actually editing. Only the
+      // revision changes between attempts -- start stays 0 and end tracks the live
+      // draft length -- so a retry cannot excise text the user did not paste.
       let applied = false;
-      try {
-        applied = shell.insertReference(reference, span) === true;
-      } catch (error) {
-        // Lexical error #337 is the one expected failure here, and it is a TIMING bug
-        // rather than a capability gap, so it is worth naming: inserting while an
-        // editor update is already in flight makes `applyEdit` take its short-circuit
-        // branch (`if (this.editor._updating) { fn(); return; }`), which runs the
-        // `$`-body WITHOUT first assigning the active editor (`oi = e` only happens
-        // inside `editor.update()`). Lexical then raises #337, "no active editor".
-        // The caller avoids this by deferring the insert out of the update; this catch
-        // stays as a backstop that degrades to the clamp instead of losing text.
-        diag({ foldChipInserted: false, foldChipReason: String(error && error.message) });
-        releaseFoldText(ref);
-        return false;
+      let lastSpan = null;
+      let lastLive = null;
+      for (let attempt = 0; attempt < 2 && !applied; attempt += 1) {
+        const live = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
+        if (live === undefined || typeof live.draftRev !== "number") break;
+        lastLive = live;
+        lastSpan = { start: 0, end: live.draft.length, draftRev: live.draftRev };
+        try {
+          applied = shell.insertReference(reference, lastSpan) === true;
+        } catch (error) {
+          // Lexical error #337 is the one expected failure here, and it is a TIMING bug
+          // rather than a capability gap, so it is worth naming: inserting while an
+          // editor update is already in flight makes `applyEdit` take its short-circuit
+          // branch (`if (this.editor._updating) { fn(); return; }`), which runs the
+          // `$`-body WITHOUT first assigning the active editor (`oi = e` only happens
+          // inside `editor.update()`). Lexical then raises #337, "no active editor".
+          // The caller avoids this by deferring the insert out of the update; this catch
+          // stays as a backstop that degrades to the clamp instead of losing text.
+          diag({ foldChipInserted: false, foldChipReason: String(error && error.message) });
+          releaseFoldText(ref);
+          return false;
+        }
       }
       if (!applied) {
-        // The CAS lost. Roll the hold back so a later serialize cannot resolve a ref
-        // that no chip carries.
+        // Refused on every attempt. insertReference has three guards and WHICH one fired
+        // decides the fix, so record the evidence rather than assuming the revision CAS:
+        //   * phase must be plain|claimed (a paste during an in-flight submit refuses)
+        //   * span.draftRev must equal shell.rev (a republish landing after our read)
+        //   * the span must map onto the current layout (detect-text bounds)
+        // `foldRefuseSentRev` vs `foldRefuseLiveRev` tells the first two apart; the two
+        // lengths tell the third.
         releaseFoldText(ref);
-        diag({ foldChipInserted: false, foldChipReason: "refused" });
+        diag({
+          foldChipInserted: false,
+          foldChipReason: "refused",
+          foldRefuseSentRev: lastSpan === null ? undefined : lastSpan.draftRev,
+          foldRefuseLiveRev: lastLive === null ? undefined : lastLive.draftRev,
+          foldRefusePhase: lastLive === null ? undefined : lastLive.phase,
+          foldRefuseSentEnd: lastSpan === null ? undefined : lastSpan.end,
+          foldRefuseLiveDraftLen: lastLive === null || typeof lastLive.draft !== "string" ? undefined : lastLive.draft.length,
+        });
         return false;
       }
       diag({ foldChipInserted: true, foldChipHeldBytes: utf8Bytes(text) });
@@ -1398,10 +1464,23 @@ window.__ModuleLoader__.load({
           // editor, so there is nothing to restore and this is purely visual.
           const record = foldStore.getSnapshot()[sessionId];
           const held = record !== undefined && record !== null && typeof record.chipRef === "string" ? foldTextByRef.get(record.chipRef) : undefined;
-          if (typeof held === "string") {
+          // Fall back to the record's own text. The by-ref hold is released by several
+          // paths (a refused insert, an earlier expand), so it is NOT a reliable source
+          // here -- and when the draft is only the chip's placeholder, restoring nothing
+          // leaves an empty composer while the chip disappears: the user sees their text
+          // vanish. `record.text` is written with the record and survives those
+          // releases, so it is the dependable source.
+          const restore = restoreTextFor({ held, record });
+          if (typeof restore === "string") {
             const shell = shellOf(ctx, sessionId);
-            if (shell !== null && typeof shell.setDraft === "function") shell.setDraft(held);
-            releaseFoldText(record.chipRef);
+            // Report whether the write is even possible, so a missing shell cannot look
+            // like a successful expand in the diagnostics.
+            const wrote = shell !== null && typeof shell.setDraft === "function";
+            if (wrote) shell.setDraft(restore);
+            if (typeof record.chipRef === "string") releaseFoldText(record.chipRef);
+            diag({ foldExpandRestored: wrote, foldExpandSource: typeof held === "string" ? "hold" : "record" });
+          } else {
+            diag({ foldExpandRestored: false, foldExpandSource: "none" });
           }
           // The text is back in the composer, so the hold's reason to exist is gone.
           // Leaving it set would tell the watcher the text is intentionally out of the
@@ -1409,7 +1488,7 @@ window.__ModuleLoader__.load({
           holdStore.clear(sessionId);
           expandStore.clear(sessionId);
           foldStore.clear(sessionId);
-          diag({ manualExpand: "expanded", foldExpandRestored: typeof held === "string" });
+          diag({ manualExpand: "expanded" });
           return;
         }
         // Collapse: re-arm the fold so the chip returns. The text is untouched.
@@ -1834,6 +1913,7 @@ window.__ModuleLoader__.load({
       pasteFileName,
       foldTextPresent,
       foldApplies,
+      restoreTextFor,
       holdApplies,
       createHoldStore,
       dismissFold,
