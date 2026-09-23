@@ -14,6 +14,17 @@ import { readFileSync } from "node:fs";
  * Pass `until` to stop as soon as the outcome is observable, which is the honest way to
  * wait on an operation that retries a variable number of times.
  */
+// A chip's real contribution to the CLIPBOARD draft.
+//
+// `ReferenceChipNode.getTextContent()` returns `clipboardText`, and the projection walk
+// pushes that into the clipboard projection (only the DETECT projection receives the lone
+// U+FFFC). `insertReference` then appends a trailing space unless one is already there.
+// Stubs that modelled the draft as "\uFFFC" mis-described every chip fold -- that wrong
+// assumption is what made a successful insert look like an 11-character draft with no chip.
+function chipDraft(ref) {
+  return `${ref.clipboardText} `;
+}
+
 async function settleChip(turns = 8, until = null) {
   for (let i = 0; i < turns; i += 1) {
     if (typeof until === "function" && until()) return;
@@ -330,7 +341,10 @@ test("inserting a fold chip holds the text BEFORE the chip exists, then wins the
 
   const text = "pasted body\n".repeat(400);
   const ok = await exports.__internals.insertFoldChip({ shell, text, ref: "r-7" });
-  assert.equal(ok, true);
+  // Resolves to the chip's draft FOOTPRINT (its label text), not `true`: the caller needs
+  // that string to write sentinels the watcher can match against the clipboard draft.
+  assert.equal(typeof ok, "string");
+  assert.equal(ok, "已折叠 4.7 KB");
   assert.equal(calls.length, 1, "exactly one insertion attempt");
   assert.equal(calls[0].resolvableAtInsert, true, "the text must be held BEFORE the chip is inserted");
   // The span must cover the whole draft and carry the live revision, or stock's CAS refuses.
@@ -639,7 +653,7 @@ test("the chip insert keeps retrying across task turns while the paste's commits
         // Simulate the paste's own trailing commits: each refusal is one more drain.
         if (pending > 0) { pending -= 1; rev += 1; return false; }
         if (span.draftRev !== rev) return false;
-        draft = "\uFFFC";
+        draft = chipDraft(ref);
         rev += 1;
         return true;
       },
@@ -811,7 +825,7 @@ test("a chip that landed after its record was retired gets a fresh record, not a
     get state() { return { getSnapshot: () => ({ draft, draftRev: rev, phase: "plain" }) }; },
     insertReference(ref, span) {
       if (span.draftRev !== rev) return false;
-      draft = "\uFFFC "; // stock's real settled shape
+      draft = chipDraft(ref); // the chip's real clipboard footprint
       rev += 1;
       // The record is retired DURING the insert -- after the abandon check but before
       // the post-insert rewrite. This is the window where the guard cannot help, so the
@@ -855,10 +869,12 @@ test("the chip path replaces the draft with a placeholder and holds the text out
     insertReference(ref, span) {
       if (span.draftRev !== shell.rev) return false;
       // The span covers the WHOLE draft, so replacing it with the chip IS the removal.
-      // Faithful to stock: `insertReference` appends a trailing SPACE beside the chip
-      // whenever the character after the span is not already one, so the settled draft
-      // is `"\uFFFC "` -- TWO code units. Modelling it as one hid several real bugs.
-      draft = "\uFFFC ";
+      // Faithful to stock, and this is the detail that hid the real bug: a chip node's
+      // `getTextContent()` returns its `clipboardText`, and the projection walk pushes
+      // THAT into the CLIPBOARD draft (only the DETECT projection gets the lone U+FFFC).
+      // So the settled draft is `<label> ` -- the label plus a trailing space -- and a
+      // sentinel of "\uFFFC" can never match it.
+      draft = chipDraft(ref);
       return true;
     },
     // Faithful to stock: `setDraft` does `root.clear()` and rebuilds from plain text,
@@ -890,12 +906,12 @@ test("the chip path replaces the draft with a placeholder and holds the text out
   // The original text is no longer displayed in the input box -- the user's
   // requirement. What remains is the chip's lone placeholder, which is what keeps
   // stock's `empty` test false so the send button stays live.
-  assert.equal(draft, "\uFFFC ", "the settled draft is the chip plus stock's trailing space");
+  assert.equal(draft, "已折叠 4.9 KB ", "the settled draft is the chip's label plus a trailing space");
   // The text is held under the ref the chip carries, so the serializer can produce
   // the ORIGINAL body at submit time.
   assert.equal(foldTextByRef.get(record.chipRef), run);
   // Presence is judged on the placeholder now, not on the text that left the draft.
-  assert.deepEqual(record.sentinels, ["\uFFFC"]);
+  assert.deepEqual(record.sentinels, ["已折叠 4.9 KB"]);
 });
 
 test("a refused chip insertion leaves the text inline rather than losing it", async () => {
@@ -988,7 +1004,7 @@ test("a fold still inserts when the detect and clipboard projections disagree", 
       if (span.draftRev !== rev) return false;
       // selectSpan: out of bounds past the detect length, so refuse.
       if (span.end > DETECT_END) return false;
-      draft = "\uFFFC ";
+      draft = chipDraft(ref);
       return true;
     },
     setDraft() {},
@@ -1007,6 +1023,55 @@ test("a fold still inserts when the detect and clipboard projections disagree", 
   assert.equal(record.chipInserted, true);
   // And the held text is the original, so the turn still carries it verbatim.
   assert.equal(foldTextByRef.get(record.chipRef), run);
+});
+
+test("a chip's draft footprint is its label, because that is what the clipboard gets", async () => {
+  // The bug that made both reported symptoms persist through three attempted fixes.
+  //
+  // Stock's projection walk pushes a chip's `getTextContent()` -- which returns the
+  // node's `clipboardText` -- into the CLIPBOARD projection; only the DETECT projection
+  // receives the lone U+FFFC. `snapshot.draft` is the clipboard text. So once a chip is
+  // in, the draft is the chip's LABEL plus stock's trailing space, and a record whose
+  // sentinels say "\uFFFC" can never match it.
+  //
+  // The consequence is not cosmetic. `foldTextPresent` is the watcher's staleness test,
+  // so the record was retired on the very next tick while the chip node stayed in the
+  // editor -- an ATOMIC, contentEditable=false node with no record: nothing draws a chip
+  // for it, and the caret cannot enter it, which is the vanished cursor and the dead
+  // keyboard. It also explains why "inserted" was reported while the composer looked
+  // empty.
+  const { insertFoldChip, foldTextPresent, createHoldStore } = loadBundle().exports.__internals;
+  const holdStore = createHoldStore();
+  const text = "z".repeat(5000);
+
+  let draft = text;
+  const shell = {
+    get state() { return { getSnapshot: () => ({ draft, draftRev: 4, phase: "plain" }) }; },
+    insertReference(ref) {
+      // Faithful to stock: the chip node's text content IS its clipboardText, and that is
+      // what lands in the clipboard draft, followed by a trailing space.
+      draft = `${ref.clipboardText} `;
+      return true;
+    },
+    setDraft() {},
+  };
+
+  const footprint = await insertFoldChip({ shell, text, ref: "r-1", holdStore });
+  assert.equal(typeof footprint, "string", "the footprint is returned for the caller to record");
+  // It is the label -- the same string the chip puts in the draft.
+  assert.match(footprint, /^已折叠 /);
+  assert.equal(footprint, "已折叠 4.9 KB");
+  assert.equal(draft, `${footprint} `);
+  // The draft contains NO placeholder at all, which is exactly what confused the earlier
+  // diagnostics and the stubs.
+  assert.equal(draft.includes("\uFFFC"), false);
+  // And the returned footprint is what makes the record survive the watcher.
+  assert.equal(foldTextPresent({ sentinels: [footprint], text }, draft), true);
+  assert.equal(
+    foldTextPresent({ sentinels: ["\uFFFC"], text }, draft),
+    false,
+    "the old sentinel could never match, which orphaned the chip",
+  );
 });
 
 test("the chip previews the first 20 characters of the paste", () => {

@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-fold-11";
+    const BUILD_REV = "chip-fold-12";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -544,13 +544,23 @@ window.__ModuleLoader__.load({
         return false;
       }
       holdFoldText(ref, text);
+      // The chip's label IS its draft footprint. A `ReferenceChipNode`'s
+      // `getTextContent()` returns its `clipboardText`, and the projection walk adds that
+      // to the CLIPBOARD draft (only the DETECT projection gets the lone U+FFFC). So once
+      // the chip is in, the draft is this label text followed by stock's trailing space --
+      // and presence in the draft must be judged on THIS string. Judging it on "\uFFFC"
+      // (as an earlier version did) can never match the clipboard draft, so the watcher
+      // retired the record at once and left the chip node orphaned: no chip drawn, and the
+      // caret unable to enter the atomic node.
+      const label = `已折叠 ${formatFoldSize(utf8Bytes(text))}`;
       const reference = {
         source: "folded-text",
         ref,
-        label: `已折叠 ${formatFoldSize(utf8Bytes(text))}`,
+        label,
         appearance: "file",
-        clipboardText: `已折叠 ${formatFoldSize(utf8Bytes(text))}`,
+        clipboardText: label,
       };
+      const chipFootprint = label;
       // Read the revision and call insertReference as close together as possible, and
       // RETRY once if the revision moved in between.
       //
@@ -639,12 +649,17 @@ window.__ModuleLoader__.load({
       diag({
         foldChipInserted: true,
         foldChipHeldBytes: utf8Bytes(text),
-        // The composer's real shape right after the insert. Stock appends a trailing
-        // space beside the chip, so this is normally `"\uFFFC "` -- two units. Recording
-        // it is how a wrong assumption about that shape gets caught.
+        // The composer's real shape right after the insert. The chip contributes its own
+        // clipboardText (the label) to the CLIPBOARD draft, plus stock's trailing space --
+        // so this is normally `<label> `, NOT `"\uFFFC "`. Recording it is how that was
+        // discovered: the earlier "\uFFFC" assumption made a successful insert look like an
+        // 11-character draft with no chip in it.
+        foldChipFootprint: chipFootprint,
         foldAfterInsertDraftShape: shell.state === undefined ? undefined : describeDraft(shell.state.getSnapshot().draft),
       });
-      return true;
+      // Return the chip's real draft footprint, so the caller records sentinels that the
+      // watcher can actually match against the clipboard draft.
+      return chipFootprint;
     }
 
     /**
@@ -938,9 +953,12 @@ window.__ModuleLoader__.load({
               // Re-read the revision now: the deferred call must CAS against the
               // CURRENT draft, not the one we saw before the update committed.
               const after = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
-              const chipInserted = after !== undefined && typeof after.draftRev === "number"
+              // Resolves to the chip's draft footprint (a string) on success, false
+              // otherwise -- see insertFoldChip.
+              const chipFootprint = after !== undefined && typeof after.draftRev === "number"
                 ? await insertFoldChip({ shell, text: chipWanted, ref: chipRef })
                 : false;
+              const chipInserted = typeof chipFootprint === "string";
               // The insert yields while it retries, so re-check the fold is still ours before
               // treating the result as current. An expand during that window must win:
               // without this the insert would overwrite the text the user just asked to
@@ -984,18 +1002,20 @@ window.__ModuleLoader__.load({
               // U+FFFC, so even a literal placeholder could not have survived it.
               //
               // Re-write the record against the post-insertion truth: presence is now
-              // judged on the placeholder, since the text has left the draft.
+              // judged on the chip's DRAFT FOOTPRINT (its label text), since the original
+              // text has left the draft. It is NOT "\uFFFC": the detect projection gets the
+              // placeholder but the clipboard draft -- which is what `snapshot.draft` is --
+              // gets the chip's `clipboardText`. A sentinel of "\uFFFC" therefore never
+              // matched, the watcher retired the record, and the chip node was orphaned.
               const live = foldStore.getSnapshot()[sessionId];
-              // Report the reconcile's outcome explicitly. The `chipRef` guard can skip
-              // it (the watcher may have already replaced the record), and a skip leaves
-              // the record's sentinels describing the ORIGINAL TEXT while the draft is
-              // now the chip's placeholder -- so the watcher retires the record and the
-              // chip never renders, even though the insert itself succeeded and
-              // `foldChipDeferred` says "inserted". That mismatch is invisible without
-              // this field, and it is exactly the "inserted but no chip visible" symptom.
+              // Report the reconcile's outcome explicitly. The `chipRef` guard can find the
+              // record already replaced, and a stale record would leave the sentinels
+              // describing the ORIGINAL TEXT while the draft holds the chip -- so the
+              // watcher retires the record and the chip never renders, even though the
+              // insert itself succeeded and `foldChipDeferred` says "inserted".
               const reconciled = live !== undefined && live !== null && live.chipRef === chipRef;
               if (reconciled) {
-                foldStore.set(sessionId, { ...live, sentinels: ["\uFFFC"], chipInserted: true });
+                foldStore.set(sessionId, { ...live, sentinels: [chipFootprint], chipInserted: true });
               } else {
                 // The record under our ref is gone, but the chip IS in the editor.
                 // Skipping the rewrite here is not harmless: the surviving record's
@@ -1010,7 +1030,7 @@ window.__ModuleLoader__.load({
                 foldStore.set(sessionId, {
                   bytes: verdict.bytes,
                   lines: countLines(candidate),
-                  sentinels: ["\uFFFC"],
+                  sentinels: [chipFootprint],
                   text: chipWanted,
                   chipRef,
                   chipInserted: true,
@@ -1056,11 +1076,16 @@ window.__ModuleLoader__.load({
             foldChipPending: shell !== undefined && shell !== null,
             // Whether the draft already held a chip placeholder when this fold was
             // decided, and how many it holds now. A repeat paste lands on a draft shaped
-            // `<U+FFFC><new text>`, and that is the one case where the insertion span and
-            // the detect layout can disagree -- so recording it makes "only the first
-            // paste folds" diagnosable instead of a guess.
+            // `<previous chip footprint><new text>`, and that is the one case where the
+            // insertion span and the detect layout can disagree -- so recording it makes
+            // "only the first paste folds" diagnosable instead of a guess.
+            //
+            // NOTE the two projections differ for a chip: the DETECT projection holds
+            // U+FFFC, while the CLIPBOARD draft (which `snapshot.draft` is) holds the
+            // chip's LABEL. Both counts are recorded so the two are never confused again.
             foldStoredDraftHadChip: typeof current === "string" && current.includes("\uFFFC"),
             foldStoredChipCount: typeof current === "string" ? (current.match(/\uFFFC/g) ?? []).length : undefined,
+            foldStoredLabelCount: typeof current === "string" ? (current.match(/已折叠 /g) ?? []).length : undefined,
             foldStoredDraftShape: describeDraft(current),
           });
         }
