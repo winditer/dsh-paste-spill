@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-2";
+    const BUILD_REV = "chip-3";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -1186,12 +1186,27 @@ window.__ModuleLoader__.load({
         if (typeof onDismiss === "function") onDismiss(sessionId, foldRef);
       };
 
+      // Stamp `data-dshps-chip` on the composer card so the CSS padding-top
+      // reserves room for the overlay chip rail. Without this, the overlay
+      // sits on top of the editor and blocks clicks.
+      const anchorRef = React.useRef(null);
+      React.useLayoutEffect(() => {
+        const card = anchorRef.current !== null ? anchorRef.current.closest("[data-composer-card]") : null;
+        if (card !== null && typeof card.setAttribute === "function") {
+          card.setAttribute("data-dshps-chip", "");
+        }
+        return () => {
+          if (card !== null && typeof card.removeAttribute === "function") {
+            card.removeAttribute("data-dshps-chip");
+          }
+        };
+      }, [collapsed]);
+
       // The chip is the ONLY affordance. The ReferenceChipNode sits in the editor
       // in place of the text, so there is no CSS clamping needed: the text is
       // physically out of the draft. The overlay chip is a pure preview + actions.
       const label = t === undefined ? (key) => key : t;
       const open = expanded === true;
-      // ONE CHIP PER FOLD, like the image rail.
       const folds = Array.isArray(record && record.folds)
         ? record.folds
         : record !== undefined && record !== null
@@ -1201,6 +1216,12 @@ window.__ModuleLoader__.load({
       return React.createElement(
         React.Fragment,
         null,
+        // Anchor div to locate the composer card for data-dshps-chip attribute.
+        React.createElement("div", {
+          ref: anchorRef,
+          style: { height: 0, width: 0, pointerEvents: "none" },
+          "aria-hidden": true,
+        }),
         anyFold
           ? React.createElement(
               "div",
