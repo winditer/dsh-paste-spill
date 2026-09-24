@@ -1509,12 +1509,9 @@ test("stock's inline chip is kept visible for typeability", () => {
 });
 
 
-test("the chip is positioned inside the card, and the card reserves a band for it", () => {
-  // The chip cannot occupy the flow itself: `conversation.input.overlay` is the
-  // only in-card slot available and its anchor is `height:0` (a floating layer
-  // shared with the `/` and `@` menus). So the chip is absolutely positioned, and
-  // the card must reserve exactly that band as padding — otherwise the chip paints
-  // over the attachments row and the editor's first line.
+test("the chip rail is a static flow container above the editor", () => {
+  // The overlay chip rail now uses position:static — it flows in the overlay slot
+  // naturally above the editor. No absolute positioning, no z-index, no card padding.
   let css = "";
   const documentStub = {
     addEventListener() {}, removeEventListener() {},
@@ -1537,41 +1534,14 @@ test("the chip is positioned inside the card, and the card reserves a band for i
     else globalThis.document = previousDocument;
   }
 
-  const band = /\[data-composer-card\]\[data-dshps-chip\]\{padding-top:(\d+)px\}/.exec(css);
-  assert.ok(band, "the card must reserve a band while the chip is mounted");
+  const rail = /\.dshps-chip-rail\{([^}]*)\}/.exec(css);
+  assert.ok(rail, "the rail rule must be installed");
+  // Static flow: no absolute positioning
+  assert.ok(!/position:\s*absolute/.test(rail[1]), "rail is static, not absolute");
+  assert.match(rail[1], /flex-wrap:wrap/, "several pastes put several chips on the rail");
   const chip = /\.dshps-chip\{([^}]*)\}/.exec(css);
   assert.ok(chip, "the chip rule must be installed");
-  // The chip is now a RAIL ITEM, so it is static and wraps inside the rail rather than
-  // being absolutely pinned. The rail itself is the floating layer, positioned in the
-  // band, and it is what the card's padding reserves room for.
-  assert.match(chip[1], /position:static/, "a rail item takes flow space inside the rail");
-  const rail = /\.dshps-chip-rail\{([^}]*)\}/.exec(css);
-  assert.ok(rail, "the rail rule must be installed, one chip per fold");
-  assert.match(rail[1], /position:absolute/, "the rail floats, so it cannot take flow space");
-  assert.match(rail[1], /top:\d+px/, "and is pinned inside that band");
-  assert.match(rail[1], /flex-wrap:wrap/, "several pastes put several chips on the rail");
-  // A compact chip, not a full-width bar: the user chose the single-line compact
-  // shape, so `right` must stay auto and the width must hug the content. Pinning
-  // both sides would silently turn it into a banner across the whole card.
   assert.match(chip[1], /width:fit-content/, "the chip hugs its content");
-  assert.match(chip[1], /max-width:calc\(100% - 24px\)/, "but cannot overflow the card");
-  assert.ok(!/right:\d/.test(chip[1]), "no `right` offset, which would stretch it full width");
-  // The rail spans the card and lays its items out in a wrapping row.
-  assert.match(rail[1], /right:\d+px/, "the rail spans the card so items can wrap");
-  // Two lines tall now (content preview + action), matching the reference chip,
-  // so each line is explicitly single-line rather than relying on the height.
-  assert.match(chip[1], /height:48px/);
-  assert.match(css, /\.dshps-chip-preview\{[^}]*white-space:nowrap/, "the preview stays on one line");
-  assert.match(css, /\.dshps-chip-action\{[^}]*white-space:nowrap/, "and so does the action line");
-
-  // The two numbers must agree, or the chip overlaps the content below it. This is
-  // the whole reason both are computed from the same constants.
-  const top = Number(/\.dshps-chip-rail\{[^}]*top:(\d+)px/.exec(css)[1]);
-  const height = Number(/\.dshps-chip\{[^}]*height:(\d+)px/.exec(css)[1]);
-  assert.ok(
-    Number(band[1]) >= top + height,
-    `band ${band[1]}px must cover the chip (top ${top}px + height ${height}px)`,
-  );
 });
 
 

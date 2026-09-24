@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-5";
+    const BUILD_REV = "chip-6";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -1646,18 +1646,19 @@ window.__ModuleLoader__.load({
           // because the overlay chip provides no Lexical editing surface.
           // The chip floats (the overlay anchor is `height:0`), so it cannot occupy
           // the flow itself. The card reserves a band as padding-top.
-          ".dshps-chip-rail{position:absolute;top:8px;left:12px;right:12px;" +
-          "display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;z-index:1;pointer-events:none}" +
-          ".dshps-chip{position:static;pointer-events:auto;" +
+          ".dshps-chip-rail{" +
+          "display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;" +
+          "padding:4px 12px 0 12px}" +
+          ".dshps-chip{" +
           "width:fit-content;max-width:calc(100% - 24px);" +
-          "height:48px;box-sizing:border-box;" +
+          "height:40px;box-sizing:border-box;" +
           "border:.5px solid var(--dsw-alias-border-l2,#0000001f);" +
           "background:var(--dsw-specific-input-major,transparent);" +
-          "border-radius:12px;align-items:center;display:flex;" +
-          "text-align:left;font:inherit;color:inherit;overflow:hidden;z-index:1}" +
+          "border-radius:10px;align-items:center;display:flex;" +
+          "text-align:left;font:inherit;color:inherit;overflow:hidden}" +
           ".dshps-chip:hover{border-color:var(--dsw-alias-border-l1,#00000033)}" +
-          ".dshps-chip-open{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:10px;" +
-          "height:100%;padding:0 4px 0 10px;border:none;background:transparent;font:inherit;" +
+          ".dshps-chip-open{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:8px;" +
+          "height:100%;padding:0 4px 0 8px;border:none;background:transparent;font:inherit;" +
           "color:inherit;cursor:pointer;text-align:left}" +
           ".dshps-chip-open:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:-2px;border-radius:12px}" +
           ".dshps-chip-glyph{flex:none;display:inline-flex;align-items:center;justify-content:center;" +
