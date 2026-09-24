@@ -776,6 +776,81 @@ test("repeated pastes accumulate one fold per paste instead of replacing each ot
   );
 });
 
+test("typing into a collapsed composer expands it, so the user sees what they type", () => {
+  // The collapsed composer hides the text with CSS, so a keystroke would otherwise
+  // land in an invisible box: the user types and nothing appears. Any ordinary edit
+  // (a non-fold insertion or a deletion) with a live fold therefore means the user is
+  // editing, and the fold is retired so the text and the caret become visible again.
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const expandStore = createSessionStore();
+  const body = "h".repeat(6000);
+  const conversation = { createDrafts() { throw new Error("no upload"); } };
+  const shell = { state: { getSnapshot: () => ({ draft: body, draftRev: 2 }) } };
+
+  reactToDraft({
+    previous: "", current: body, run: body, sessionId: "sess-1",
+    conversation, shell, foldStore, expandStore,
+  });
+  assert.ok(foldStore.getSnapshot()["sess-1"], "the paste folded");
+
+  const typed = body + "!";
+  const outcome = reactToDraft({
+    previous: body, current: typed, run: "!", sessionId: "sess-1",
+    conversation, shell, foldStore, expandStore,
+  });
+  assert.equal(outcome, "inline", "a keystroke is not a fold");
+  assert.equal(
+    foldStore.getSnapshot()["sess-1"],
+    undefined,
+    "and it must retire the fold, or the typed character stays invisible",
+  );
+  assert.equal(
+    expandStore.getSnapshot()["sess-1"],
+    undefined,
+    "with the expanded flag dropped too, so the next paste folds normally",
+  );
+});
+
+test("deleting from a collapsed composer expands it rather than editing blind", () => {
+  // The sentinel check does NOT cover this, which is why the auto-expand exists.
+  //
+  // The paste appended to pre-existing text, so the record's sentinels are [paste,
+  // wholeDraft]. Deleting a character from the PRE-EXISTING prefix leaves `paste` a
+  // substring of the draft, so the sentinel check still says the fold is live -- but
+  // `previous` no longer matches, so the fold must still be retired or the user is
+  // editing characters they cannot see.
+  const { reactToDraft, createSessionStore, foldTextPresent } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const surrounding = "k".repeat(5000);
+  const body = "j".repeat(6000);
+  const shell = { state: { getSnapshot: () => ({ draft: surrounding + body, draftRev: 2 }) } };
+  const conversation = { createDrafts() { throw new Error("no upload"); } };
+
+  reactToDraft({
+    previous: surrounding, current: surrounding + body, run: body, sessionId: "sess-1",
+    conversation, shell, foldStore,
+  });
+  const record = foldStore.getSnapshot()["sess-1"];
+  assert.ok(record, "the appended paste folded");
+
+  const shorter = surrounding.slice(1) + body;
+  assert.ok(
+    foldTextPresent(record, shorter),
+    "precondition: the sentinel check alone would still call this fold live",
+  );
+  const outcome = reactToDraft({
+    previous: surrounding + body, current: shorter, run: null, sessionId: "sess-1",
+    conversation, shell, foldStore,
+  });
+  assert.equal(outcome, "inline");
+  assert.equal(
+    foldStore.getSnapshot()["sess-1"],
+    undefined,
+    "a deletion must reveal the text even when the sentinels survive it",
+  );
+});
+
 test("reactToDraft drops the fold record when the draft is cleared", () => {
   const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
   const foldStore = createSessionStore();
@@ -1453,8 +1528,12 @@ test("the collapse rule outranks the stock scroll rule it overrides", () => {
 
   const rule = /\[data-composer-card\]\[data-dshps-folded\](?::not\(\[data-dshps-chip\]\))?\s*\[data-input-scroll\]\{([^}]*)\}/.exec(css);
   assert.ok(rule, "the collapsed scroll rule must be installed");
-  assert.match(rule[1], /max-height:\d+px/, "and must actually clamp the height");
-  assert.match(rule[1], /mask-image/, "and fade the cut edge");
+  assert.match(rule[1], /max-height:0px/, "and must hide the pasted text completely");
+  // `overflow:hidden` rather than relying on stock's `overflow-y:auto`: a 0-height box
+  // with only the Y axis clipped still paints an unbreakable token on the X axis, so
+  // the collapsed composer could show a sliver of the paste it is supposed to hide.
+  assert.match(rule[1], /overflow:hidden/, "clipping in BOTH axes, so nothing paints outside a 0-height box");
+  assert.doesNotMatch(rule[1], /mask-image/, "no fade any more: there are no visible lines left to fade");
   // The clamp is the ONLY thing hiding the text, so it must apply whenever a fold is
   // collapsed -- including when a chip is present. (It was once a fallback, gated off
   // chip folds because the editor was empty then; the text is never removed now, so
@@ -1463,11 +1542,11 @@ test("the collapse rule outranks the stock scroll rule it overrides", () => {
     !rule[0].includes("data-dshps-chip"),
     "the clamp must apply to chip folds too, or the pasted text stays visible",
   );
-  // Two lines, per the user's request. Pinned because it is derived (84px was
-  // ~3 lines) rather than measured, so a careless edit shifting it back would
-  // silently change what the fold shows.
+  // Zero, per the user's requirement: while collapsed the chip is the ONLY thing on
+  // screen ("收起=只有 chip"). The text must be in the draft (so a send posts it
+  // verbatim) but entirely unpainted.
   const clamp = /max-height:(\d+)px/.exec(rule[1]);
-  assert.equal(Number(clamp[1]), 60, "the fold must show two lines");
+  assert.equal(Number(clamp[1]), 0, "the fold must hide the paste, leaving the chip alone on screen");
   // Specificity: attributes count like classes, so count them in the selector.
   const selector = rule[0].slice(0, rule[0].indexOf("{"));
   const attributes = selector.match(/\[[^\]]+\]/g) ?? [];
@@ -1549,7 +1628,7 @@ test("the collapsed clamp applies even though a chip is present", () => {
   }
 
   // Locate the clamp by its own declaration, then read the selector that precedes it.
-  const at = css.indexOf("max-height:" + "60px");
+  const at = css.indexOf("max-height:" + "0px");
   assert.ok(at > 0, "the clamp must declare a max-height");
   const open = css.lastIndexOf("{", at);
   const selStart = css.lastIndexOf("}", open) + 1;
@@ -1560,8 +1639,8 @@ test("the collapsed clamp applies even though a chip is present", () => {
     !clamp[0].includes("data-dshps-chip"),
     "the clamp must not be skipped when a chip is present, or the pasted text stays visible",
   );
-  assert.match(clamp[0], /max-height:\d+px/, "and it must actually constrain the height");
-  assert.match(clamp[0], /mask-image/, "with a faded edge so the cut reads as a fold");
+  assert.match(clamp[0], /max-height:0px/, "and it must hide the text rather than merely shorten it");
+  assert.match(clamp[0], /overflow:hidden/, "clipping both axes, so a long token cannot peek out");
 });
 
 test("the chip is positioned inside the card, and the card reserves a band for it", () => {
@@ -1764,6 +1843,10 @@ function holdWith(sessionId, text) {
 // banner row: while text is folded the composer shows ONE chip that previews the
 // content and offers two actions — click to put the full text back in the text
 // box, and × to discard it entirely. There is no separate status line above it.
+//
+// "展开" is now purely visual (the text never left the draft), so the chip's click
+// just retires the fold record: the 0px clamp lifts, the text and caret reappear,
+// and the chip unmounts because nothing is folded any more.
 
 test("the collapsed chip previews the content instead of a byte/line summary", () => {
   const { PasteFoldChip } = loadBundle().exports.__internals;
@@ -2004,6 +2087,11 @@ function setUpFold({ draft = "", attachments = [] } = {}) {
 // So folding is a CHANGE OF APPEARANCE ONLY. These tests pin the two properties that
 // make that true, because both were violated by the earlier sidecar design: the text
 // must stay in the composer, and no attachment may exist at any point.
+//
+// The APPEARANCE itself is now "chip only": the user asked for "只显示 chip，完全不显示
+// 原文", so the collapsed editor is clamped to 0px and the paste is not painted at all.
+// The earlier "露出开头两行" (60px + fade) build is deliberately gone — it really did
+// show the first two lines, which the user reported as text appearing in the input box.
 
 test("collapsing never touches the draft and never attaches anything", () => {
   const { face, draftStore } = setUpFold();

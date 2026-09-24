@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "fold-css-2";
+    const BUILD_REV = "fold-css-3";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -354,25 +354,23 @@ window.__ModuleLoader__.load({
     const FOLD_ATTR = "data-dshps-folded";
 
     /**
-     * Height of the faded band at the bottom of a collapsed editor, in px. Must
-     * match the mask gradient stop in the stylesheet. Only the band is a toggle
-     * target: the visible lines above it keep normal caret behaviour, so a user can
-     * paste a huge document, collapse, and still click in to append "summarize
-     * this" without the composer springing open.
-     */
-    const FADE_PX = 30;
-
-    /**
-     * Clamped height of the editor while folded, in px — about TWO lines plus the
-     * container's own top padding. The user asked for two visible lines: enough to
-     * recognise the paste, short enough that the fold clearly reads as folded.
+     * Height of the editor while folded, in px. ZERO, by the user's decision:
      *
-     * Derived from the previous value rather than guessed: 84px was empirically
-     * ~3 lines including padding, and every plausible padding (8-16px) puts the
-     * per-line height at 23-25px, so 2 lines lands at 59-61px. 60 is the middle
-     * and is what the app was verified against.
+     *   "只显示 chip，完全不显示原文" — while collapsed, the chip is the only thing
+     *   on screen and the pasted text is not visible at all.
+     *
+     * This replaces the earlier "露出开头两行" (two visible lines, 60px) design. That
+     * build clamped the editor to 60px with a 30px fade, which really did paint the
+     * first ~2 lines of the paste — reported as "输入框出现文本" once the chip was the
+     * expected appearance. The text must still STAY in the draft (that is how a send
+     * posts it verbatim); it simply must not be painted.
+     *
+     * Zero is safe here because nothing in the composer subtree imposes a floor:
+     * `.p_FcLG_scroll` and `.p_FcLG_grow` carry no `min-height`, and the only
+     * `min-height` in the subtree (36px/52px) is on the INNER editable, which a
+     * `max-height:0` + `overflow:hidden` ancestor clips.
      */
-    const FOLD_CLAMP_PX = 60;
+    const FOLD_CLAMP_PX = 0;
 
     /** The stock scroll container that the collapsed style clamps. */
     const SCROLL_SELECTOR = "[data-input-scroll]";
@@ -669,10 +667,32 @@ window.__ModuleLoader__.load({
         if (expandStore !== undefined && expandStore !== null) expandStore.clear(sessionId);
       }
       const candidate = measurableText({ recorded, run, previous, current });
+      const verdict = candidate === null ? { action: "inline", bytes: 0 } : decidePaste(candidate);
+      // AUTO-EXPAND on any ordinary edit.
+      //
+      // Collapsed now means the text is not painted AT ALL (a 0px clamp), so a keystroke
+      // would otherwise land in an invisible box: the user types and sees nothing. So a
+      // live fold plus a transition that is not itself a new fold means the user is
+      // editing, and the fold is retired -- the text and the caret become visible again,
+      // and the chip unmounts.
+      //
+      // The sentinel check above cannot cover this: its sentinels are substrings, and
+      // typing at the END of the paste leaves them all present, so the fold would stay
+      // collapsed over the character just typed.
+      //
+      // Only a genuine edit counts. A spill-size paste ("file") is handled by its own
+      // layer and its own visible chip, so this deliberately leaves that path alone.
+      if (!held && sessionId !== undefined && verdict.action === "inline") {
+        const liveFold = foldStore.getSnapshot()[sessionId];
+        if (liveFold !== undefined && liveFold !== null) {
+          foldStore.clear(sessionId);
+          if (expandStore !== undefined && expandStore !== null) expandStore.clear(sessionId);
+          diag({ foldAutoExpanded: true });
+        }
+      }
       if (candidate === null) {
         return "inline";
       }
-      const verdict = decidePaste(candidate);
       if (verdict.action === "inline") return "inline";
       if (verdict.action === "fold") {
         if (sessionId !== undefined) {
@@ -1047,35 +1067,15 @@ window.__ModuleLoader__.load({
         applyFoldToCard(anchorRef.current, collapsed, collapsed);
       }, [collapsed]);
 
-      // Expand when the user clicks the faded band at the bottom of the clamped
-      // editor. Bound in the CAPTURE phase on the scroll container so the caret is
-      // never placed first (which would scroll the container and move the band out
-      // from under the pointer between mousedown and mouseup).
+      // There is deliberately NO click-the-band-to-expand handler any more.
       //
-      // Only the band toggles: a click anywhere in the visible lines falls through
-      // untouched. `preventDefault` is called only once the hit-test has already
-      // decided this is the band, so normal clicking is never affected.
-      React.useEffect(() => {
-        if (!collapsed) return undefined;
-        try {
-          const anchor = anchorRef.current;
-          const card = anchor === null ? null : anchor.closest("[data-composer-card]");
-          const scroll = card === null ? null : card.querySelector(SCROLL_SELECTOR);
-          if (scroll === null) return undefined;
-          const onMouseDown = (event) => {
-            const rect = scroll.getBoundingClientRect();
-            // The band is the bottom FADE_PX of the container, which at 84px
-            // clamped height is also where the mask has already faded to nothing.
-            if (event.clientY < rect.bottom - FADE_PX) return;
-            event.preventDefault();
-            applyToggle(true);
-          };
-          scroll.addEventListener("mousedown", onMouseDown, true);
-          return () => scroll.removeEventListener("mousedown", onMouseDown, true);
-        } catch {
-          return undefined;
-        }
-      }, [collapsed, sessionId, setFoldExpanded]);
+      // It existed to make the faded bottom edge of a 60px clamp clickable. At a 0px
+      // clamp there is no band -- but worse, the container's hit area still spanned the
+      // gap between the chip rail and the send row, so a leftover handler would have
+      // swallowed clicks on controls the user can actually see. Expanding is now done
+      // the two ways that remain honest: click the chip, or just start typing (which
+      // the watcher turns into an expand, see reactToDraft).
+      //
       // Cleanup is separate so it also runs on unmount/teardown, when the session
       // switches away: leaving the attributes behind would clamp the NEXT session's
       // composer with nothing painted to explain it, and a stale band would indent
@@ -1652,8 +1652,24 @@ window.__ModuleLoader__.load({
           // `display:none` rather than `visibility` so the card takes no space and
           // leaves no gap where it used to sit.
           // Collapsed editor: the pasted text STAYS in the editor (that is how it reaches
-          // the turn verbatim), and this is what hides it -- clamped to ~2 lines with a
-          // faded cut edge, so the composer reads as a chip rather than 40k of text.
+          // the turn verbatim), and this is what hides it -- clamped to ZERO height, so
+          // the chip is the only thing on screen.
+          //
+          // There is deliberately no `mask-image` any more. The previous build clamped to
+          // 60px with a 30px fade, which really did paint the first ~2 lines of the paste
+          // and was reported as the text showing up in the input box ("输入框出现文本").
+          // With no visible lines left there is nothing to fade.
+          //
+          // `overflow:hidden` clips BOTH axes. Stock's `.p_FcLG_scroll` sets
+          // `overflow-y:auto`, leaving the X axis visible -- enough for an unbreakable
+          // token to paint a sliver outside a 0-height box. It also leaves the collapsed
+          // container a ZERO-height hit area, so it cannot intercept a click meant for
+          // the chip rail or the send row.
+          //
+          // `pointer-events:none` is NOT needed and is deliberately absent: the text is
+          // still in the document, and stock routes "click the composer to focus it" via
+          // a keepFocus mousedown handler that calls `.focus()` on the editor. Blocking
+          // pointer events here would be an extra, unbudgeted behaviour change.
           //
           // This must apply while the chip is present. An earlier version gated it
           // `:not([data-dshps-chip])`, which was right when a chip meant the editor had
@@ -1663,9 +1679,7 @@ window.__ModuleLoader__.load({
           // leaving the whole paste visible and copyable from the text box.
           "[data-composer-card][" + FOLD_ATTR + "] " + SCROLL_SELECTOR + "{" +
           "max-height:" + FOLD_CLAMP_PX + "px;" +
-          "mask-image:linear-gradient(to bottom,#000 calc(100% - " + FADE_PX + "px),transparent);" +
-          "-webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - " + FADE_PX + "px),transparent);" +
-          "cursor:pointer}"
+          "overflow:hidden}"
         document.head.appendChild(tag);
         return () => tag.remove();
       }, "dsh-paste-spill: styles");
@@ -1721,12 +1735,11 @@ window.__ModuleLoader__.load({
         ),
       );
     };
-    // `inputTriggers` is the root half of stock's trigger pipeline (the source
-    // roster behind `@` and `/`). The fold layer needs it because a chip is the
-    // only way to place something in the composer that is not literal text: the
-    // chip node contributes a lone U+FFFC placeholder to the draft, which keeps
-    // `draft.trim() !== ""` (so the send button stays live) while the real text
-    // travels beside the draft and is re-serialized at submit time.
+    // `inputTriggers` was in this list for a design that no longer exists: the chip was
+    // once a real editor node contributing a lone U+FFFC placeholder to the draft, which
+    // needed the trigger roster to register a chip source. Nothing registers a source
+    // any more -- the fold is pure CSS over text that never leaves the draft -- but the
+    // key is harmless and its removal would be an untested change to the inject contract.
     exports.inject = ["slots", "conversation", "sessions", "locale", "inputTriggers"];
     exports.__internals = {
       FOLD_BYTES,
