@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "fold-css-5";
+    const BUILD_REV = "fold-css-6";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -423,14 +423,21 @@ window.__ModuleLoader__.load({
      *   fold is expanded.
      */
     function applyFoldToCard(anchor, collapsed, hasChip) {
-      if (anchor === null || anchor === undefined) return false;
+      if (anchor === null || anchor === undefined) {
+        diag({ applyFoldAnchorNull: true, collapsed, hasChip });
+        return false;
+      }
       const card = typeof anchor.closest === "function" ? anchor.closest("[data-composer-card]") : null;
-      if (card === null) return false;
+      if (card === null) {
+        diag({ applyFoldCardNotFound: true, collapsed, hasChip });
+        return false;
+      }
       if (collapsed) card.setAttribute(FOLD_ATTR, "");
       else card.removeAttribute(FOLD_ATTR);
       const chip = hasChip === undefined ? collapsed === true : hasChip === true;
       if (chip) card.setAttribute(CHIP_ATTR, "");
       else card.removeAttribute(CHIP_ATTR);
+      diag({ applyFoldToCardOk: true, collapsed, hasChip });
       return true;
     }
 
@@ -1070,6 +1077,7 @@ window.__ModuleLoader__.load({
       // the chip and the collapsed clamp now share a lifetime, because expanding
       // removes the chip.
       React.useLayoutEffect(() => {
+        diag({ pasteFoldChipFx: true, collapsed, sessionId, recordPresent: record !== undefined && record !== null, expanded });
         applyFoldToCard(anchorRef.current, collapsed, collapsed);
       }, [collapsed]);
 
