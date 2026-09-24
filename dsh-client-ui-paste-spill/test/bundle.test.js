@@ -1190,8 +1190,79 @@ test("no fold record renders nothing", () => {
   assert.equal(chipOf(tree), null, "nothing folded means no chip");
 });
 
+test("the rail renders one chip per fold, each with its own ×", () => {
+  // "支持多次粘贴": three pastes into one composer must put three chips on the rail, and
+  // × on one of them must remove only that one. The old component rendered a single chip
+  // from a single record, so a repeat paste replaced the previous fold and looked like
+  // nothing happened.
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const folds = [
+    { ref: "r1", bytes: 5000, lines: 1, text: "a".repeat(5000) },
+    { ref: "r2", bytes: 5000, lines: 1, text: "b".repeat(5000) },
+    { ref: "r3", bytes: 5000, lines: 1, text: "c".repeat(5000) },
+  ];
+  const record = { folds, bytes: 5000, lines: 1, text: folds[2].text, chipRef: "r3" };
+  const tree = PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select({}),
+    onDismiss: () => {},
+    t: (key) => key,
+  });
+  const chips = chipsOf(tree);
+  assert.equal(chips.length, 3, "one chip per fold");
+  const dismisses = findAllDeep(tree, "data-paste-spill-dismiss");
+  assert.equal(dismisses.length, 3, "each chip has its own ×");
+  // The × names the chip it removes, so the handler can delete just that paste.
+  assert.deepEqual(dismisses.map((d) => d.props["data-paste-spill-dismiss"]), ["r1", "r2", "r3"]);
+});
 
+test("× on one chip asks for just that fold to be removed", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const calls = [];
+  const folds = [
+    { ref: "r1", bytes: 5000, text: "a".repeat(5000) },
+    { ref: "r2", bytes: 5000, text: "b".repeat(5000) },
+  ];
+  const tree = PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": { folds } }),
+    useFoldExpanded: (select) => select({}),
+    onDismiss: (sessionId, ref) => calls.push([sessionId, ref]),
+    t: (key) => key,
+  });
+  const dismisses = findAllDeep(tree, "data-paste-spill-dismiss");
+  // Click the SECOND chip's ×: it must name r2, not the session alone.
+  dismisses[1].props.onClick();
+  assert.deepEqual(calls, [["sess-1", "r2"]], "the × carries the chip it removes");
+});
 
+test("the chip renders from the fold record alone, without a draft hook", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  // The card deliberately has NO draft hook: the session binding's draft store is
+  // materialized once and cached, so a binding born before the shell existed would
+  // hand the card a permanently empty store and hide it forever. The watcher owns
+  // clearing the record instead, so rendering depends on exactly one store.
+  const record = { bytes: 5000, lines: 2, sentinels: ["big pasted text"] };
+  const tree = PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select({}),
+    t: (key, params) => `${key}:${JSON.stringify(params ?? {})}`,
+  });
+  const chip = chipOf(tree);
+  assert.notEqual(chip, null, "a record alone must be enough to render the chip");
+  // Collect leaf strings rather than matching the whole serialized tree: the
+  // JSON form escapes the quotes inside the interpolated label arguments.
+  const text = leafText(chip);
+  // The chip now previews the CONTENT (Codex-style) instead of a byte/line
+  // summary, and offers the "show in text box" affordance.
+  assert.match(text, /foldPreview|foldTitle/, "the chip previews the folded text");
+  assert.match(text, /foldExpandAction/, "and names the expand action");
+  // "Sent as-is" moved onto the expand control's tooltip. The build that rendered
+  // it as a paragraph ABOVE the input box was rejected.
+  assert.match(openButtonOf(tree).props.title, /foldHint/);
+});
 
 test("the composer entry exposes store-shaped hooks, not plain functions", () => {
   const { apply } = loadBundle().exports;
@@ -1285,6 +1356,33 @@ test("the collapse marker registers inside the composer card, not beside it", ()
   assert.deepEqual(Object.keys(face.hooks), ["pasteFold", "foldExpanded"]);
 });
 
+test("the pasted text leaving the draft clears the record, which hides the card", () => {
+  const { watchDraft, createSessionStore, createPasteInbox, PasteFoldChip } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const draftStore = createDraftStore("");
+  const stop = watchDraft({
+    shell: { state: draftStore, setDraft: (text) => draftStore.setDraft(text) },
+    foldStore,
+    sessionId: "sess-1",
+    conversation: {},
+    nextIndex: () => 1,
+    inbox: createPasteInbox(),
+    onRestore: () => {},
+  });
+  const run = "x".repeat(5000);
+  draftStore.setDraft(run);
+  const visible = () => chipOf(PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select(foldStore.getSnapshot()),
+    useFoldExpanded: (select) => select({}),
+    t: (key) => key,
+  }));
+  assert.notEqual(visible(), null, "the chip shows while the folded text is in the draft");
+  draftStore.setDraft("");
+  assert.equal(foldStore.getSnapshot()["sess-1"], undefined, "clearing the draft must drop the record");
+  assert.equal(visible(), null, "and the chip must then render nothing");
+  stop();
+});
 
 test("the inject never touches the session shell, so a missing binding cannot hide the chip", () => {
   const { apply } = loadBundle().exports;
@@ -1411,8 +1509,93 @@ test("stock's inline chip is kept visible for typeability", () => {
 });
 
 
+test("the chip is positioned inside the card, and the card reserves a band for it", () => {
+  // The chip cannot occupy the flow itself: `conversation.input.overlay` is the
+  // only in-card slot available and its anchor is `height:0` (a floating layer
+  // shared with the `/` and `@` menus). So the chip is absolutely positioned, and
+  // the card must reserve exactly that band as padding — otherwise the chip paints
+  // over the attachments row and the editor's first line.
+  let css = "";
+  const documentStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null, querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild: (tag) => { css = tag.textContent; } },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = documentStub;
+  try {
+    loadBundle().exports.apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_k, register) => register(), register: () => {} },
+      conversation: { input: { shell: () => undefined } },
+      sessions: { list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} } },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  const band = /\[data-composer-card\]\[data-dshps-chip\]\{padding-top:(\d+)px\}/.exec(css);
+  assert.ok(band, "the card must reserve a band while the chip is mounted");
+  const chip = /\.dshps-chip\{([^}]*)\}/.exec(css);
+  assert.ok(chip, "the chip rule must be installed");
+  // The chip is now a RAIL ITEM, so it is static and wraps inside the rail rather than
+  // being absolutely pinned. The rail itself is the floating layer, positioned in the
+  // band, and it is what the card's padding reserves room for.
+  assert.match(chip[1], /position:static/, "a rail item takes flow space inside the rail");
+  const rail = /\.dshps-chip-rail\{([^}]*)\}/.exec(css);
+  assert.ok(rail, "the rail rule must be installed, one chip per fold");
+  assert.match(rail[1], /position:absolute/, "the rail floats, so it cannot take flow space");
+  assert.match(rail[1], /top:\d+px/, "and is pinned inside that band");
+  assert.match(rail[1], /flex-wrap:wrap/, "several pastes put several chips on the rail");
+  // A compact chip, not a full-width bar: the user chose the single-line compact
+  // shape, so `right` must stay auto and the width must hug the content. Pinning
+  // both sides would silently turn it into a banner across the whole card.
+  assert.match(chip[1], /width:fit-content/, "the chip hugs its content");
+  assert.match(chip[1], /max-width:calc\(100% - 24px\)/, "but cannot overflow the card");
+  assert.ok(!/right:\d/.test(chip[1]), "no `right` offset, which would stretch it full width");
+  // The rail spans the card and lays its items out in a wrapping row.
+  assert.match(rail[1], /right:\d+px/, "the rail spans the card so items can wrap");
+  // Two lines tall now (content preview + action), matching the reference chip,
+  // so each line is explicitly single-line rather than relying on the height.
+  assert.match(chip[1], /height:48px/);
+  assert.match(css, /\.dshps-chip-preview\{[^}]*white-space:nowrap/, "the preview stays on one line");
+  assert.match(css, /\.dshps-chip-action\{[^}]*white-space:nowrap/, "and so does the action line");
+
+  // The two numbers must agree, or the chip overlaps the content below it. This is
+  // the whole reason both are computed from the same constants.
+  const top = Number(/\.dshps-chip-rail\{[^}]*top:(\d+)px/.exec(css)[1]);
+  const height = Number(/\.dshps-chip\{[^}]*height:(\d+)px/.exec(css)[1]);
+  assert.ok(
+    Number(band[1]) >= top + height,
+    `band ${band[1]}px must cover the chip (top ${top}px + height ${height}px)`,
+  );
+});
 
 
+test("the chip expands the fold rather than mutating the draft itself", () => {
+  // The chip never edits the draft: it asks the plugin's toggle to do it, because
+  // expanding is a restore (the text is out of the editor and held) and only the
+  // plugin knows where it is. A chip that called setDraft directly would blank the
+  // content it was supposed to bring back.
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const calls = [];
+  const record = { bytes: 6000, lines: 3, text: '{"a":1}', sentinels: ["x"] };
+  const render = (expanded) => PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select(expanded === undefined ? {} : { "sess-1": expanded }),
+    onToggle: (sessionId, next) => calls.push([sessionId, next]),
+    t: (key) => key,
+  });
+
+  const open = openButtonOf(render(undefined));
+  assert.equal(open.props["aria-expanded"], false);
+  open.props.onClick();
+  assert.deepEqual(calls, [["sess-1", true]], "clicking the chip asks the plugin to restore the text");
+});
 
 test("the chip component renders nothing when there is no record", () => {
   const { PasteFoldChip } = loadBundle().exports.__internals;
@@ -1452,7 +1635,37 @@ function holdWith(sessionId, text) {
 // just retires the fold record: the clamp and the transparency lift, the text and
 // caret reappear, and the chip unmounts because nothing is folded any more.
 
+test("the collapsed chip previews the content instead of a byte/line summary", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const record = { bytes: 6000, lines: 1, text: '{"readings": {"backward": [1,2,3]}}', sentinels: ["x"] };
+  const tree = PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select({}),
+    t: (key) => key,
+  });
+  const text = leafText(chipOf(tree));
+  assert.match(text, /readings/, "the chip previews the pasted content");
+  assert.doesNotMatch(text, /foldMeta/, "and no longer shows the byte/line summary row");
+});
 
+test("the collapsed chip offers an expand affordance that restores the text", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const toggles = [];
+  const record = { bytes: 6000, lines: 1, text: '{"a":1}', sentinels: ["x"] };
+  const tree = PasteFoldChip({
+    sessionId: "sess-1",
+    usePasteFold: (select) => select({ "sess-1": record }),
+    useFoldExpanded: (select) => select({}),
+    onToggle: (sessionId, next) => toggles.push([sessionId, next]),
+    t: (key) => key,
+  });
+  const open = openButtonOf(tree);
+  assert.ok(open, "the chip renders an expand control");
+  // The whole chip body is the expand target, exactly like the reference chip.
+  open.props.onClick();
+  assert.deepEqual(toggles, [["sess-1", true]], "clicking the chip expands it into the text box");
+});
 
 
 // --- Expand dismisses the chip entirely ---------------------------------------
@@ -1461,7 +1674,136 @@ function holdWith(sessionId, text) {
 // in the composer the chip has nothing left to represent, so it must unmount — not
 // linger in an "expanded" state that offers to fold it again.
 
+test("expanding clears the fold so the chip unmounts once the text is back", () => {
+  const { apply } = loadBundle().exports;
+  let entry = null;
+  const hostStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = hostStub;
+  const draftStore = createDraftStore("");
+  const shell = {
+    state: draftStore,
+    setDraft: (text) => draftStore.setDraft(text),
+    addAttachments: (ids) => draftStore.addAttachments(ids),
+  };
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_key, register) => register(), register: (e) => { entry = e; } },
+      sessions: { list: { getSnapshot: () => ({ current: "s1" }), subscribe: () => () => {} } },
+      conversation: {
+        input: { shell: () => shell },
+        // Globally unique ids, like stock's attachment ids. A per-batch counter
+        // would reuse `d-0` for every call, making a stale attachment
+        // indistinguishable from a fresh one and hiding accumulation bugs.
+        createDrafts: (_s, files) => files.map((file) => ({ id: `d-${createDraftsSeq++}`, file })),
+        releaseDraftAttachments: () => {},
+      },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
 
+  const body = "q".repeat(6000);
+  draftStore.setDraft(body);
+  const face = entry.inject("s1");
+  const record = face.hooks.pasteFold.getSnapshot()["s1"];
+  assert.ok(record, "the paste folded");
+
+  const renderChip = () => {
+    const tree = face && loadBundle().exports.__internals.PasteFoldChip({
+      sessionId: "s1",
+      usePasteFold: (select) => select(face.hooks.pasteFold.getSnapshot()),
+      useFoldExpanded: (select) => select(face.hooks.foldExpanded.getSnapshot()),
+      onToggle: face.onToggle,
+      onDismiss: face.onDismiss,
+      getHeld: face.getHeld,
+      t: (key) => key,
+    });
+    return chipOf(tree);
+  };
+
+  assert.notEqual(renderChip(), null, "the chip is shown while collapsed");
+
+  // Expand: the text goes back, and the chip must be gone.
+  face.onToggle("s1", true);
+  assert.equal(draftStore.getSnapshot().draft, body, "the full text is restored verbatim");
+  assert.equal(
+    renderChip(),
+    null,
+    "and the chip is unmounted, because nothing is folded any more",
+  );
+});
+
+test("a fresh large paste after an expand folds again, so the chip is not suppressed forever", () => {
+  // The unmount must come from the fold being CONSUMED, not from a sticky "user
+  // expanded once" flag: if it came from the flag, every later paste in that
+  // session would arrive already-expanded and the chip would never appear again.
+  const { apply } = loadBundle().exports;
+  let entry = null;
+  const hostStub = {
+    addEventListener() {}, removeEventListener() {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    createElement: () => ({ dataset: {}, remove() {} }),
+    head: { appendChild() {} },
+  };
+  const previousDocument = globalThis.document;
+  globalThis.document = hostStub;
+  const draftStore = createDraftStore("");
+  const shell = {
+    state: draftStore,
+    setDraft: (text) => draftStore.setDraft(text),
+    addAttachments: (ids) => draftStore.addAttachments(ids),
+  };
+  try {
+    apply({
+      locale: { register: () => {} },
+      effect: (fn) => { fn(); return () => {}; },
+      slots: { inject: (_key, register) => register(), register: (e) => { entry = e; } },
+      sessions: { list: { getSnapshot: () => ({ current: "s1" }), subscribe: () => () => {} } },
+      conversation: {
+        input: { shell: () => shell },
+        // Globally unique ids, like stock's attachment ids. A per-batch counter
+        // would reuse `d-0` for every call, making a stale attachment
+        // indistinguishable from a fresh one and hiding accumulation bugs.
+        createDrafts: (_s, files) => files.map((file) => ({ id: `d-${createDraftsSeq++}`, file })),
+        releaseDraftAttachments: () => {},
+      },
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+
+  const face = entry.inject("s1");
+  draftStore.setDraft("a".repeat(6000));
+  face.onToggle("s1", true);
+  assert.equal(draftStore.getSnapshot().draft, "a".repeat(6000), "first paste restored");
+
+  // A second, different large paste must fold again and show a chip.
+  draftStore.setDraft(`${"a".repeat(6000)}${"b".repeat(6000)}`);
+  const second = face.hooks.pasteFold.getSnapshot()["s1"];
+  assert.ok(second, "the second large paste folds again");
+  const tree = loadBundle().exports.__internals.PasteFoldChip({
+    sessionId: "s1",
+    usePasteFold: (select) => select(face.hooks.pasteFold.getSnapshot()),
+    useFoldExpanded: (select) => select(face.hooks.foldExpanded.getSnapshot()),
+    onToggle: face.onToggle,
+    onDismiss: face.onDismiss,
+    getHeld: face.getHeld,
+    t: (key) => key,
+  });
+  assert.notEqual(chipOf(tree), null, "and its chip is shown, not permanently suppressed");
+});
 
 // --- Sending clears the fold entirely -----------------------------------------
 //
@@ -1703,7 +2045,7 @@ test("registerFoldSource installs a codec with clipboardText and serialize", () 
   registerFoldSource(ctx);
   assert.equal(sources.length, 1, "one source must be registered");
   const src = sources[0];
-  assert.equal(src.trigger, "/");
+  assert.equal(src.trigger, "\x00");
   assert.equal(src.name, "folded-text");
 
   // clipboardText returns a placeholder
@@ -1714,89 +2056,4 @@ test("registerFoldSource installs a codec with clipboardText and serialize", () 
   return src.codec.serialize("r1").then((text) => {
     assert.equal(text, "六字真言");
   });
-
-test("dismiss bar renders when a fold record exists", () => {
-  const { PasteFoldChip } = loadBundle().exports.__internals;
-  const record = { bytes: 5000, chipRef: "r1", text: "a".repeat(5000) };
-  const tree = PasteFoldChip({
-    sessionId: "sess-1",
-    usePasteFold: (select) => select({ "sess-1": record }),
-    useFoldExpanded: (select) => select({}),
-    t: (key) => key,
-  });
-  assert.ok(tree, "dismiss bar renders");
-  assert.equal(tree.props.className, "dshps-dismiss-bar");
-});
-
-test("dismiss bar returns null when no record or expanded", () => {
-  const { PasteFoldChip } = loadBundle().exports.__internals;
-  assert.equal(
-    PasteFoldChip({ sessionId: "s-1", usePasteFold: (s) => s({}), useFoldExpanded: (s) => s({}) }),
-    null,
-    "no record = null",
-  );
-  assert.equal(
-    PasteFoldChip({
-      sessionId: "s-1",
-      usePasteFold: (s) => s({ "s-1": { bytes: 5000, chipRef: "r1" } }),
-      useFoldExpanded: (s) => s({ "s-1": true }),
-    }),
-    null,
-    "expanded = null",
-  );
-});
-
-test("dismiss bar × calls onDismiss with fold ref", () => {
-  const { PasteFoldChip } = loadBundle().exports.__internals;
-  const calls = [];
-  const record = { bytes: 5000, chipRef: "r1", text: "x".repeat(5000) };
-  const tree = PasteFoldChip({
-    sessionId: "sess-1",
-    usePasteFold: (s) => s({ "sess-1": record }),
-    useFoldExpanded: (s) => s({}),
-    onDismiss: (sid, ref) => calls.push([sid, ref]),
-    t: (k) => k,
-  });
-  const btn = tree.props.children[1];
-  btn.props.onClick();
-  assert.deepEqual(calls, [["sess-1", "r1"]]);
-});
-
-test("dismiss bar label click calls onToggle", () => {
-  const { PasteFoldChip } = loadBundle().exports.__internals;
-  const calls = [];
-  const record = { bytes: 5000, chipRef: "r1" };
-  const tree = PasteFoldChip({
-    sessionId: "sess-1",
-    usePasteFold: (s) => s({ "sess-1": record }),
-    useFoldExpanded: (s) => s({}),
-    onToggle: (sid, next) => calls.push([sid, next]),
-    setFoldExpanded: (sid, next) => calls.push(["set", sid, next]),
-    t: (k) => k,
-  });
-  tree.props.children[0].props.onClick();
-  assert.equal(calls.length, 2, "both onToggle and setFoldExpanded called");
-});
-
-test("a fresh large paste after an expand folds again", () => {
-  const { reactToDraft, createSessionStore, createHoldStore } = loadBundle().exports.__internals;
-  const foldStore = createSessionStore();
-  const holdStore = createHoldStore();
-  const shell = { state: { getSnapshot: () => ({ draft: "z", draftRev: 1, phase: "plain" }) }, insertReference: () => true, setDraft() {}, caretSpan: () => ({ start: 0, end: 0 }) };
-  const r1 = reactToDraft({
-    previous: "", current: "a".repeat(5000), run: "a".repeat(5000), sessionId: "s-1",
-    conversation: { createDrafts() { throw new Error("no upload"); } },
-    shell, foldStore, holdStore,
-  });
-  assert.equal(r1, "fold");
-  foldStore.clear("s-1");
-  holdStore.clear("s-1");
-  const r2 = reactToDraft({
-    previous: "z", current: "z" + "b".repeat(5000), run: "b".repeat(5000), sessionId: "s-1",
-    conversation: { createDrafts() { throw new Error("no upload"); } },
-    shell, foldStore, holdStore,
-  });
-  assert.equal(r2, "fold", "paste after expand must fold again");
-});
-
 });

@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-4";
+    const BUILD_REV = "chip-5";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -411,7 +411,7 @@ window.__ModuleLoader__.load({
           return;
         }
         const source = {
-          trigger: "/",
+          trigger: "\x00",
           name: "folded-text",
           showGroupTitle: false,
           candidates() {
@@ -1177,66 +1177,128 @@ window.__ModuleLoader__.load({
       const record = readSessionSlice(usePasteFold, sessionId);
       const expanded = readSessionSlice(useFoldExpanded, sessionId);
       const present = foldApplies(record) || (typeof getHeld === "function" && getHeld(sessionId) !== undefined);
-      if (!present || expanded === true) return null;
+      const collapsed = present && expanded !== true;
+      const applyToggle = (next) => {
+        if (typeof onToggle === "function") onToggle(sessionId, next);
+        if (typeof setFoldExpanded === "function") setFoldExpanded(sessionId, next);
+      };
+      const applyDismiss = (foldRef) => {
+        if (typeof onDismiss === "function") onDismiss(sessionId, foldRef);
+      };
 
-      const bytes = record !== undefined && record !== null ? record.bytes : 0;
+      // Stamp data-dshps-chip on the card so CSS reserves padding-top for the
+      // floating chip rail. Without this the rail overlaps the editor.
+      const anchorRef = React.useRef(null);
+      React.useLayoutEffect(() => {
+        const card = anchorRef.current?.closest?.("[data-composer-card]");
+        if (card) card.setAttribute("data-dshps-chip", "");
+        return () => { if (card) card.removeAttribute("data-dshps-chip"); };
+      }, []);
+
       const label = t === undefined ? (key) => key : t;
-      const sizeText = formatFoldSize(bytes);
-      const foldRef = record !== undefined && record !== null ? record.chipRef : undefined;
-
+      const open = expanded === true;
+      // ONE CHIP PER FOLD, like the image rail.
+      const folds = Array.isArray(record && record.folds)
+        ? record.folds
+        : record !== undefined && record !== null
+          ? [record]
+          : [];
+      const anyFold = folds.length > 0 || present;
       return React.createElement(
-        "div",
-        {
-          className: "dshps-dismiss-bar",
-          style: {
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "2px 12px",
-            fontSize: "12px",
-            lineHeight: "20px",
-            color: "var(--dsw-alias-label-tertiary)",
-            background: "var(--dsw-alias-bg-base, transparent)",
-            borderBottom: ".5px solid var(--dsw-alias-border-l3, #00000014)",
-            userSelect: "none",
-            flexShrink: 0,
-          },
-        },
-        React.createElement(
-          "span",
-          {
-            style: { cursor: "pointer" },
-            onClick: () => {
-              if (typeof onToggle === "function") onToggle(sessionId, true);
-              if (typeof setFoldExpanded === "function") setFoldExpanded(sessionId, true);
-            },
-            title: label("foldExpandAction") || "点击展开",
-          },
-          label("foldTitle") || "已折叠",
-          " ",
-          sizeText,
-        ),
-        React.createElement(
-          "button",
-          {
-            type: "button",
-            onClick: () => {
-              if (typeof onDismiss === "function") onDismiss(sessionId, foldRef);
-            },
-            style: {
-              border: "none",
-              background: "transparent",
-              cursor: "pointer",
-              padding: "0 4px",
-              fontSize: "14px",
-              lineHeight: 1,
-              color: "inherit",
-              opacity: 0.7,
-            },
-            title: label("foldDismissLabel") || "关闭并删除",
-          },
-          "\u00D7",
-        ),
+        React.Fragment,
+        null,
+        anyFold
+          ? React.createElement(
+              "div",
+              { className: "dshps-chip-rail", "data-paste-spill-rail": true },
+              React.createElement("div", { ref: anchorRef, style: { height: 0, width: 0, pointerEvents: "none" }, "aria-hidden": true }),
+              ...folds.map((fold, index) => {
+                const foldRef = fold.ref;
+                const foldPreview = foldPreviewOf(fold);
+                return React.createElement(
+                  "div",
+                  {
+                    key: foldRef,
+                    className: "dshps-chip",
+                    "data-paste-spill-chip": foldRef,
+                    "data-paste-spill-chip-index": index,
+                  },
+                  React.createElement(
+                    "button",
+                    {
+                      type: "button",
+                      className: "dshps-chip-open",
+                      "data-paste-spill-expand": foldRef,
+                      // Was the text put back into the composer? The chip is only mounted
+                      // while it is collapsed, so this is false in practice -- but it is
+                      // the honest state for assistive tech, and it is what the affordance
+                      // reports.
+                      "aria-expanded": open === true,
+                      // "按原文发送" lives on the expand control's tooltip. A build that
+                      // rendered it as a paragraph above the input box was rejected.
+                      title: label("foldHint"),
+                      onClick: (event) => {
+                        if (event !== undefined && typeof event.stopPropagation === "function") event.stopPropagation();
+                        applyToggle(true);
+                      },
+                    },
+                    React.createElement(
+                      "span",
+                      { className: "dshps-chip-glyph", "aria-hidden": true },
+                      React.createElement("svg", {
+                        width: 12,
+                        height: 12,
+                        viewBox: "0 0 12 12",
+                        fill: "none",
+                        children: React.createElement("path", {
+                          d: "M2 2h5l3 3v5H2z",
+                          stroke: "currentColor",
+                          strokeWidth: 1.2,
+                          strokeLinejoin: "round",
+                          strokeLinecap: "round",
+                        }),
+                      }),
+                    ),
+                    React.createElement(
+                      "span",
+                      { className: "dshps-chip-body" },
+                      React.createElement(
+                        "span",
+                        { className: "dshps-chip-preview" },
+                        // A record with no readable text (an older build, or a pure
+                        // whitespace paste) still needs a label rather than an empty chip.
+                        foldPreview === "" ? label("foldTitle") : foldPreview,
+                      ),
+                      React.createElement(
+                        "span",
+                        { className: "dshps-chip-action" },
+                        label("foldExpandAction"),
+                        React.createElement("span", { className: "dshps-chip-chevron", "aria-hidden": true }, "\u203A"),
+                      ),
+                    ),
+                  ),
+                  // "关闭即删除": discards THIS paste. Per-chip, because with several
+                  // folds a session-level dismiss would delete all of them at once --
+                  // the rail's x removes one item, so ours must too.
+                  React.createElement(
+                    "button",
+                    {
+                      type: "button",
+                      className: "dshps-chip-dismiss",
+                      "data-paste-spill-dismiss": foldRef,
+                      "aria-label": label("foldDismissLabel"),
+                      title: label("foldDismissLabel"),
+                      onClick: (event) => {
+                        if (event !== undefined && typeof event.stopPropagation === "function") event.stopPropagation();
+                        applyDismiss(foldRef);
+                      },
+                    },
+                    "\u00D7",
+                  ),
+                );
+              }),
+            )
+          : null,
       );
     }
 
@@ -1575,11 +1637,46 @@ window.__ModuleLoader__.load({
         tag.dataset.plugin = "dsh-paste-spill";
         tag.dataset.pluginCss = "dsh-paste-spill";
         tag.textContent =
-          // Minimal CSS: the stock ReferenceChip stays visible in the editor.
-          // PasteFoldChip is a thin dismiss bar above the editor — no overlay,
-          // no absolute positioning, no z-index games. The bar flows in the
-          // overlay slot naturally.
-          "";
+          // The stock ReferenceChip renders inline in the editor as a compact 22px
+          // pill. We keep it visible — it IS the editable area: the trailing space
+          // after the chip node is where the caret lands. Our PasteFoldChip overlay
+          // floats above with expand/× affordances; both are visible.
+          //
+          // No display:none on the stock chip. Hiding it made the editor untypeable
+          // because the overlay chip provides no Lexical editing surface.
+          // The chip floats (the overlay anchor is `height:0`), so it cannot occupy
+          // the flow itself. The card reserves a band as padding-top.
+          ".dshps-chip-rail{position:absolute;top:8px;left:12px;right:12px;" +
+          "display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;z-index:1;pointer-events:none}" +
+          ".dshps-chip{position:static;pointer-events:auto;" +
+          "width:fit-content;max-width:calc(100% - 24px);" +
+          "height:48px;box-sizing:border-box;" +
+          "border:.5px solid var(--dsw-alias-border-l2,#0000001f);" +
+          "background:var(--dsw-specific-input-major,transparent);" +
+          "border-radius:12px;align-items:center;display:flex;" +
+          "text-align:left;font:inherit;color:inherit;overflow:hidden;z-index:1}" +
+          ".dshps-chip:hover{border-color:var(--dsw-alias-border-l1,#00000033)}" +
+          ".dshps-chip-open{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:10px;" +
+          "height:100%;padding:0 4px 0 10px;border:none;background:transparent;font:inherit;" +
+          "color:inherit;cursor:pointer;text-align:left}" +
+          ".dshps-chip-open:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:-2px;border-radius:12px}" +
+          ".dshps-chip-glyph{flex:none;display:inline-flex;align-items:center;justify-content:center;" +
+          "width:24px;height:24px;border-radius:6px;background:var(--dsw-alias-bg-base,#0000000a);" +
+          "color:var(--dsw-alias-label-secondary)}" +
+          ".dshps-chip-body{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px}" +
+          ".dshps-chip-preview{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;" +
+          "white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:13px;line-height:18px}" +
+          ".dshps-chip-action{display:flex;align-items:center;gap:2px;color:var(--dsw-alias-label-tertiary);" +
+          "font-size:12px;line-height:16px;white-space:nowrap}" +
+          ".dshps-chip-chevron{flex:none;font-size:11px}" +
+          ".dshps-chip-dismiss{flex:none;display:inline-flex;align-items:center;justify-content:center;" +
+          "width:20px;height:20px;margin-right:8px;padding:0;border:none;border-radius:999px;" +
+          "background:var(--dsw-alias-label-primary,#000);color:var(--dsw-alias-bg-base,#fff);" +
+          "font-size:13px;line-height:1;cursor:pointer;opacity:.85}" +
+          ".dshps-chip-dismiss:hover{opacity:1}" +
+          ".dshps-chip-dismiss:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}" +
+          // The card reserves a band for the floating chip rail.
+          "[data-composer-card][data-dshps-chip]{padding-top:60px}"
         document.head.appendChild(tag);
         return () => tag.remove();
       }, "dsh-paste-spill: styles");
