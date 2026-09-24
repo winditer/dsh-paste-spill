@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "fold-css-6";
+    const BUILD_REV = "fold-css-7";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -782,6 +782,22 @@ window.__ModuleLoader__.load({
             foldStoredTextLen: typeof foldText === "string" ? foldText.length : undefined,
             foldStoredDraftLen: typeof current === "string" ? current.length : undefined,
           });
+          // Set the collapsed attribute directly on the composer card NOW, before this
+          // tick ends. layoutEffect inside PasteFoldChip runs inside a React subtree
+          // that can observe a different sessionId than the watcher, so relying on it
+          // alone has repeatedly left the attribute absent and the text visible — the
+          // "}}}}" the user sees is the literal JSON tail of an un-hidden draft.
+          try {
+            if (typeof document !== "undefined") {
+              const card = document.querySelector("[data-composer-card]");
+              if (card !== null) {
+                card.setAttribute(FOLD_ATTR, "");
+                diag({ foldSetAttributeDirect: true });
+              }
+            }
+          } catch {
+            /* must not break the fold path */
+          }
         }
 
         return "fold";
