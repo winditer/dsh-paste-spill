@@ -1477,10 +1477,10 @@ test("the fold record and the expanded flag are cleared together", () => {
 });
 
 
-test("stock's inline chip is kept visible for typeability", () => {
-  // The stock ReferenceChip is NOT hidden. It IS the editable area: the
-  // trailing space after the chip node is where the caret lands and typing
-  // works. Our overlay chip floats above with expand/× affordances only.
+test("stock chip is hidden, overlay chip provides the UI", () => {
+  // The stock ReferenceChip is hidden (display:none) so the user sees only
+  // the PasteFoldChip overlay. The chip node + trailing space remain in the
+  // editor for serialization and typeability.
   let css = "";
   const documentStub = {
     addEventListener() {}, removeEventListener() {},
@@ -1503,9 +1503,8 @@ test("stock's inline chip is kept visible for typeability", () => {
     else globalThis.document = previousDocument;
   }
 
-  // The hide-stock-chip rule (display:none on .QiNVUW_chip) must NOT exist.
-  const hidden = /display:\s*none.*已折叠|已折叠.*display:\s*none/.test(css);
-  assert.equal(hidden, false, "stock chip must not be hidden — it provides the typeable space");
+  // Stock chip must be hidden so only the overlay shows.
+  assert.match(css, /display:\s*none.*已折叠|已折叠.*display:\s*none/, "stock chip must be hidden");
 });
 
 

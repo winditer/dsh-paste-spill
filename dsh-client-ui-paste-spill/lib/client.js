@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "chip-6";
+    const BUILD_REV = "chip-7";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -1637,15 +1637,11 @@ window.__ModuleLoader__.load({
         tag.dataset.plugin = "dsh-paste-spill";
         tag.dataset.pluginCss = "dsh-paste-spill";
         tag.textContent =
-          // The stock ReferenceChip renders inline in the editor as a compact 22px
-          // pill. We keep it visible — it IS the editable area: the trailing space
-          // after the chip node is where the caret lands. Our PasteFoldChip overlay
-          // floats above with expand/× affordances; both are visible.
-          //
-          // No display:none on the stock chip. Hiding it made the editor untypeable
-          // because the overlay chip provides no Lexical editing surface.
-          // The chip floats (the overlay anchor is `height:0`), so it cannot occupy
-          // the flow itself. The card reserves a band as padding-top.
+          // Hide stock's inline chip rendering so the user sees only our overlay.
+          // The stock chip node IS in the editor (it's what carries the reference
+          // for serialization), but the user sees the PasteFoldChip overlay instead.
+          // The chip node + trailing space provide a typeable area in the editor.
+          "[data-composer-card] .QiNVUW_chip[title^=\"已折叠 \"]{display:none}" +
           ".dshps-chip-rail{" +
           "display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;" +
           "padding:4px 12px 0 12px}" +
