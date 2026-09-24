@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "fold-css-7";
+    const BUILD_REV = "chip-1";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -194,6 +194,52 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Text held by fold chips, keyed by the `ref` the chip carries.
+     *
+     * Why a module-level map rather than session state: the ONLY value that
+     * crosses from an inserted chip into the submitted message is its `ref`
+     * (stock calls `occurrences[].serializeReference(source, ref)` at submit
+     * time). So `ref` is the handle the serializer dereferences, and it must
+     * outlive the React render tree that inserted it.
+     */
+    const foldTextByRef = new Map();
+
+    /**
+     * Hold text under the `ref` a fold chip carries.
+     *
+     * The ref is minted by the plugin and embedded in the chip node, so this is the
+     * only handle the serializer will later have. Re-holding an existing ref is a
+     * programming error, not a user-visible condition.
+     * @param ref - chip reference id.
+     * @param text - the original pasted text.
+     */
+    function holdFoldText(ref, text) {
+      foldTextByRef.set(ref, text);
+    }
+
+    /**
+     * Release held text, so a later serialize of the same ref fails loudly.
+     *
+     * Called by both exits from a fold: expanding (the text is back in the editor,
+     * so the chip is gone) and × (the user discarded it). Failing loudly matters --
+     * returning "" would silently submit a truncated message.
+     * @param ref - chip reference id.
+     */
+    function releaseFoldText(ref) {
+      foldTextByRef.delete(ref);
+    }
+
+    /**
+     * Format a byte count for the chip's label.
+     */
+    function formatFoldSize(bytes) {
+      if (bytes < 1024) return `${bytes} B`;
+      const kb = bytes / 1024;
+      if (kb < 1000) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
+      return `${(kb / 1024).toFixed(1)} MB`;
+    }
+
+    /**
      * Which text an EXPAND must write back into the composer, if any.
      *
      * Two sources, in order:
@@ -217,9 +263,6 @@ window.__ModuleLoader__.load({
     function restoreTextFor({ held, record }) {
       if (typeof held === "string" && held !== "") return held;
       if (record === undefined || record === null) return undefined;
-      // Only a chip fold needs a restore: for a clamp-only fold the text is still in
-      // the editor and the draft is that text, not the placeholder.
-      if (record.chipInserted !== true) return undefined;
       return typeof record.text === "string" && record.text !== "" ? record.text : undefined;
     }
 
@@ -346,99 +389,145 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * DOM attribute carrying the collapsed state on the composer card. The card
-     * (not our own subtree) is the only element that can clamp the editor, because
-     * the scroll container we need to shrink is a stock sibling we must not wrap
-     * or restyle selectively by hand.
+     * Register the `fold` chip source with stock's trigger pipeline.
+     *
+     * Why a chip at all, instead of clamping the text with CSS: a chip is the only
+     * way to put something in the composer that is not literal text. The chip node
+     * contributes a lone U+FFFC to the draft, and `"\uFFFC".trim() !== ""`, so
+     * stock's `empty` test (`draft.trim() === "" && attachments.length === 0`) is
+     * false and the send button stays LIVE -- while the real text stays out of the
+     * composer and is re-serialized from `ref` at submit. That is exactly how
+     * stock's own image and `@file` chips work, and it needs no stock patch.
+     *
+     * `trigger`/`name` must be unique in the roster (duplicates throw), so the
+     * pair is namespaced with the plugin prefix.
+     * @param ctx - client plugin context.
      */
-    const FOLD_ATTR = "data-dshps-folded";
+    function registerFoldSource(ctx) {
+      try {
+        const inputTriggers = ctx.inputTriggers !== undefined ? ctx.inputTriggers : ctx.get("inputTriggers");
+        if (inputTriggers === undefined || typeof inputTriggers.registerSource !== "function") {
+          diag({ foldSourceRegistered: false, foldSourceReason: "service-missing" });
+          return;
+        }
+        const source = {
+          trigger: "/",
+          name: "folded-text",
+          showGroupTitle: false,
+          candidates() {
+            return Promise.resolve([]);
+          },
+          codec: {
+            clipboardText: (ref) => `[folded-text:${ref}]`,
+            serialize(ref) {
+              const held = foldTextByRef.get(ref);
+              if (held === undefined) return Promise.reject(new Error(`dsh-paste-spill: folded text "${ref}" is no longer held`));
+              diag({ foldSerializeBytes: utf8Bytes(held) });
+              return Promise.resolve(held);
+            },
+          },
+        };
+        ctx.effect(() => inputTriggers.registerSource(source), "dsh-paste-spill: folded-text source");
+        diag({ foldSourceRegistered: true });
+      } catch (error) {
+        diag({ foldSourceRegistered: false, foldSourceReason: String(error && error.message) });
+      }
+    }
 
     /**
-     * Height of the editor while folded, in px — ONE line, not zero.
+     * Build the detect-coordinate span that `insertReference` needs.
      *
-     * The user wants the collapsed composer to behave like an image paste: a chip on
-     * top and an EMPTY, still-typeable input box beneath it. A zero-height clamp is
-     * the wrong way to reach that — it removes the box's hit area entirely, so the
-     * caret cannot enter and "无法输入" is the result (the previous build hit exactly
-     * this: `max-height:0` left nothing to click or focus).
-     *
-     * So the box is clamped to ONE line, and the pasted text inside it is hidden with
-     * `color:transparent` (not painted, but still laid out and focusable). The caret
-     * stays visible through `caret-color`, and the box reads as empty — the same shape
-     * as a composer that has just taken an image attachment. The text itself never
-     * leaves the draft, which is what lets a send post it verbatim.
-     *
-     * One line (36px, the editable's own min-height) is enough for the caret and the
-     * click target, and short enough that the box looks empty rather than a wall of
-     * invisible space.
+     * The span covers the WHOLE current draft (start:0 to the caret's end). For a
+     * paste this is the length of the text that just landed, and for a re-collapse
+     * after expanding a previous fold (the text is already back) it is the length
+     * of the restored text.
+     * @returns {start, end, draftRev} or null when unavailable.
      */
-    const FOLD_CLAMP_PX = 36;
-
-    /** The stock scroll container that the collapsed style clamps. */
-    const SCROLL_SELECTOR = "[data-input-scroll]";
-
-    /**
-     * DOM attribute on the composer card while a fold chip is mounted. The chip
-     * itself lives in a floating layer (the overlay anchor is `height:0`), so it
-     * would otherwise paint over the attachments row and the editor; this
-     * attribute is what makes the card reserve a band for it instead.
-     *
-     * Now that expanding consumes the fold, the chip exists only while the text is
-     * folded, so "chip mounted" and "collapsed" are the same condition — the chip
-     * and the clamp share one lifetime.
-     */
-    const CHIP_ATTR = "data-dshps-chip";
-
-    /** Top offset of the chip inside the card, in px — mirrors the card's own
-     * stock `padding-top`. */
-    const CHIP_TOP_PX = 8;
-    /** Chip height in px. Two lines (content preview + action), matching the
-     * reference chip rather than a single-line summary row. */
-    const CHIP_HEIGHT_PX = 48;
-    /** Gap between the chip and the content below it, in px. */
-    const CHIP_GAP_PX = 4;
-    /**
-     * Top padding the card must carry while the chip is mounted, in px. Summed
-     * from the parts rather than hard-coded so the chip can never drift into the
-     * attachments row: this is the one number that keeps a floating chip from
-     * overlapping in-flow content.
-     */
-    const CHIP_BAND_PX = CHIP_TOP_PX + CHIP_HEIGHT_PX + CHIP_GAP_PX;
+    function foldSpanFor(shell, snapshot) {
+      if (snapshot === undefined || typeof snapshot.draftRev !== "number") return null;
+      let end = null;
+      try {
+        if (typeof shell.caretSpan === "function") {
+          const caret = shell.caretSpan();
+          if (caret !== null && caret !== undefined && typeof caret.end === "number" && caret.end >= 0) {
+            end = caret.end;
+          }
+        }
+      } catch {
+        end = null;
+      }
+      if (end === null) end = typeof snapshot.draft === "string" ? snapshot.draft.length : null;
+      if (end === null || end <= 0) return null;
+      return { start: 0, end, draftRev: snapshot.draftRev };
+    }
 
     /**
-     * Apply or remove the collapsed attribute on ONE session's composer card.
+     * Replace the editor's current draft with a ReferenceChipNode that holds
+     * `text` under `ref`, and carry the text in `foldTextByRef`.
      *
-     * `[data-composer-card]` is marked by the stock InputBar on the element
-     * wrapping the whole composer, and the overlay anchor this component renders
-     * into sits inside that same card, so the nearest ancestor is this session's
-     * card and never another session's. Scoping by `sessionId` is therefore
-     * automatic — the element is only ever reached from inside itself.
+     * The chip's draft footprint is its label text (e.g. "已折叠 5.9 KB"), not a
+     * lone U+FFFC: the clipboard draft gets the chip's `clipboardText`, and the
+     * watcher reads that same draft, so sentinels must describe THIS text.
      *
-     * Returns true when the card was found, so the caller can retry: the card can
-     * legitimately be absent for a commit or two when a session is switching.
-     *
-     * @param collapsed - clamp the editor to the folded height.
-     * @param hasChip - reserve the chip band. Defaults to `collapsed`; callers that
-     *   pass it explicitly pass the same value, because the chip is gone once the
-     *   fold is expanded.
+     * @returns the chip's draft-footprint string on success, false on failure.
      */
-    function applyFoldToCard(anchor, collapsed, hasChip) {
-      if (anchor === null || anchor === undefined) {
-        diag({ applyFoldAnchorNull: true, collapsed, hasChip });
+    async function insertFoldChip({ shell, text, ref }) {
+      const snapshot = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
+      if (snapshot === undefined || typeof snapshot.draftRev !== "number") {
+        diag({ foldChipInserted: false, foldChipReason: "no-revision" });
         return false;
       }
-      const card = typeof anchor.closest === "function" ? anchor.closest("[data-composer-card]") : null;
-      if (card === null) {
-        diag({ applyFoldCardNotFound: true, collapsed, hasChip });
+      holdFoldText(ref, text);
+      const label = `已折叠 ${formatFoldSize(utf8Bytes(text))}`;
+      const reference = {
+        source: "folded-text",
+        ref,
+        label,
+        appearance: "file",
+        clipboardText: label,
+      };
+      const chipFootprint = label;
+      let lastSpan = null;
+      let lastLive = null;
+      let applied = false;
+      for (let attempt = 0; attempt < 8 && !applied; attempt += 1) {
+        const live = shell.state !== undefined ? shell.state.getSnapshot() : undefined;
+        if (live === undefined || typeof live.draftRev !== "number") break;
+        lastLive = live;
+        lastSpan = foldSpanFor(shell, live);
+        if (lastSpan === null) break;
+        try {
+          applied = shell.insertReference(reference, lastSpan) === true;
+        } catch (error) {
+          diag({ foldChipInserted: false, foldChipReason: String(error && error.message) });
+          releaseFoldText(ref);
+          return false;
+        }
+        if (!applied && attempt < 7) {
+          const waited = await settleTurn();
+          if (!waited) break;
+        }
+      }
+      if (!applied) {
+        releaseFoldText(ref);
+        diag({
+          foldChipInserted: false,
+          foldChipReason: "refused",
+          foldRefuseSentRev: lastSpan === null ? undefined : lastSpan.draftRev,
+          foldRefuseLiveRev: lastLive === null ? undefined : lastLive.draftRev,
+          foldRefusePhase: lastLive === null ? undefined : lastLive.phase,
+          foldRefuseSentEnd: lastSpan === null ? undefined : lastSpan.end,
+          foldRefuseLiveDraftLen: lastLive === null || typeof lastLive.draft !== "string" ? undefined : lastLive.draft.length,
+        });
         return false;
       }
-      if (collapsed) card.setAttribute(FOLD_ATTR, "");
-      else card.removeAttribute(FOLD_ATTR);
-      const chip = hasChip === undefined ? collapsed === true : hasChip === true;
-      if (chip) card.setAttribute(CHIP_ATTR, "");
-      else card.removeAttribute(CHIP_ATTR);
-      diag({ applyFoldToCardOk: true, collapsed, hasChip });
-      return true;
+      diag({
+        foldChipInserted: true,
+        foldChipHeldBytes: utf8Bytes(text),
+        foldChipFootprint: chipFootprint,
+        foldAfterInsertDraftShape: shell.state === undefined ? undefined : describeDraft(shell.state.getSnapshot().draft),
+      });
+      return chipFootprint;
     }
 
     /**
@@ -709,97 +798,100 @@ window.__ModuleLoader__.load({
       if (verdict.action === "inline") return "inline";
       if (verdict.action === "fold") {
         if (sessionId !== undefined) {
-          // The record is the WHOLE fold state, and writing it is the only side effect.
-          //
-          // Nothing here touches the editor. That is the point of this design: an
-          // earlier version replaced the draft with a `ReferenceChipNode` so the
-          // composer would show a chip, and every bug in it came from that mutation --
-          // the revision CAS, the detect-vs-clipboard span coordinates, the atomic
-          // node orphaned without a record, and a repeat paste whose whole-draft span
-          // swallowed the previous chip. The text now simply STAYS in the editor and is
-          // hidden with CSS, so there is no editor state to get wrong. Typing, the
-          // caret, undo, and repeated pastes all behave exactly as they do without
-          // this plugin, which is the requirement.
-          //
-          // Sending is unaffected: stock serializes `fx.draft` as a `text` block, and CSS
-          // is presentation only -- so the message body is the pasted text verbatim,
-          // while the composer shows a clamped, chipped appearance.
-          //
-          // The ref must be unique per fold: several folds can measure the same byte
-          // count, so a ref built from bytes alone would collide and make two records
-          // indistinguishable.
-          // A bare timestamp is NOT a sufficient identity: two pastes can land in the same
-          // millisecond, which made two folds share a ref -- so the second fold was
-          // indistinguishable from the first and its chip never appeared. A monotonic
-          // counter is mixed in so identity never depends on clock resolution.
-          foldRefSeq += 1;
-          const chipRef = `${sessionId}:${verdict.bytes}:${Date.now().toString(36)}:${foldRefSeq.toString(36)}`;
-          // `sentinels` are the substrings whose presence in the draft means this fold is
-          // still live. Both the measured run and the whole draft are registered, because
-          // the two can differ: the run is a fragment when the paste replaced similar
-          // text, and the draft is the safer signal when the editor normalized the
-          // insertion on the way in. A LIST rather than one best guess is what makes the
-          // record's lifetime robust to either case.
-          const candidateSentinels = candidate === current ? [current] : [candidate, current];
-          // Prefer the text the user actually pasted (captured on beforeinput/paste),
-          // then the located diff, and only fall back to the measurement.
-          const foldText =
+          const sentinels = candidate === current ? [current] : [candidate, current];
+          const excision =
             recorded !== null && recorded !== undefined && typeof recorded.text === "string" && recorded.text !== ""
               ? recorded.text
               : typeof removable === "string" && removable !== "" && removable !== current
                 ? removable
-                : typeof run === "string" && run !== null && run !== "" && run !== current
-                  ? run
+                : current === candidate && previous !== ""
+                  ? (insertedRun(previous, current) ?? candidate)
                   : candidate;
-          // The record is a LIST per session, because the user can paste several large
-          // runs into one composer and each earns its own chip. Collapsing them into one
-          // record was why a repeat paste replaced the previous fold instead of joining it.
-          const existing = foldStore.getSnapshot()[sessionId];
-          const folds = Array.isArray(existing && existing.folds) ? existing.folds.slice() : [];
-          folds.push({
-            ref: chipRef,
-            bytes: verdict.bytes,
-            lines: countLines(candidate),
-            sentinels: candidateSentinels,
-            // The exact text this chip's x removes from the composer. It is a genuine
-            // substring of the draft, which is what keeps x from deleting unrelated text.
-            text: foldText,
-          });
+          foldRefSeq += 1;
+          const chipRef = `${sessionId}:${verdict.bytes}:${Date.now().toString(36)}:${foldRefSeq.toString(36)}`;
+          const chipWanted = recorded !== null && recorded !== undefined && typeof recorded.text === "string" && recorded.text !== "" ? recorded.text : excision;
+          // Write the record FIRST, unconditionally. The chip insertion is deferred
+          // (it runs async after the editor's update commits), so the clamp must be
+          // correct from this instant.
           foldStore.set(sessionId, {
-            // Kept for the clamp and for older readers: the LAST fold's numbers.
             bytes: verdict.bytes,
             lines: countLines(candidate),
-            sentinels: candidateSentinels,
-            text: foldText,
+            sentinels,
+            text: excision,
             chipRef,
             chipInserted: false,
-            folds,
           });
+          // Raise a HOLD now, before the insertion. The chip replaces the draft with a
+          // lone U+FFFC, which no longer contains the sentinels, so the watcher would
+          // immediately retire the record without this guard.
+          if (holdStore !== undefined && holdStore !== null && typeof holdStore.set === "function") {
+            holdStore.set(sessionId, chipWanted);
+          }
+          // Defer the chip insertion out of the current editor update to avoid Lexical
+          // error #337 ("no active editor").
+          if (shell !== undefined && shell !== null) {
+            const settle = async () => {
+              const liveNow = foldStore.getSnapshot()[sessionId];
+              if (liveNow === undefined || liveNow === null || liveNow.chipRef !== chipRef) {
+                if (holdStore !== undefined && holdStore !== null && typeof holdStore.clear === "function") {
+                  holdStore.clear(sessionId);
+                }
+                diag({ foldChipDeferred: "abandoned", foldAbandonLiveRef: liveNow === null || liveNow === undefined ? undefined : liveNow.chipRef });
+                return;
+              }
+              const chipFootprint = shell.state !== undefined && typeof shell.state.getSnapshot()?.draftRev === "number"
+                ? await insertFoldChip({ shell, text: chipWanted, ref: chipRef })
+                : false;
+              const chipInserted = typeof chipFootprint === "string";
+              const stillLive = foldStore.getSnapshot()[sessionId];
+              if (!chipInserted && (stillLive === undefined || stillLive === null || stillLive.chipRef !== chipRef)) {
+                if (holdStore !== undefined && holdStore !== null && typeof holdStore.clear === "function") {
+                  holdStore.clear(sessionId);
+                }
+                diag({ foldChipDeferred: "abandoned-after-retry" });
+                return;
+              }
+              if (!chipInserted) {
+                if (holdStore !== undefined && holdStore !== null && typeof holdStore.clear === "function") {
+                  holdStore.clear(sessionId);
+                }
+                diag({ foldChipDeferred: "refused" });
+                return;
+              }
+              const live = foldStore.getSnapshot()[sessionId];
+              const reconciled = live !== undefined && live !== null && live.chipRef === chipRef;
+              if (reconciled) {
+                foldStore.set(sessionId, { ...live, sentinels: [chipFootprint], chipInserted: true });
+              } else {
+                foldStore.set(sessionId, {
+                  bytes: verdict.bytes,
+                  lines: countLines(candidate),
+                  sentinels: [chipFootprint],
+                  text: chipWanted,
+                  chipRef,
+                  chipInserted: true,
+                });
+              }
+              diag({
+                foldChipDeferred: "inserted",
+                foldReconcile: reconciled ? "reconciled" : "replaced",
+                foldReconcileLiveRef: live === null || live === undefined ? undefined : live.chipRef,
+                foldReconcileWantRef: chipRef,
+              });
+            };
+            if (typeof queueMicrotask === "function") queueMicrotask(settle);
+            else Promise.resolve().then(settle);
+          }
           diag({
             foldStoredBytes: verdict.bytes,
             foldStoredFromPaste: recorded !== null && recorded !== undefined,
-            foldCount: folds.length,
-            foldStoredTextLen: typeof foldText === "string" ? foldText.length : undefined,
-            foldStoredDraftLen: typeof current === "string" ? current.length : undefined,
+            foldChipPending: shell !== undefined && shell !== null,
+            foldStoredDraftHadChip: typeof current === "string" && current.includes("\uFFFC"),
+            foldStoredChipCount: typeof current === "string" ? (current.match(/\uFFFC/g) ?? []).length : undefined,
+            foldStoredLabelCount: typeof current === "string" ? (current.match(/已折叠 /g) ?? []).length : undefined,
+            foldStoredDraftShape: describeDraft(current),
           });
-          // Set the collapsed attribute directly on the composer card NOW, before this
-          // tick ends. layoutEffect inside PasteFoldChip runs inside a React subtree
-          // that can observe a different sessionId than the watcher, so relying on it
-          // alone has repeatedly left the attribute absent and the text visible — the
-          // "}}}}" the user sees is the literal JSON tail of an un-hidden draft.
-          try {
-            if (typeof document !== "undefined") {
-              const card = document.querySelector("[data-composer-card]");
-              if (card !== null) {
-                card.setAttribute(FOLD_ATTR, "");
-                diag({ foldSetAttributeDirect: true });
-              }
-            }
-          } catch {
-            /* must not break the fold path */
-          }
         }
-
         return "fold";
       }
       if (sessionId === undefined || conversation === undefined || conversation === null || shell === undefined || shell === null) {
@@ -1064,89 +1156,30 @@ window.__ModuleLoader__.load({
       const record = readSessionSlice(usePasteFold, sessionId);
       const expanded = readSessionSlice(useFoldExpanded, sessionId);
       const present = foldApplies(record) || (typeof getHeld === "function" && getHeld(sessionId) !== undefined);
-      // An expanded chip cannot be shown: expanding consumes the fold, so `expanded`
-      // is only ever transiently true mid-click and never true for a mounted chip.
-      // Kept in the visibility test anyway so a stale flag from an older build can
-      // never pin a chip on screen for text that is already back in the composer.
       const collapsed = present && expanded !== true;
-      const anchorRef = React.useRef(null);
-      // ONE toggle for both the chip and the faded band, so "expand" can never mean
-      // "flip a flag" in one place and "write the text back" in another. Expanding
-      // is a real edit (the text is physically out of the editor), which makes that
-      // distinction the difference between restoring the user's paste and losing it.
       const applyToggle = (next) => {
         if (typeof onToggle === "function") onToggle(sessionId, next);
         if (typeof setFoldExpanded === "function") setFoldExpanded(sessionId, next);
       };
-      // Dismiss is its own action, never routed through the toggle: "关闭即删除"
-      // and "展开写回" are opposites, and sharing a callback would make the × a
-      // coin flip between them.
-      // Passes the chip's own ref, so × removes just that paste. A session-level dismiss
-      // would delete every fold at once, which is not what removing one rail item means.
       const applyDismiss = (foldRef) => {
         if (typeof onDismiss === "function") onDismiss(sessionId, foldRef);
       };
 
-      // useLayoutEffect, not useEffect: the attributes must be on the card in the
-      // same commit that reveals the fold, otherwise the first paint shows the
-      // full 40k paste and then snaps shut. Both attributes pass the same value:
-      // the chip and the collapsed clamp now share a lifetime, because expanding
-      // removes the chip.
-      React.useLayoutEffect(() => {
-        diag({ pasteFoldChipFx: true, collapsed, sessionId, recordPresent: record !== undefined && record !== null, expanded });
-        applyFoldToCard(anchorRef.current, collapsed, collapsed);
-      }, [collapsed]);
-
-      // There is deliberately NO click-the-band-to-expand handler any more.
-      //
-      // It existed to make the faded bottom edge of a 60px clamp clickable. At a 0px
-      // clamp there is no band -- but worse, the container's hit area still spanned the
-      // gap between the chip rail and the send row, so a leftover handler would have
-      // swallowed clicks on controls the user can actually see. Expanding is now done
-      // the two ways that remain honest: click the chip, or just start typing (which
-      // the watcher turns into an expand, see reactToDraft).
-      //
-      // Cleanup is separate so it also runs on unmount/teardown, when the session
-      // switches away: leaving the attributes behind would clamp the NEXT session's
-      // composer with nothing painted to explain it, and a stale band would indent
-      // its content for a chip that is not there.
-      React.useEffect(
-        () => () => {
-          applyFoldToCard(anchorRef.current, false, false);
-        },
-        [],
-      );
-
+      // The chip is the ONLY affordance. The ReferenceChipNode sits in the editor
+      // in place of the text, so there is no CSS clamping needed: the text is
+      // physically out of the draft. The overlay chip is a pure preview + actions.
       const label = t === undefined ? (key) => key : t;
       const open = expanded === true;
       // ONE CHIP PER FOLD, like the image rail.
-      //
-      // Reads the fold LIST the watcher records. Several large pastes into one composer
-      // each earn their own chip, which is the multi-paste behaviour the image chip has:
-      // "支持多次粘贴". A single-chip renderer was why a repeat paste looked like nothing
-      // happened.
-      // A record written by an older build has no `folds` list; treat the record itself
-      // as a single fold so such a state still renders a chip instead of nothing.
       const folds = Array.isArray(record && record.folds)
         ? record.folds
         : record !== undefined && record !== null
           ? [record]
           : [];
-      // The collapsed clamp belongs to the card, not to one chip, so it is driven once
-      // from whether ANY fold exists.
       const anyFold = folds.length > 0 || present;
       return React.createElement(
         React.Fragment,
         null,
-        // The zero-size locator. Always rendered, even with no record, because the
-        // effects above need a mounted node to reach the card from (and to clear
-        // the attributes from on teardown).
-        React.createElement("div", {
-          ref: anchorRef,
-          className: "dshps-fold-anchor",
-          "data-paste-spill-anchor": true,
-          "aria-hidden": true,
-        }),
         anyFold
           ? React.createElement(
               "div",
@@ -1259,14 +1292,8 @@ window.__ModuleLoader__.load({
      * @param ctx - client plugin context.
      */
     exports.apply = function apply(ctx) {
-      // Boot marker FIRST, before anything that could throw.
-      //
-      // It used to sit at the end of apply(). When the diagnostics key went missing
-      // while the chip still rendered, that placement made the two possible causes
-      // indistinguishable: "apply never ran" and "apply threw halfway through, after
-      // the slot was registered" both produced no key. Writing it first separates
-      // them, and applyFailures below records the other case explicitly.
       diag({ build: BUILD_REV, applyRanAt: Date.now() });
+      registerFoldSource(ctx);
       const foldStore = createSessionStore();
       // Separate store from the fold record on purpose: "is text folded here" and
       // "has the user opened it up" have different lifetimes. Collapsing must not
@@ -1300,21 +1327,38 @@ window.__ModuleLoader__.load({
        */
       const toggleFold = (sessionId, next) => {
         if (sessionId === undefined || sessionId === null) return;
-        // Expanding and collapsing are now PURELY VISUAL.
-        //
-        // The text never left the composer -- that is the whole design -- so there is
-        // nothing to write back and nothing to restore. Expanding just drops the fold
-        // state so the CSS clamp lifts and the chip unmounts, revealing the text that was
-        // in the editor all along.
-        //
-        // This is what removes the entire class of bug the old expand path had: no
-        // `setDraft`, so no rebuilt editor, no caret to lose, no undo history to reset,
-        // and no placeholder that could survive as an orphan. It also means an expand can
-        // never lose text, because it never moves any.
-        foldStore.clear(sessionId);
+        if (next === true) {
+          // Expand: write the original text BACK into the composer. The chip replaced
+          // the draft with a lone U+FFFC placeholder, so expanding MUST restore the text.
+          const record = foldStore.getSnapshot()[sessionId];
+          const held = record !== undefined && record !== null && typeof record.chipRef === "string" ? foldTextByRef.get(record.chipRef) : undefined;
+          const restore = restoreTextFor({ held, record });
+          if (typeof restore === "string") {
+            const shell = shellOf(ctx, sessionId);
+            const wrote = shell !== null && typeof shell.setDraft === "function";
+            if (wrote) shell.setDraft(restore);
+            if (typeof record.chipRef === "string") releaseFoldText(record.chipRef);
+            diag({
+              foldExpandRestored: wrote,
+              foldExpandSource: typeof held === "string" ? "hold" : "record",
+              foldExpandDraftShape: shell === null || shell.state === undefined ? undefined : describeDraft(shell.state.getSnapshot().draft),
+            });
+          } else {
+            diag({ foldExpandRestored: false, foldExpandSource: "none" });
+          }
+          holdStore.clear(sessionId);
+          expandStore.clear(sessionId);
+          foldStore.clear(sessionId);
+          diag({ manualExpand: "expanded" });
+          return;
+        }
+        // Collapse: re-arm the fold so the chip returns. The text is untouched.
+        const record = foldStore.getSnapshot()[sessionId];
+        const text = record === undefined || record === null ? undefined : record.text;
+        if (typeof text !== "string" || text === "") return;
+        foldStore.set(sessionId, record);
         expandStore.clear(sessionId);
-        holdStore.clear(sessionId);
-        diag({ manualExpand: "expanded", foldExpandRestored: false, foldExpandSource: "text-stayed-in-draft" });
+        diag({ manualCollapse: "collapsed" });
       };
       const setFoldExpanded = (sessionId, next) => {
         if (sessionId === undefined || sessionId === null) return;
@@ -1324,35 +1368,24 @@ window.__ModuleLoader__.load({
       /**
        * The chip's × handler: "关闭即删除" -- the × discards the paste for real.
        *
-       * Deletes the TEXT from the composer, not merely the chip. Display-only folding
-       * means the text is still in the editor while collapsed, so a × that only
-       * unmounted the chip would leave the paste sitting in the input box that the
-       * user just discarded.
+       * Deletes the CHIP placeholder from the composer and releases the held text.
+       * The text is out of the editor (held by the chip node), so dismissing means
+       * clearing the chip's placeholder and releasing the fold.
        */
       const dismissSessionFold = (sessionId, foldRef) => {
         if (sessionId === undefined || sessionId === null) return;
         const record = foldStore.getSnapshot()[sessionId];
-        const all = Array.isArray(record && record.folds)
-          ? record.folds
-          : record !== undefined && record !== null
-            ? [record]
-            : [];
-        // Remove just the named chip. With several pastes in one composer, × on one rail
-        // item must delete only THAT paste -- removing the whole fold state would wipe the
-        // other pastes' text as well.
-        const target = typeof foldRef === "string" ? all.find((f) => f.ref === foldRef) : all[all.length - 1];
-        if (target === undefined || target === null) return;
-        const text = typeof target.text === "string" ? target.text : "";
         const shell = shellOf(ctx, sessionId);
         const outcome = dismissFold({
           sessionId,
           holdStore,
-          // Delete exactly this fold's text from the composer. `removePastedText` refuses a
-          // candidate that is the whole draft with a pre-existing prefix, so a bogus target
-          // degrades to leaving the text rather than clearing everything.
+          // The chip's placeholder ("已折叠 X KB ") is in the editor. Dismiss must
+          // clear it, leaving an empty composer.
           removeText: (current) => {
-            if (text === "") return current;
-            return removePastedText(current, text, "");
+            if (typeof current !== "string" || current === "") return "";
+            // Remove the chip's label footprint.
+            const cleaned = current.replace(/已折叠 [\d.]+ [BK]B /g, "").trim();
+            return cleaned === current ? "" : cleaned;
           },
           writeDraft: (next) => {
             if (shell === null || typeof shell.setDraft !== "function") return false;
@@ -1363,26 +1396,13 @@ window.__ModuleLoader__.load({
             const draft = shell === null ? undefined : shell.state?.getSnapshot()?.draft;
             return typeof draft === "string" ? draft : "";
           },
-          // Drop only this fold from the list; the session's fold state survives for the
-          // other chips.
           clearFold: () => {
-            const remaining = all.filter((f) => f !== target);
-            if (remaining.length === 0) {
-              foldStore.clear(sessionId);
-              expandStore.clear(sessionId);
-              return;
-            }
-            // Keep the convenience fields pointing at the newest surviving fold.
-            const last = remaining[remaining.length - 1];
-            foldStore.set(sessionId, {
-              bytes: last.bytes,
-              lines: last.lines,
-              sentinels: last.sentinels,
-              text: last.text,
-              chipRef: last.ref,
-              chipInserted: false,
-              folds: remaining,
-            });
+            foldStore.clear(sessionId);
+            expandStore.clear(sessionId);
+          },
+          // × is a deletion, so release the held text.
+          releaseChip: () => {
+            if (record !== undefined && record !== null && typeof record.chipRef === "string") releaseFoldText(record.chipRef);
           },
         });
         diag({ foldDismissed: outcome, foldDismissedRef: foldRef, foldRemaining: foldStore.getSnapshot()[sessionId]?.folds?.length ?? 0 });
@@ -1610,35 +1630,17 @@ window.__ModuleLoader__.load({
           // for a pill nobody can see.
           "[data-composer-card] .QiNVUW_chip[title^=\"已折叠 \"]{display:none}" +
           // The chip floats (the overlay anchor is `height:0`), so it cannot occupy
-          // the flow itself. These two rules are a pair: the chip is positioned in
-          // the band, and the card reserves exactly that band as padding. Sizing the
-          // band from the same constants the chip is positioned with is what keeps
-          // the chip from ever painting over the attachments row.
-          "[data-composer-card][" + CHIP_ATTR + "]{padding-top:" + CHIP_BAND_PX + "px}" +
-          // The RAIL: the band that holds one chip per fold, laid out like the image rail
-          // (dsh-client-ui-attachment's rail) -- a wrapping row of items above the editor.
-          // Absolute so it does not disturb the composer's own flow; the card's padding-top
-          // (above) reserves exactly this band, so the chips never paint over the editor.
-          ".dshps-chip-rail{position:absolute;top:" + CHIP_TOP_PX + "px;left:12px;right:12px;" +
+          // the flow itself. The card reserves a band as padding-top.
+          ".dshps-chip-rail{position:absolute;top:8px;left:12px;right:12px;" +
           "display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;z-index:1}" +
-          // Each chip is a rail item: `position:static` so it participates in the wrap
-          // (the old absolute positioning pinned exactly one chip to one spot, which is
-          // why several folds could not be shown at once).
           ".dshps-chip{position:static;" +
-          // Hug the content (a compact chip, like the attachment chip it imitates)
-          // but never extend past the card. `right` stays auto: with both sides
-          // pinned the chip would stretch into a full-width bar.
           "width:fit-content;max-width:calc(100% - 24px);" +
-          "height:" + CHIP_HEIGHT_PX + "px;box-sizing:border-box;" +
-          // Mirrors dsh-client-ui-attachment's chip (GD8l4q_card) so it reads as one
-          // of the composer's own affordances rather than a plugin banner.
+          "height:48px;box-sizing:border-box;" +
           "border:.5px solid var(--dsw-alias-border-l2,#0000001f);" +
           "background:var(--dsw-specific-input-major,transparent);" +
           "border-radius:12px;align-items:center;display:flex;" +
           "text-align:left;font:inherit;color:inherit;overflow:hidden;z-index:1}" +
           ".dshps-chip:hover{border-color:var(--dsw-alias-border-l1,#00000033)}" +
-          // The body is the expand affordance: a flat button filling the chip so the
-          // whole surface (except the × corner) is the click target.
           ".dshps-chip-open{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:10px;" +
           "height:100%;padding:0 4px 0 10px;border:none;background:transparent;font:inherit;" +
           "color:inherit;cursor:pointer;text-align:left}" +
@@ -1646,73 +1648,20 @@ window.__ModuleLoader__.load({
           ".dshps-chip-glyph{flex:none;display:inline-flex;align-items:center;justify-content:center;" +
           "width:24px;height:24px;border-radius:6px;background:var(--dsw-alias-bg-base,#0000000a);" +
           "color:var(--dsw-alias-label-secondary)}" +
-          // Two stacked lines: the content preview on top, the action underneath —
-          // the reference chip's shape. Both single-line, so the fixed height holds.
           ".dshps-chip-body{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px}" +
           ".dshps-chip-preview{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;" +
           "white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:13px;line-height:18px}" +
           ".dshps-chip-action{display:flex;align-items:center;gap:2px;color:var(--dsw-alias-label-tertiary);" +
           "font-size:12px;line-height:16px;white-space:nowrap}" +
           ".dshps-chip-chevron{flex:none;font-size:11px}" +
-          // "关闭即删除": a small circular × in the chip's top-right, like the
-          // reference. Sized and padded to stay a comfortable hit target.
           ".dshps-chip-dismiss{flex:none;display:inline-flex;align-items:center;justify-content:center;" +
           "width:20px;height:20px;margin-right:8px;padding:0;border:none;border-radius:999px;" +
           "background:var(--dsw-alias-label-primary,#000);color:var(--dsw-alias-bg-base,#fff);" +
           "font-size:13px;line-height:1;cursor:pointer;opacity:.85}" +
           ".dshps-chip-dismiss:hover{opacity:1}" +
           ".dshps-chip-dismiss:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}" +
-          // The anchor itself must occupy no space and never intercept a click; it
-          // exists only to locate the composer card from inside it.
-          ".dshps-fold-anchor{height:0;width:0;pointer-events:none}" +
-          // The sidecar file card is HIDDEN, not dropped: the user wants the chip
-          // alone ("不需要下部分的文件，只保留上部分内容"), but the attachment is
-          // what carries the text into a submission made from the emptied composer,
-          // so removing it would send nothing.
-          //
-          // Matched by the card's own `title` attribute, which stock sets to the
-          // file NAME, and scoped inside `[data-composer-card]` so the rule cannot
-          // reach a same-named element elsewhere. The prefix is ours alone
-          // (`pasted-text-`), so a user's genuine attachments are untouched --
-          // `display:none` rather than `visibility` so the card takes no space and
-          // leaves no gap where it used to sit.
-          // Collapsed editor: the pasted text STAYS in the editor (that is how it reaches
-          // the turn verbatim), and this is what hides it. The box is clamped to ONE line
-          // and its text is made transparent, so it reads as EMPTY -- the same shape as a
-          // composer holding an image attachment -- while remaining clickable and typeable.
-          //
-          // This replaces BOTH earlier hides:
-          //   * the 60px + 30px fade build actually painted the first ~2 lines, reported
-          //     as text showing in the box ("输入框出现文本");
-          //   * the `max-height:0` build removed the box's hit area entirely, reported as
-          //     "无法输入".
-          // One line with transparent text has neither failure: no text is painted, and
-          // there is still a caret and a click target.
-          //
-          // `color:transparent` hides the glyphs but keeps the layout, so the contenteditable
-          // stays focusable and the caret can enter. `caret-color` must be set explicitly,
-          // because a caret inherits `currentColor` and would otherwise be transparent too
-          // (an invisible caret reads as "the box does not respond"). The value is the
-          // theme's primary label colour so the caret looks exactly like the unfurled box's.
-          //
-          // `overflow:hidden` clips BOTH axes. Stock's `.p_FcLG_scroll` sets
-          // `overflow-y:auto`, leaving the X axis visible -- enough for an unbreakable
-          // token to paint a sliver outside the clamped box.
-          //
-          // `pointer-events:none` is deliberately ABSENT: the box must stay clickable to
-          // focus the editor, which is the whole point of the one-line clamp.
-          //
-          // This must apply while the chip is present. An earlier version gated it
-          // `:not([data-dshps-chip])`, which was right when a chip meant the editor had
-          // been EMPTIED: clamping an empty editor would only squeeze the chip's band.
-          // But the text is now never removed, so every fold has a chip AND text, and
-          // that guard suppressed the clamp on exactly the case it was needed for --
-          // leaving the whole paste visible and copyable from the text box.
-          "[data-composer-card][" + FOLD_ATTR + "] " + SCROLL_SELECTOR + "{" +
-          "max-height:" + FOLD_CLAMP_PX + "px;" +
-          "overflow:hidden;" +
-          "color:transparent;" +
-          "caret-color:var(--dsw-alias-label-primary,#000)}"
+          // The card reserves a band for the floating chip rail.
+          "[data-composer-card][data-dshps-chip]{padding-top:60px}"
         document.head.appendChild(tag);
         return () => tag.remove();
       }, "dsh-paste-spill: styles");
@@ -1794,9 +1743,6 @@ window.__ModuleLoader__.load({
       foldPreview,
       foldPreviewOf,
       readSessionSlice,
-      applyFoldToCard,
-      FOLD_ATTR,
-      CHIP_ATTR,
       createSessionStore,
       insertedRun,
       measurableText,
@@ -1807,6 +1753,12 @@ window.__ModuleLoader__.load({
       reactToDraft,
       watchDraft,
       PasteFoldChip,
+      holdFoldText,
+      releaseFoldText,
+      foldSpanFor,
+      insertFoldChip,
+      registerFoldSource,
+      __foldTextByRef: foldTextByRef,
     };
     return module.exports;
   },

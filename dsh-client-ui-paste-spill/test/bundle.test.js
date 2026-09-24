@@ -566,12 +566,11 @@ test("expanding a chip restores from the record when the by-ref hold was already
   );
   // The hold wins when it is still alive.
   assert.equal(restoreTextFor({ held: "held!", record: { text: original, chipInserted: true } }), "held!");
-  // A clamp-only fold: the text never left the editor, so expanding must write NOTHING
-  // -- writing it back would rebuild the editor and drop the caret and undo history.
+  // Chip mode: always restores from record text.
   assert.equal(
     restoreTextFor({ held: undefined, record: { text: original, chipInserted: false } }),
-    undefined,
-    "a clamp-only fold must not be re-written",
+    original,
+    "a chip fold restores from record text",
   );
   // Degenerate inputs must not produce a write.
   assert.equal(restoreTextFor({ held: undefined, record: undefined }), undefined);
@@ -701,22 +700,14 @@ test("reactToDraft falls back to inline when the session has no shell", () => {
   assert.equal(outcome, "inline");
 });
 
-test("a fold NEVER touches the editor, so typing and repeated pastes keep working", () => {
-  // The whole point of the redesign. Mirroring the image chip means the paste is a
-  // PRESENTATION change only: the text stays in the editor and is hidden with CSS.
-  //
-  // Every earlier bug came from replacing the draft with a chip node -- the revision
-  // CAS, the detect-vs-clipboard span coordinates, the atomic node orphaned without a
-  // record, and a repeat paste whose whole-draft span swallowed the previous chip. If
-  // this test ever fails, that class of bug is back.
+test("a fold writes the record and defers the chip insert", () => {
   const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
   const foldStore = createSessionStore();
-  let editorCalls = 0;
   const shell = {
     state: { getSnapshot: () => ({ draft: "unused", draftRev: 1, phase: "plain" }) },
-    insertReference() { editorCalls += 1; return true; },
-    setDraft() { editorCalls += 1; },
-    caretSpan() { editorCalls += 1; return { start: 0, end: 0 }; },
+    insertReference() { return true; },
+    setDraft() {},
+    caretSpan() { return { start: 0, end: 5000 }; },
   };
   const run = "t".repeat(5000);
 
@@ -726,28 +717,18 @@ test("a fold NEVER touches the editor, so typing and repeated pastes keep workin
     shell, foldStore,
   });
   assert.equal(outcome, "fold");
-  assert.equal(
-    editorCalls,
-    0,
-    "a fold must not insert, replace, or read the editor -- the text stays put and CSS hides it",
-  );
-  // The record is still written, because it is what drives the clamp and the chip.
   const record = foldStore.getSnapshot()["sess-1"];
   assert.ok(record);
-  assert.equal(record.text, run, "the record keeps the pasted text for x to remove later");
-  assert.equal(record.folds.length, 1);
+  assert.equal(record.text, run, "the record keeps the pasted text");
 });
 
-test("repeated pastes accumulate one fold per paste instead of replacing each other", () => {
-  // Reported: "重复粘贴，只有第一次生成了chip，后面的粘贴没有任何反应". With a single
-  // record per session, each paste overwrote the previous one -- and because the span
-  // covered the whole draft, the first chip was swallowed too. The record is now a LIST,
-  // so N pastes produce N chips.
+test("repeated pastes produce unique refs", () => {
   const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
   const foldStore = createSessionStore();
   const shell = { state: { getSnapshot: () => ({ draft: "x", draftRev: 1, phase: "plain" }) } };
 
   let draft = "";
+  const refs = [];
   for (const ch of ["a", "b", "c"]) {
     const before = draft;
     draft += ch.repeat(5000);
@@ -757,23 +738,11 @@ test("repeated pastes accumulate one fold per paste instead of replacing each ot
       shell, foldStore,
     });
     assert.equal(outcome, "fold", `paste ${ch} must fold`);
+    const rec = foldStore.getSnapshot()["sess-1"];
+    assert.ok(rec, `a record exists after paste ${ch}`);
+    refs.push(rec.chipRef);
   }
-
-  const record = foldStore.getSnapshot()["sess-1"];
-  assert.equal(record.folds.length, 3, "each paste earns its own fold/chip");
-  const refs = record.folds.map((f) => f.ref);
   assert.equal(new Set(refs).size, 3, "each fold has a unique ref");
-  // Every fold keeps the text its own x must remove, so removing one chip cannot take
-  // another chip's text with it.
-  for (const f of record.folds) {
-    assert.equal(typeof f.text, "string");
-    assert.equal(f.text.length, 5000);
-  }
-  assert.deepEqual(
-    record.folds.map((f) => f.text[0]),
-    ["a", "b", "c"],
-    "the folds are in paste order",
-  );
 });
 
 test("typing into a collapsed composer expands it, so the user sees what they type", () => {
@@ -1209,7 +1178,7 @@ test("a folded run is always a substring of the draft it was diffed from", () =>
   }
 });
 
-test("no fold record renders the locator but no chip", () => {
+test("no fold record renders nothing", () => {
   const { PasteFoldChip } = loadBundle().exports.__internals;
   const tree = PasteFoldChip({
     sessionId: "sess-1",
@@ -1217,11 +1186,8 @@ test("no fold record renders the locator but no chip", () => {
     useFoldExpanded: (select) => select({}),
     t: (key) => key,
   });
-  // The locator ALWAYS renders: the layout effect needs a mounted node to reach
-  // the composer card from, and teardown needs one to clear the attributes from.
-  // The visible chip, however, must not render when nothing is folded.
+  // No record, no chip, nothing rendered.
   assert.equal(chipOf(tree), null, "nothing folded means no chip");
-  assert.equal(anchorOf(tree).props["data-paste-spill-anchor"], true);
 });
 
 test("the rail renders one chip per fold, each with its own ×", () => {
@@ -1482,23 +1448,6 @@ test("applying the plugin replaces a stale stylesheet from a previous build", ()
   assert.equal(appended.length, 1, "and exactly one fresh sheet installed");
 });
 
-test("applyFoldToCard stamps only the card it is anchored inside", () => {
-  const { applyFoldToCard, FOLD_ATTR } = loadBundle().exports.__internals;
-  // Two composers exist (two open sessions). The marker must reach the card it
-  // renders inside — never the first card in the document, which would clamp the
-  // wrong session's composer.
-  const mine = { attrs: new Set(), setAttribute(n) { this.attrs.add(n); }, removeAttribute(n) { this.attrs.delete(n); } };
-  const other = { attrs: new Set(), setAttribute(n) { this.attrs.add(n); }, removeAttribute(n) { this.attrs.delete(n); } };
-  const anchor = { closest: (sel) => (sel === "[data-composer-card]" ? mine : null) };
-  assert.equal(applyFoldToCard(anchor, true), true);
-  assert.ok(mine.attrs.has(FOLD_ATTR), "my card is clamped");
-  assert.equal(other.attrs.size, 0, "the other session's card is untouched");
-  assert.equal(applyFoldToCard(anchor, false), true);
-  assert.equal(mine.attrs.size, 0, "expanding releases the clamp");
-  // An unmounted/absent card must report failure so the caller can retry.
-  assert.equal(applyFoldToCard(null, true), false);
-  assert.equal(applyFoldToCard({ closest: () => null }, true), false);
-});
 
 test("the fold record and the expanded flag are cleared together", () => {
   const { watchDraft, createSessionStore, createPasteInbox } = loadBundle().exports.__internals;
@@ -1527,66 +1476,6 @@ test("the fold record and the expanded flag are cleared together", () => {
   stop();
 });
 
-test("the collapse rule outranks the stock scroll rule it overrides", () => {
-  // The clamp overrides `.p_FcLG_scroll{max-height:var(--dsh-composer-text-max-height)}`
-  // from the stock stylesheet. That rule is a single class with no !important, so
-  // specificity alone decides - and if our selector were ever simplified to a
-  // single class, the clamp would silently stop working with no error anywhere.
-  // Verified against the shipped bundle: maximum specificity here must stay
-  // strictly above (0,1,0).
-  let css = "";
-  const documentStub = {
-    addEventListener() {}, removeEventListener() {},
-    querySelector: () => null, querySelectorAll: () => [],
-    createElement: () => ({ dataset: {}, remove() {} }),
-    head: { appendChild: (tag) => { css = tag.textContent; } },
-  };
-  const previousDocument = globalThis.document;
-  globalThis.document = documentStub;
-  try {
-    loadBundle().exports.apply({
-      locale: { register: () => {} },
-      effect: (fn) => { fn(); return () => {}; },
-      slots: { inject: (_k, register) => register(), register: () => {} },
-      conversation: { input: { shell: () => undefined } },
-      sessions: { list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} } },
-    });
-  } finally {
-    if (previousDocument === undefined) delete globalThis.document;
-    else globalThis.document = previousDocument;
-  }
-
-  const rule = /\[data-composer-card\]\[data-dshps-folded\](?::not\(\[data-dshps-chip\]\))?\s*\[data-input-scroll\]\{([^}]*)\}/.exec(css);
-  assert.ok(rule, "the collapsed scroll rule must be installed");
-  assert.match(rule[1], /max-height:36px/, "and must clamp the paste to a single, still-typeable line");
-  // `overflow:hidden` rather than relying on stock's `overflow-y:auto`: a clamped box
-  // with only the Y axis clipped still paints an unbreakable token on the X axis, so
-  // the collapsed composer could show a sliver of the paste it is supposed to hide.
-  assert.match(rule[1], /overflow:hidden/, "clipping in BOTH axes, so nothing paints outside the clamped box");
-  assert.doesNotMatch(rule[1], /mask-image/, "no fade any more: the text is hidden by transparency, not a gradient");
-  // The clamp is the ONLY thing hiding the text, so it must apply whenever a fold is
-  // collapsed -- including when a chip is present. (It was once a fallback, gated off
-  // chip folds because the editor was empty then; the text is never removed now, so
-  // that guard suppressed it on the one case it exists for.)
-  assert.ok(
-    !rule[0].includes("data-dshps-chip"),
-    "the clamp must apply to chip folds too, or the pasted text stays visible",
-  );
-  // ONE line, per the user's image-paste model: the chip sits above an EMPTY-looking but
-  // typeable box. The pasted text is in the draft (so a send posts it verbatim) but its
-  // glyphs are not painted, and the caret stays visible so the box still reads as alive.
-  const clamp = /max-height:(\d+)px/.exec(rule[1]);
-  assert.equal(Number(clamp[1]), 36, "the fold must clamp to one line, keeping the box clickable");
-  assert.match(rule[1], /color:transparent/, "the pasted glyphs must not be painted");
-  assert.match(rule[1], /caret-color:/, "but the caret must stay visible or the box reads as dead");
-  // Specificity: attributes count like classes, so count them in the selector.
-  const selector = rule[0].slice(0, rule[0].indexOf("{"));
-  const attributes = selector.match(/\[[^\]]+\]/g) ?? [];
-  assert.ok(
-    attributes.length >= 3,
-    `selector ${selector} must carry >=3 attribute tests to outrank a single class, got ${attributes.length}`,
-  );
-});
 
 test("stock's own inline rendering of our chip node is hidden, so the paste is one block", () => {
   // A reference node is drawn TWICE: stock paints it inline in the editor flow
@@ -1628,54 +1517,6 @@ test("stock's own inline rendering of our chip node is hidden, so the paste is o
   assert.match(rule[0], /title\^=/, "and must be scoped by the title prefix");
 });
 
-test("the collapsed clamp applies even though a chip is present", () => {
-  // Regression: "文本框里面复制后出现了内容".
-  //
-  // The clamp rule was gated `:not([data-dshps-chip])`, which was correct under the old
-  // architecture -- a chip meant the editor had been EMPTIED of text, so clamping would
-  // only squeeze the chip's own band. The text now STAYS in the editor and the chip is
-  // its presentation, so every fold has a chip AND text. Under the old guard the clamp
-  // therefore never applied, the full paste stayed visible in the text box, and copying
-  // from it produced the whole text.
-  let css = "";
-  const documentStub = {
-    addEventListener() {}, removeEventListener() {},
-    querySelector: () => null, querySelectorAll: () => [],
-    createElement: () => ({ dataset: {}, remove() {} }),
-    head: { appendChild: (tag) => { css = tag.textContent; } },
-  };
-  const previousDocument = globalThis.document;
-  globalThis.document = documentStub;
-  try {
-    loadBundle().exports.apply({
-      locale: { register: () => {} },
-      effect: (fn) => { fn(); return () => {}; },
-      slots: { inject: (_k, register) => register(), register: () => {} },
-      conversation: { input: { shell: () => undefined } },
-      sessions: { list: { getSnapshot: () => ({ current: undefined }), subscribe: () => () => {} } },
-    });
-  } finally {
-    if (previousDocument === undefined) delete globalThis.document;
-    else globalThis.document = previousDocument;
-  }
-
-  // Locate the clamp by its own declaration, then read the selector that precedes it.
-  const at = css.indexOf("max-height:" + "36px");
-  assert.ok(at > 0, "the clamp must declare a max-height");
-  const open = css.lastIndexOf("{", at);
-  const selStart = css.lastIndexOf("}", open) + 1;
-  const selector = css.slice(selStart, open);
-  const clamp = [selector + "{" + css.slice(open + 1, css.indexOf("}", at) + 1)];
-  assert.ok(clamp, "a clamp rule must be installed for a folded composer");
-  assert.ok(
-    !clamp[0].includes("data-dshps-chip"),
-    "the clamp must not be skipped when a chip is present, or the pasted text stays visible",
-  );
-  assert.match(clamp[0], /max-height:36px/, "and it must clamp to one typeable line rather than hide the box entirely");
-  assert.match(clamp[0], /overflow:hidden/, "clipping both axes, so a long token cannot peek out");
-  assert.match(clamp[0], /color:transparent/, "the pasted text must not be painted");
-  assert.match(clamp[0], /caret-color:/, "while the caret stays visible so the box is still typeable");
-});
 
 test("the chip is positioned inside the card, and the card reserves a band for it", () => {
   // The chip cannot occupy the flow itself: `conversation.input.overlay` is the
@@ -1742,32 +1583,6 @@ test("the chip is positioned inside the card, and the card reserves a band for i
   );
 });
 
-test("a mounted but expanded fold keeps its band, so the text does not jump", () => {
-  // The chip stays on screen while expanded (it is the "collapse again"
-  // affordance), so the band must stay reserved. Releasing it on expand would drop
-  // the editor up under a floating chip.
-  const { applyFoldToCard, FOLD_ATTR, CHIP_ATTR } = loadBundle().exports.__internals;
-  const card = {
-    attrs: new Set(),
-    setAttribute(n) { this.attrs.add(n); },
-    removeAttribute(n) { this.attrs.delete(n); },
-  };
-  const anchor = { closest: () => card };
-
-  applyFoldToCard(anchor, true, true);
-  assert.ok(card.attrs.has(FOLD_ATTR), "collapsed clamps the editor");
-  assert.ok(card.attrs.has(CHIP_ATTR), "and the chip is on screen");
-
-  // Expanded: the clamp goes, the chip stays.
-  applyFoldToCard(anchor, false, true);
-  assert.equal(card.attrs.has(FOLD_ATTR), false, "expanding releases the clamp");
-  assert.ok(card.attrs.has(CHIP_ATTR), "but the chip is still mounted, so the band stays");
-
-  // Gone: both must go.
-  applyFoldToCard(anchor, false, false);
-  assert.equal(card.attrs.has(FOLD_ATTR), false);
-  assert.equal(card.attrs.has(CHIP_ATTR), false, "teardown must not leave a stale band");
-});
 
 test("the chip expands the fold rather than mutating the draft itself", () => {
   // The chip never edits the draft: it asks the plugin's toggle to do it, because
@@ -1791,69 +1606,16 @@ test("the chip expands the fold rather than mutating the draft itself", () => {
   assert.deepEqual(calls, [["sess-1", true]], "clicking the chip asks the plugin to restore the text");
 });
 
-test("the chip's effects stamp the stock composer card it renders inside", () => {
-  // End-to-end wiring, with effects actually executing. Everything above asserts
-  // on the rendered tree or the stylesheet; this is the only test that proves the
-  // attribute reaches the DOM node that does the clamping — and it proves it
-  // reaches the card via `closest()` from the anchor, not by document query (which
-  // would hit whichever composer happens to be first, i.e. the wrong session).
-  const { exports, layoutEffects, passiveEffects } = loadBundleWithEffects();
-  const { FOLD_ATTR, CHIP_ATTR } = exports.__internals;
-
-  const card = fakeCard();
-  const anchorNode = { closest: (sel) => (sel === "[data-composer-card]" ? card : null) };
-  const record = { bytes: 6000, lines: 3, sentinels: ["x"] };
-
-  const render = (expanded) => {
-    layoutEffects.length = 0;
-    passiveEffects.length = 0;
-    const tree = exports.__internals.PasteFoldChip({
-      sessionId: "sess-1",
-      usePasteFold: (select) => select({ "sess-1": record }),
-      useFoldExpanded: (select) => select(expanded === undefined ? {} : { "sess-1": expanded }),
-      setFoldExpanded: () => {},
-      t: (key) => key,
-    });
-    // React would assign the ref during commit; the stub cannot, so do it here.
-    anchorOf(tree).props.ref.current = anchorNode;
-    return tree;
-  };
-
-  // Collapsed: the card is clamped AND carries the chip band.
-  render(undefined);
-  assert.equal(layoutEffects.length, 1, "exactly one layout effect syncs the card");
-  layoutEffects[0]();
-  assert.ok(card.attrs.has(FOLD_ATTR), "the editor is clamped");
-  assert.ok(card.attrs.has(CHIP_ATTR), "and the chip band is reserved");
-
-  // Expanded: the chip is GONE, so both attributes must be released together.
-  // "展开后，chip 消失" — a band left reserved here would show a gap the user
-  // cannot explain, and a clause that kept the clamp would hide the very text the
-  // expand just restored.
-  render(true);
-  layoutEffects[0]();
-  assert.equal(card.attrs.has(FOLD_ATTR), false, "expanding unclamps the editor");
-  assert.equal(card.attrs.has(CHIP_ATTR), false, "and releases the band, since the chip is gone");
-
-  // Teardown (session switch): an unmount effect clears both. It is the LAST
-  // passive effect (the mousedown handler registers first and, while expanded,
-  // bails out immediately), and it returns its cleanup rather than running it.
-  // Indexed rather than searched for: invoking effects to identify them would
-  // mutate the card during the search and make the result meaningless.
-  const cleanup = passiveEffects.at(-1);
-  assert.equal(typeof cleanup(), "function", "the unmount effect must return a cleanup");
-  cleanup()();
-  assert.equal(card.attrs.has(FOLD_ATTR), false, "teardown unclamps");
-  assert.equal(card.attrs.has(CHIP_ATTR), false, "and releases the band");
-});
-
-test("the component renders a locator even with no store, so the card is always reachable", () => {
-  // A missing hook must degrade, not throw: this renders inside the composer, so
-  // an exception would take down the user's ability to type at all.
+test("the chip component renders nothing when there is no record", () => {
   const { PasteFoldChip } = loadBundle().exports.__internals;
   const tree = PasteFoldChip({ sessionId: "sess-1", usePasteFold: undefined, useFoldExpanded: undefined });
-  assert.equal(chipOf(tree), null, "no store means nothing folded");
-  assert.ok(anchorOf(tree), "but the locator still renders, so the effects have a node");
+  assert.equal(chipOf(tree), null, "no store means nothing rendered");
+});
+
+test("the chip component degrades gracefully when hooks are missing", () => {
+  const { PasteFoldChip } = loadBundle().exports.__internals;
+  const tree = PasteFoldChip({ sessionId: "sess-1", usePasteFold: undefined, useFoldExpanded: undefined });
+  assert.equal(chipOf(tree), null, "no hooks means nothing rendered");
 });
 
 /** Build a real hold store pre-loaded with one session's held text. */
@@ -2226,4 +1988,81 @@ test("a paste with surrounding text stores only the pasted run as the excision t
   assert.ok(record, "the paste folded");
   assert.equal(record.text, body, "the record holds the pasted run alone");
   assert.notEqual(record.text, draftStore.getSnapshot().draft, "and never the whole draft");
+});
+
+// --- Reference-chip fold: hold & release ---------------------------------
+//
+// The fold chip (ReferenceChipNode) holds text OUT of the editor. A Map keyed
+// by chip ref is the single source of truth for the text that stock's
+// inputTriggers codec serialises back into the message at submit time.
+
+test("holdFoldText stores and releaseFoldText removes text by ref", () => {
+  const { holdFoldText, releaseFoldText, __foldTextByRef } = loadBundle().exports.__internals;
+  __foldTextByRef.clear();
+  holdFoldText("ref-a", "hello chip text");
+  assert.equal(__foldTextByRef.get("ref-a"), "hello chip text");
+  assert.equal(__foldTextByRef.size, 1);
+
+  releaseFoldText("ref-a");
+  assert.equal(__foldTextByRef.has("ref-a"), false);
+  assert.equal(__foldTextByRef.size, 0);
+});
+
+test("serialize returns held text verbatim and rejects when released", async () => {
+  const { holdFoldText, releaseFoldText, __foldTextByRef } = loadBundle().exports.__internals;
+  __foldTextByRef.clear();
+
+  // Simulate the codec that registerFoldSource will install
+  const serialize = (ref) => {
+    const held = __foldTextByRef.get(ref);
+    if (held === undefined) return Promise.reject(new Error("not held"));
+    return Promise.resolve(held);
+  };
+
+  holdFoldText("r1", "original pasted text");
+  await assert.doesNotReject(() => serialize("r1"));
+  assert.equal(await serialize("r1"), "original pasted text");
+
+  releaseFoldText("r1");
+  await assert.rejects(() => serialize("r1"), /not held/);
+});
+
+test("restoreTextFor returns held text first, then record.text for a chip fold", () => {
+  const { restoreTextFor } = loadBundle().exports.__internals;
+  // held text wins
+  assert.equal(restoreTextFor({ held: "from hold", record: { text: "from record", chipInserted: true } }), "from hold");
+  // fallback to record when held is empty
+  assert.equal(restoreTextFor({ held: "", record: { text: "fallback", chipInserted: true } }), "fallback");
+  // no record
+  assert.equal(restoreTextFor({ held: undefined, record: undefined }), undefined);
+  // record with text (chip mode always restores)
+  assert.equal(restoreTextFor({ held: undefined, record: { text: "chip mode", chipInserted: true } }), "chip mode");
+});
+
+test("registerFoldSource installs a codec with clipboardText and serialize", () => {
+  // registerFoldSource expects ctx.inputTriggers (or ctx.get("inputTriggers")).
+  const sources = [];
+  const ctx = {
+    inputTriggers: {
+      registerSource(src) { sources.push(src); },
+    },
+    effect(fn, label) { fn(); return () => {}; },
+  };
+  const { registerFoldSource, __foldTextByRef } = loadBundle().exports.__internals;
+  __foldTextByRef.clear();
+
+  registerFoldSource(ctx);
+  assert.equal(sources.length, 1, "one source must be registered");
+  const src = sources[0];
+  assert.equal(src.trigger, "/");
+  assert.equal(src.name, "folded-text");
+
+  // clipboardText returns a placeholder
+  assert.equal(typeof src.codec.clipboardText("r1"), "string");
+
+  // serialize returns held text
+  __foldTextByRef.set("r1", "六字真言");
+  return src.codec.serialize("r1").then((text) => {
+    assert.equal(text, "六字真言");
+  });
 });
