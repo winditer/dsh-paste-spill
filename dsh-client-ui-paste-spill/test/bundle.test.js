@@ -1477,11 +1477,10 @@ test("the fold record and the expanded flag are cleared together", () => {
 });
 
 
-test("stock's own inline rendering of our chip node is hidden, so the paste is one block", () => {
-  // A reference node is drawn TWICE: stock paints it inline in the editor flow
-  // (`.QiNVUW_chip`, a 22px pill) and we draw the real affordance as a floating
-  // overlay. Left alone the user sees both, which reads as the paste having been
-  // split into two separate blocks. This rule removes stock's copy.
+test("stock's inline chip is kept visible for typeability", () => {
+  // The stock ReferenceChip is NOT hidden. It IS the editable area: the
+  // trailing space after the chip node is where the caret lands and typing
+  // works. Our overlay chip floats above with expand/× affordances only.
   let css = "";
   const documentStub = {
     addEventListener() {}, removeEventListener() {},
@@ -1504,17 +1503,9 @@ test("stock's own inline rendering of our chip node is hidden, so the paste is o
     else globalThis.document = previousDocument;
   }
 
-  const rule = /\[data-composer-card\]\s*\.QiNVUW_chip\[title\^="已折叠 "\]\{([^}]*)\}/.exec(css);
-  assert.ok(rule, "stock's inline chip must be suppressed");
-  // display:none, not visibility:hidden: the node must stop occupying inline space,
-  // or the editor would still reserve a 22px line for an invisible pill.
-  assert.match(rule[1], /display:\s*none/);
-
-  // Scoping matters: stock's chip DOM carries only `title={label}`, so the label is
-  // the only discriminator. Without BOTH the stock class and the title prefix, the
-  // rule would hide the user's own `@file` / image chips too.
-  assert.match(rule[0], /\.QiNVUW_chip/, "must target stock's chip class");
-  assert.match(rule[0], /title\^=/, "and must be scoped by the title prefix");
+  // The hide-stock-chip rule (display:none on .QiNVUW_chip) must NOT exist.
+  const hidden = /display:\s*none.*已折叠|已折叠.*display:\s*none/.test(css);
+  assert.equal(hidden, false, "stock chip must not be hidden — it provides the typeable space");
 });
 
 
