@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "fold-css-4";
+    const BUILD_REV = "fold-css-5";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -670,26 +670,30 @@ window.__ModuleLoader__.load({
       }
       const candidate = measurableText({ recorded, run, previous, current });
       const verdict = candidate === null ? { action: "inline", bytes: 0 } : decidePaste(candidate);
-      // AUTO-EXPAND on any ordinary edit.
+      // AUTO-EXPAND on any genuine edit. Collapsed means the text is hidden, so a
+      // keystroke would land in an invisible box. A live fold plus an "inline" transition
+      // normally means the user is editing, and the fold is retired.
       //
-      // Collapsed now means the text is not painted AT ALL (a 0px clamp), so a keystroke
-      // would otherwise land in an invisible box: the user types and sees nothing. So a
-      // live fold plus a transition that is not itself a new fold means the user is
-      // editing, and the fold is retired -- the text and the caret become visible again,
-      // and the chip unmounts.
+      // HOWEVER: a fold itself is followed by a Lexical normalisation republish that also
+      // arrives as an "inline" transition with the same draft text. Letting that clear the
+      // fold immediately is what caused the "输入框中原文还在" symptom every single build:
+      // the fold record was written and the chip mounted, but the next transition
+      // auto-expanded before the CSS even painted, leaving the text fully visible with a
+      // chip above it and "}}" from the paste's JSON tail plainly visible.
       //
-      // The sentinel check above cannot cover this: its sentinels are substrings, and
-      // typing at the END of the paste leaves them all present, so the fold would stay
-      // collapsed over the character just typed.
-      //
-      // Only a genuine edit counts. A spill-size paste ("file") is handled by its own
-      // layer and its own visible chip, so this deliberately leaves that path alone.
+      // The guard: only auto-expand when this transition actually CHANGED the draft text
+      // compared to what was there when the current fold was recorded. A normalisation
+      // republish leaves the draft byte-identical, so the fold stays.
       if (!held && sessionId !== undefined && verdict.action === "inline") {
         const liveFold = foldStore.getSnapshot()[sessionId];
         if (liveFold !== undefined && liveFold !== null) {
-          foldStore.clear(sessionId);
-          if (expandStore !== undefined && expandStore !== null) expandStore.clear(sessionId);
-          diag({ foldAutoExpanded: true });
+          if (current !== previous) {
+            foldStore.clear(sessionId);
+            if (expandStore !== undefined && expandStore !== null) expandStore.clear(sessionId);
+            diag({ foldAutoExpanded: true });
+          } else {
+            diag({ foldAutoExpandSuppressed: true, reason: "sameText" });
+          }
         }
       }
       if (candidate === null) {

@@ -851,6 +851,36 @@ test("deleting from a collapsed composer expands it rather than editing blind", 
   );
 });
 
+test("a normalisation republish after a fold does NOT auto-expand", () => {
+  // After a fold, Lexical can republish the draft with a new revision but the same
+  // text. The auto-expand block must not treat that as a user edit: `current === previous`,
+  // so the fold survives and the CSS gets to paint.
+  const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
+  const foldStore = createSessionStore();
+  const expandStore = createSessionStore();
+  const body = "x".repeat(6000);
+  const shell = { state: { getSnapshot: () => ({ draft: body, draftRev: 2 }) } };
+  const conversation = { createDrafts() { throw new Error("no upload"); } };
+
+  // First: the fold.
+  reactToDraft({
+    previous: "", current: body, run: body, sessionId: "sess-1",
+    conversation, shell, foldStore, expandStore,
+  });
+  assert.ok(foldStore.getSnapshot()["sess-1"], "the paste folded");
+
+  // Second: a normalisation republish — same text, new revision.
+  const outcome = reactToDraft({
+    previous: body, current: body, run: null, sessionId: "sess-1",
+    conversation, shell, foldStore, expandStore,
+  });
+  assert.equal(outcome, "inline");
+  assert.ok(
+    foldStore.getSnapshot()["sess-1"],
+    "the fold must survive a normalisation republish",
+  );
+});
+
 test("reactToDraft drops the fold record when the draft is cleared", () => {
   const { reactToDraft, createSessionStore } = loadBundle().exports.__internals;
   const foldStore = createSessionStore();
