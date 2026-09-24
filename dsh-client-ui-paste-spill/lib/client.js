@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     /** The composer's contenteditable surface — how we recognize paste targets. */
     const COMPOSER_SELECTOR = "[data-composer-input]";
     /** Bumped by hand so the boot marker identifies the exact build in the GUI. */
-    const BUILD_REV = "fold-css-3";
+    const BUILD_REV = "fold-css-4";
     /** Debug channel. The renderer partition's Local Storage is readable from the
      * host, so this is the only way to get in-app ground truth without a console. */
     const DIAG_KEY = "dsh.paste-spill.diag";
@@ -354,23 +354,25 @@ window.__ModuleLoader__.load({
     const FOLD_ATTR = "data-dshps-folded";
 
     /**
-     * Height of the editor while folded, in px. ZERO, by the user's decision:
+     * Height of the editor while folded, in px — ONE line, not zero.
      *
-     *   "只显示 chip，完全不显示原文" — while collapsed, the chip is the only thing
-     *   on screen and the pasted text is not visible at all.
+     * The user wants the collapsed composer to behave like an image paste: a chip on
+     * top and an EMPTY, still-typeable input box beneath it. A zero-height clamp is
+     * the wrong way to reach that — it removes the box's hit area entirely, so the
+     * caret cannot enter and "无法输入" is the result (the previous build hit exactly
+     * this: `max-height:0` left nothing to click or focus).
      *
-     * This replaces the earlier "露出开头两行" (two visible lines, 60px) design. That
-     * build clamped the editor to 60px with a 30px fade, which really did paint the
-     * first ~2 lines of the paste — reported as "输入框出现文本" once the chip was the
-     * expected appearance. The text must still STAY in the draft (that is how a send
-     * posts it verbatim); it simply must not be painted.
+     * So the box is clamped to ONE line, and the pasted text inside it is hidden with
+     * `color:transparent` (not painted, but still laid out and focusable). The caret
+     * stays visible through `caret-color`, and the box reads as empty — the same shape
+     * as a composer that has just taken an image attachment. The text itself never
+     * leaves the draft, which is what lets a send post it verbatim.
      *
-     * Zero is safe here because nothing in the composer subtree imposes a floor:
-     * `.p_FcLG_scroll` and `.p_FcLG_grow` carry no `min-height`, and the only
-     * `min-height` in the subtree (36px/52px) is on the INNER editable, which a
-     * `max-height:0` + `overflow:hidden` ancestor clips.
+     * One line (36px, the editable's own min-height) is enough for the caret and the
+     * click target, and short enough that the box looks empty rather than a wall of
+     * invisible space.
      */
-    const FOLD_CLAMP_PX = 0;
+    const FOLD_CLAMP_PX = 36;
 
     /** The stock scroll container that the collapsed style clamps. */
     const SCROLL_SELECTOR = "[data-input-scroll]";
@@ -1354,11 +1356,6 @@ window.__ModuleLoader__.load({
               folds: remaining,
             });
           },
-          // × is a deletion, so the held text goes with it. Only for a real chip: a
-          // clamp-only fold never held anything.
-          releaseChip: () => {
-            if (typeof target.ref === "string") releaseFoldText(target.ref);
-          },
         });
         diag({ foldDismissed: outcome, foldDismissedRef: foldRef, foldRemaining: foldStore.getSnapshot()[sessionId]?.folds?.length ?? 0 });
       };
@@ -1652,24 +1649,30 @@ window.__ModuleLoader__.load({
           // `display:none` rather than `visibility` so the card takes no space and
           // leaves no gap where it used to sit.
           // Collapsed editor: the pasted text STAYS in the editor (that is how it reaches
-          // the turn verbatim), and this is what hides it -- clamped to ZERO height, so
-          // the chip is the only thing on screen.
+          // the turn verbatim), and this is what hides it. The box is clamped to ONE line
+          // and its text is made transparent, so it reads as EMPTY -- the same shape as a
+          // composer holding an image attachment -- while remaining clickable and typeable.
           //
-          // There is deliberately no `mask-image` any more. The previous build clamped to
-          // 60px with a 30px fade, which really did paint the first ~2 lines of the paste
-          // and was reported as the text showing up in the input box ("输入框出现文本").
-          // With no visible lines left there is nothing to fade.
+          // This replaces BOTH earlier hides:
+          //   * the 60px + 30px fade build actually painted the first ~2 lines, reported
+          //     as text showing in the box ("输入框出现文本");
+          //   * the `max-height:0` build removed the box's hit area entirely, reported as
+          //     "无法输入".
+          // One line with transparent text has neither failure: no text is painted, and
+          // there is still a caret and a click target.
+          //
+          // `color:transparent` hides the glyphs but keeps the layout, so the contenteditable
+          // stays focusable and the caret can enter. `caret-color` must be set explicitly,
+          // because a caret inherits `currentColor` and would otherwise be transparent too
+          // (an invisible caret reads as "the box does not respond"). The value is the
+          // theme's primary label colour so the caret looks exactly like the unfurled box's.
           //
           // `overflow:hidden` clips BOTH axes. Stock's `.p_FcLG_scroll` sets
           // `overflow-y:auto`, leaving the X axis visible -- enough for an unbreakable
-          // token to paint a sliver outside a 0-height box. It also leaves the collapsed
-          // container a ZERO-height hit area, so it cannot intercept a click meant for
-          // the chip rail or the send row.
+          // token to paint a sliver outside the clamped box.
           //
-          // `pointer-events:none` is NOT needed and is deliberately absent: the text is
-          // still in the document, and stock routes "click the composer to focus it" via
-          // a keepFocus mousedown handler that calls `.focus()` on the editor. Blocking
-          // pointer events here would be an extra, unbudgeted behaviour change.
+          // `pointer-events:none` is deliberately ABSENT: the box must stay clickable to
+          // focus the editor, which is the whole point of the one-line clamp.
           //
           // This must apply while the chip is present. An earlier version gated it
           // `:not([data-dshps-chip])`, which was right when a chip meant the editor had
@@ -1679,7 +1682,9 @@ window.__ModuleLoader__.load({
           // leaving the whole paste visible and copyable from the text box.
           "[data-composer-card][" + FOLD_ATTR + "] " + SCROLL_SELECTOR + "{" +
           "max-height:" + FOLD_CLAMP_PX + "px;" +
-          "overflow:hidden}"
+          "overflow:hidden;" +
+          "color:transparent;" +
+          "caret-color:var(--dsw-alias-label-primary,#000)}"
         document.head.appendChild(tag);
         return () => tag.remove();
       }, "dsh-paste-spill: styles");

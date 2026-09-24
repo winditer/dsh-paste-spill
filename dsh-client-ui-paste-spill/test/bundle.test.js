@@ -1528,12 +1528,12 @@ test("the collapse rule outranks the stock scroll rule it overrides", () => {
 
   const rule = /\[data-composer-card\]\[data-dshps-folded\](?::not\(\[data-dshps-chip\]\))?\s*\[data-input-scroll\]\{([^}]*)\}/.exec(css);
   assert.ok(rule, "the collapsed scroll rule must be installed");
-  assert.match(rule[1], /max-height:0px/, "and must hide the pasted text completely");
-  // `overflow:hidden` rather than relying on stock's `overflow-y:auto`: a 0-height box
+  assert.match(rule[1], /max-height:36px/, "and must clamp the paste to a single, still-typeable line");
+  // `overflow:hidden` rather than relying on stock's `overflow-y:auto`: a clamped box
   // with only the Y axis clipped still paints an unbreakable token on the X axis, so
   // the collapsed composer could show a sliver of the paste it is supposed to hide.
-  assert.match(rule[1], /overflow:hidden/, "clipping in BOTH axes, so nothing paints outside a 0-height box");
-  assert.doesNotMatch(rule[1], /mask-image/, "no fade any more: there are no visible lines left to fade");
+  assert.match(rule[1], /overflow:hidden/, "clipping in BOTH axes, so nothing paints outside the clamped box");
+  assert.doesNotMatch(rule[1], /mask-image/, "no fade any more: the text is hidden by transparency, not a gradient");
   // The clamp is the ONLY thing hiding the text, so it must apply whenever a fold is
   // collapsed -- including when a chip is present. (It was once a fallback, gated off
   // chip folds because the editor was empty then; the text is never removed now, so
@@ -1542,11 +1542,13 @@ test("the collapse rule outranks the stock scroll rule it overrides", () => {
     !rule[0].includes("data-dshps-chip"),
     "the clamp must apply to chip folds too, or the pasted text stays visible",
   );
-  // Zero, per the user's requirement: while collapsed the chip is the ONLY thing on
-  // screen ("收起=只有 chip"). The text must be in the draft (so a send posts it
-  // verbatim) but entirely unpainted.
+  // ONE line, per the user's image-paste model: the chip sits above an EMPTY-looking but
+  // typeable box. The pasted text is in the draft (so a send posts it verbatim) but its
+  // glyphs are not painted, and the caret stays visible so the box still reads as alive.
   const clamp = /max-height:(\d+)px/.exec(rule[1]);
-  assert.equal(Number(clamp[1]), 0, "the fold must hide the paste, leaving the chip alone on screen");
+  assert.equal(Number(clamp[1]), 36, "the fold must clamp to one line, keeping the box clickable");
+  assert.match(rule[1], /color:transparent/, "the pasted glyphs must not be painted");
+  assert.match(rule[1], /caret-color:/, "but the caret must stay visible or the box reads as dead");
   // Specificity: attributes count like classes, so count them in the selector.
   const selector = rule[0].slice(0, rule[0].indexOf("{"));
   const attributes = selector.match(/\[[^\]]+\]/g) ?? [];
@@ -1628,7 +1630,7 @@ test("the collapsed clamp applies even though a chip is present", () => {
   }
 
   // Locate the clamp by its own declaration, then read the selector that precedes it.
-  const at = css.indexOf("max-height:" + "0px");
+  const at = css.indexOf("max-height:" + "36px");
   assert.ok(at > 0, "the clamp must declare a max-height");
   const open = css.lastIndexOf("{", at);
   const selStart = css.lastIndexOf("}", open) + 1;
@@ -1639,8 +1641,10 @@ test("the collapsed clamp applies even though a chip is present", () => {
     !clamp[0].includes("data-dshps-chip"),
     "the clamp must not be skipped when a chip is present, or the pasted text stays visible",
   );
-  assert.match(clamp[0], /max-height:0px/, "and it must hide the text rather than merely shorten it");
+  assert.match(clamp[0], /max-height:36px/, "and it must clamp to one typeable line rather than hide the box entirely");
   assert.match(clamp[0], /overflow:hidden/, "clipping both axes, so a long token cannot peek out");
+  assert.match(clamp[0], /color:transparent/, "the pasted text must not be painted");
+  assert.match(clamp[0], /caret-color:/, "while the caret stays visible so the box is still typeable");
 });
 
 test("the chip is positioned inside the card, and the card reserves a band for it", () => {
@@ -1845,8 +1849,8 @@ function holdWith(sessionId, text) {
 // box, and × to discard it entirely. There is no separate status line above it.
 //
 // "展开" is now purely visual (the text never left the draft), so the chip's click
-// just retires the fold record: the 0px clamp lifts, the text and caret reappear,
-// and the chip unmounts because nothing is folded any more.
+// just retires the fold record: the clamp and the transparency lift, the text and
+// caret reappear, and the chip unmounts because nothing is folded any more.
 
 test("the collapsed chip previews the content instead of a byte/line summary", () => {
   const { PasteFoldChip } = loadBundle().exports.__internals;
@@ -2088,10 +2092,12 @@ function setUpFold({ draft = "", attachments = [] } = {}) {
 // make that true, because both were violated by the earlier sidecar design: the text
 // must stay in the composer, and no attachment may exist at any point.
 //
-// The APPEARANCE itself is now "chip only": the user asked for "只显示 chip，完全不显示
-// 原文", so the collapsed editor is clamped to 0px and the paste is not painted at all.
-// The earlier "露出开头两行" (60px + fade) build is deliberately gone — it really did
-// show the first two lines, which the user reported as text appearing in the input box.
+// The APPEARANCE is "chip over an empty-looking box": the collapsed editor is clamped
+// to ONE line and its text is made transparent, so the paste is not painted while the
+// box stays clickable and typeable (the image-paste model). The earlier "露出开头两行"
+// (60px + fade) build painted the first two lines (reported as text in the box), and a
+// later `max-height:0` build hid the box's hit area entirely (reported as "无法输入");
+// one line + transparency has neither failure.
 
 test("collapsing never touches the draft and never attaches anything", () => {
   const { face, draftStore } = setUpFold();
@@ -2114,6 +2120,29 @@ test("expanding is purely visual: the text was already there and nothing is left
   assert.equal(draftStore.getSnapshot().draft, body, "the full text is still in the composer");
   assert.deepEqual(draftStore.getSnapshot().attachmentIds, [], "no attachment at any point");
   assert.equal(face.hooks.pasteFold.getSnapshot()["s1"], undefined, "and the chip is gone");
+});
+
+test("× on the real chip deletes the text and clears the fold", () => {
+  // This goes through `face.onDismiss` -- the REAL wired handler -- not the stubbed
+  // `dismissFold` helper. A previous build's dismiss called an undefined `releaseFoldText`,
+  // which threw a ReferenceError before it could delete anything; the stub-only tests never
+  // reached that closure, so the bug shipped and "点击×也没有反应" was the result.
+  const { face, draftStore } = setUpFold();
+  const body = "v".repeat(6000);
+  draftStore.setDraft(body);
+
+  const record = face.hooks.pasteFold.getSnapshot()["s1"];
+  assert.ok(record, "the paste folded");
+  const ref = typeof record.chipRef === "string" ? record.chipRef : record.folds[0].ref;
+
+  face.onDismiss("s1", ref);
+
+  assert.equal(
+    draftStore.getSnapshot().draft,
+    "",
+    "× must remove the pasted text from the composer, not just hide the chip",
+  );
+  assert.equal(face.hooks.pasteFold.getSnapshot()["s1"], undefined, "and retire the fold");
 });
 
 test("the send button is disabled after expand-then-delete, so no file chip can be posted", () => {
