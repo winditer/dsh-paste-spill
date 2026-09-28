@@ -37,19 +37,25 @@ The host half watches `agent/inbox/inserted` for those paste files, resolves eac
 
 ## Screenshots
 
-<!-- Reserved slot. Add the images under assets/ (see assets/README.md), uncomment the two
-     lines below, and copy screenshots.json.example to screenshots.json.
+**The fold layer** — a 4–50 KB paste becomes one chip: preview line, `在文本框中显示 ›` to write it back, `×` to delete just that paste.
 
-![dsh-paste-spill plugin preview: a 6 KB paste folded into a chip above the DeepSeek Harness composer](assets/screenshot-1.png)
-![dsh-paste-spill plugin preview: a 60 KB paste attached as a file, with the deliverable card in the turn tail](assets/screenshot-2.png)
+![dsh-paste-spill plugin preview 1: a JSON paste folded into a chip reading { "readings": { "bac… above the DeepSeek Harness composer, with the expand affordance and the delete button](assets/screenshot-1-fold-chip.webp)
 
--->
+**The spill layer** — a ≥ 50 KB paste becomes a real attachment (`pasted-text-173.json`, 59 KB) in the composer, so the model gets a file instead of a wall of text.
 
-No screenshots are committed yet: this section, `assets/README.md` and `screenshots.json.example` are the reserved slot. Adding the two image files and uncommenting the lines above is all it takes — dsh-market resolves a relative `assets/...` path in this README as a GitHub-hosted image.
+![dsh-paste-spill plugin preview 2: a 59 KB JSON paste shown as a pasted-text-173.json attachment chip in the composer, with the send button active](assets/screenshot-2-spill-attachment.webp)
+
+dsh-market shows these on the plugin card and in the detail view; they are declared in [`screenshots.json`](screenshots.json) so their order and selection are curated here rather than guessed from this README.
 
 ## Install
 
-From the DeepSeek Harness CLI, into the **web** profile:
+From the DeepSeek Harness CLI, into the **web** profile — published on npm as [`dsh-paste-spill`](https://www.npmjs.com/package/dsh-paste-spill):
+
+```sh
+dsh plugin --profile web add dsh-paste-spill
+```
+
+Prefer the source? The same package installs straight from GitHub:
 
 ```sh
 dsh plugin --profile web add github:winditer/dsh-paste-spill
@@ -96,6 +102,7 @@ node --test            # 108 tests: host half 17 (helpers 7 + plugin 10), browse
 - [fixtures/](fixtures/) — real paste payloads (3 KB / 6 KB / 60 KB) used by the tests.
 - [scripts/read-leveldb.py](scripts/read-leveldb.py) and [scripts/read-session.mjs](scripts/read-session.mjs) — evidence tools for reading renderer Local Storage and what a session actually submitted, used when no console is available.
 - In-app diagnostics are written to `localStorage["dsh.paste-spill.diag"]` (`bySession.<sessionId>` for the per-session facts). `build` must equal the current `BUILD_REV` and `applyRanAt` must be fresh if a new build is really loaded.
+- Releasing: bump `version` in `package.json`, then `pnpm publish`. The `files` list keeps the tarball to `lib`, `cordis.patch.yml`, both READMEs, `screenshots.json`, `assets` and `LICENSE`; there is no build step, so a published version is exactly the source.
 
 ## Known limitations
 

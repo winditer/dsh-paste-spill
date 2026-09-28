@@ -37,19 +37,25 @@ chip 是编辑器里的真实节点，不是装饰：它注册了一个 `inputTr
 
 ## 截图
 
-<!-- 预留位置。把图片放进 assets/（见 assets/README.md），取消下面两行注释，
-     并把 screenshots.json.example 复制成 screenshots.json。
+**折叠层** —— 4–50 KB 的粘贴变成一枚 chip：预览行、`在文本框中显示 ›`（写回原文）、`×`（只删除这一枚）。
 
-![dsh-paste-spill 效果预览：6 KB 粘贴在 DSH 输入框上方折叠成一枚 chip](assets/screenshot-1.png)
-![dsh-paste-spill 效果预览：60 KB 粘贴转成附件，turn 末尾出现交付卡](assets/screenshot-2.png)
+![dsh-paste-spill 效果预览 1：一段 JSON 粘贴在 DSH 输入框上方折叠成 chip，显示 { "readings": { "bac… 与展开、删除按钮](assets/screenshot-1-fold-chip.webp)
 
--->
+**转文件层** —— ≥ 50 KB 的粘贴变成真附件（`pasted-text-173.json`，59 KB），模型拿到的是文件而不是一大段文字。
 
-目前仓库里还没有真实截图：本节、`assets/README.md` 与 `screenshots.json.example` 就是预留的位置。放入两张图片、取消上面两行注释即可生效——dsh-market 会把本 README 里相对的 `assets/...` 路径解析成 GitHub 图床图片。
+![dsh-paste-spill 效果预览 2：59 KB 的 JSON 粘贴在输入框里显示为 pasted-text-173.json 附件 chip，发送按钮可用](assets/screenshot-2-spill-attachment.webp)
+
+dsh-market 会在插件卡与详情页展示这两张图；它们声明在 [`screenshots.json`](screenshots.json) 里，因此顺序与取舍由本仓库决定，而不是靠市场从 README 猜。
 
 ## 安装
 
-在 DeepSeek Harness CLI 里装进 **web** profile：
+在 DeepSeek Harness CLI 里装进 **web** profile——已发布到 npm：[`dsh-paste-spill`](https://www.npmjs.com/package/dsh-paste-spill)：
+
+```sh
+dsh plugin --profile web add dsh-paste-spill
+```
+
+想从源码装？同一个包也可以直接从 GitHub 安装：
 
 ```sh
 dsh plugin --profile web add github:winditer/dsh-paste-spill
@@ -96,6 +102,7 @@ node --test            # 108 个测试：宿主半 17（helpers 7 + plugin 10）
 - [fixtures/](fixtures/) —— 测试用的真实粘贴样本（3 KB / 6 KB / 60 KB）。
 - [scripts/read-leveldb.py](scripts/read-leveldb.py) 与 [scripts/read-session.mjs](scripts/read-session.mjs) —— 没有 console 时用来看渲染层 Local Storage 和某次会话真正提交了什么的证据工具。
 - 应用内诊断写在 `localStorage["dsh.paste-spill.diag"]`（按会话的事实看 `bySession.<sessionId>`）。确认新构建真的加载了：`build` 必须等于当前 `BUILD_REV`，`applyRanAt` 是刚刚的时间。
+- 发版：改 `package.json` 的 `version`，然后 `pnpm publish`。`files` 白名单让 tarball 只含 `lib`、`cordis.patch.yml`、两份 README、`screenshots.json`、`assets` 与 `LICENSE`；没有构建步骤，所以发出去的版本就是源码本身。
 
 ## 已知限制
 

@@ -1,28 +1,24 @@
-# assets / screenshots — reserved slot
+# assets / screenshots
 
-dsh-market shows App Store-style screenshots on a plugin's detail page. A plugin declares
-them **in its own repository**, in a `screenshots.json` next to `package.json`, listing
-1–8 image paths relative to that file.
+dsh-market shows App Store-style screenshots on a plugin's detail page and card. The plugin
+declares them **in its own repository**, in [`screenshots.json`](../screenshots.json) next to
+`package.json`, listing 1–8 paths relative to that file.
 
-This directory is the reserved slot for those images; nothing is committed yet.
+The two images here are real screenshots of the running plugin on DSH 0.1.7-rc.2:
 
-## To enable screenshots
+| File | What it shows | Layer |
+|---|---|---|
+| `screenshot-1-fold-chip.webp` | A 4–50 KB JSON paste folded into a chip above the composer: preview line, `在文本框中显示 ›`, `×`. | Fold |
+| `screenshot-2-spill-attachment.webp` | A ≥ 50 KB paste shown as a `pasted-text-173.json` (59 KB) attachment chip in the composer. | Spill |
 
-1. Save the images here, using these names:
+## Replacing or adding a screenshot
 
-   | File | What it should show |
-   |---|---|
-   | `screenshot-1.png` | A 4–50 KB paste folded into a chip above the composer (the chip band, preview line, `在文本框中显示 ›`, `×`). |
-   | `screenshot-2.png` | A ≥ 50 KB paste turned into an attachment, with the deliverable card in the turn tail. |
-
-2. Copy the declaration into place:
-
-   ```sh
-   cp screenshots.json.example screenshots.json
-   ```
-
-3. Uncomment the two image lines in the `## Screenshots` section of [`README.md`](../README.md)
-   (and of [`README.zh.md`](../README.zh.md) if you want them there too).
+1. Save the image here (PNG/JPEG/WebP — **SVG is dropped** as a logo/badge shape).
+2. List it in [`screenshots.json`](../screenshots.json). Order is the carousel order; the
+   first image is the card thumbnail. At most 8 entries.
+3. Keep the alt text in the `## Screenshots` section of [`README.md`](../README.md) and
+   [`README.zh.md`](../README.zh.md) pointing at the same file, so GitHub and the market
+   fallback agree.
 
 ## Rules the market enforces
 
@@ -31,10 +27,8 @@ This directory is the reserved slot for those images; nothing is committed yet.
 - Absolute URLs are accepted as well, but must be **https on GitHub hosting**
   (`raw.githubusercontent.com`, `user-images.githubusercontent.com`, `camo.githubusercontent.com`,
   `github.com` attachments). Third-party image hosts are rejected for privacy reasons.
-- **SVG is dropped** (logos/badges), so use PNG/JPEG/WebP.
-- Prefer GitHub's own hosting. Renaming or deleting a file shows up immediately here; a
-  hard-coded third-party URL rots silently.
+- Keep the file names stable: a relative path breaks visibly here, while a hard-coded
+  third-party URL rots silently.
 
-Without `screenshots.json`, dsh-market falls back to extracting images from `README.md` —
-the commented block in the `## Screenshots` section is exactly the markup it looks for, so
-either route works.
+Without `screenshots.json`, dsh-market falls back to extracting images from `README.md`; the
+`## Screenshots` section is written to work either way.
