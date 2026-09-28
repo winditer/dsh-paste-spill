@@ -1,5 +1,8 @@
 # dsh-paste-spill — 设计文档
 
+> **已被现行实现取代（2026-09-28）**：本文写的是"两个独立包 + CSS 钳制"的旧方案。现在是一个包 `dsh-paste-spill`（宿主半 + 浏览器半，一行 patch）、chip 是编辑器里的真实节点、rail 实测高度预留、监听器由 rail 自己安装。以 `README.md` 和 `dsh-paste-spill/` 里的代码为准；本文仅作历史记录。
+
+
 > 日期：2026-09-20
 > 状态：已实施（§0 记录实施期更正；§4.3 记录折叠层的两次形态更正：
 > "仅提示" → "输入框内折叠" → "输入框内的折叠卡片，框外无任何提示"）
@@ -608,3 +611,71 @@ SPEC 主张拆出 `dsh-paste-spill-policy` 承载阈值。但：
 
 1. **无构建步骤**（见 §4.5）：本机没有 esbuild 或任何打包器，`lib/client.js` 手写为工厂包并直接发布，与 `dsh-message-rail` 一致。纯逻辑挂在 `__internals` 上供测试直接断言。
 2. **客户端的两个清单不同源**（见 §4.4）：`package.json` 的 `dsh.client.inject` 是**npm 包名**（加载顺序），而插件自身返回的 `inject` 是**cordis 服务名**（`["slots","conversation","sessions","locale"]`，授权 `ctx.<service>` 访问）。实测 `dsh-client-ui-conversation` 以 `super(ctx, "conversation")` 提供 `conversation`、`:2857`；`sessions` 经 `ctx.get("sessions")` 访问、`dsh-client-ui-session:3183`。
+
+## 13. 2026-09-28 追加：为什么"有的对话有 chip，有的没有"
+
+用户报的症状是**按会话**的：同一段 6K 文本，在 A 对话里折叠成 chip，在 B 对话里原文留在输入框。
+把三条能弄丢一次粘贴的路径逐一核对后，确认它们**全部是按会话存活的**，因此都要单独修：
+
+1. **shell 会被替换（§4.3 的实现前提被违反）**。`InputHub.shellFor(binding)` 每个会话 binding 只缓存
+   一个 shell（`ui-conversation:13660` 一带的 `this.shells` WeakMap），会话 scope 退栈时
+   `shell.dispose(); this.shells.delete(binding)`；离开再进同一对话 → **新 shell / 新 store**。
+   原 `tryInstall` 用 `watchers.has(id)` 短路，**连 shell 都不再解析**：watcher 挂在已死的 store 上，
+   那个对话从此永久静默且无报错。现在每次安装都重新解析，`shell !== installed.shell` 时
+   停旧订新（诊断 `bySession.<id>.shellSwaps` / `watchInstalls`）。
+2. **粘贴归属哪个会话只有 DOM 知道**。`paste`/`beforeinput` 不带 sessionId，`sessions.list.current`
+   只是选中态。rail（现在**始终挂载**，空时 `data-empty` + `display:none`）在 layout effect 里给
+   `[data-composer-card]` 写 `data-dshps-session`；observer 从事件目标往上 `closest` 读回会话 id；
+   `createPasteInbox` 按会话存（`record/take/peek/consume`，另有 `unmapped` 兜底槽，**绝不跨会话回退**）。
+3. **stock 会在 composer 忙时拒绝插入 chip**。`SessionInputShell.insertReference` 的门是
+   `phase !== "plain" && phase !== "claimed"`（`ui-conversation:13747`），即前一条消息还在飞或还在等审批
+   （`submitting`/`adjudicating`）时**必定被拒**；这是按会话的状态，因此表现为"这个对话不行"。
+   被拒后回滚折叠记录（文本留在输入框），同时**重新武装**。
+
+**armed retry（保底那一次尝试）**：≥4000 字节的粘贴记一条 per-session armed 记录，200ms 轮询、
+上限 5 分钟。定位条件是 §4.3.3 的 `pastedRunSpan`（光标在粘贴段末尾 + 归一化变体匹配），
+`phase` 允许时再走一次 `reactToDraft`（折叠/转文件共用判定）。终止条件：已有 pending/live chip
+（`already-folded`）、更新的粘贴取代（`superseded`）、连续 30 次定位不到（`gave-up`）、
+展开/×/发送/插件卸载（`stopArmedRetry`）。**同一次粘贴只折叠一次，但按身份而不是按文本**：录制带 `pasteId`；先到的触发者把粘贴段换成 chip，
+后到者的 `pastedRunSpan` 定位不到那段文本就自行停止。用文本比较会把**同一段文本的第二次粘贴**
+误判成重复（真机回归：`第一次有 chip，第二次没有`），因此任何 "是否已处理过这次粘贴" 的判断都只能用 `pasteId`。
+
+不变量不变：chip 是文本的唯一载体；任何"hold 已释放但 chip 还在编辑器里"的时序都是数据丢失
+（stock 会退化成发送 label 文本），因此回滚与释放必须成对出现，且 abandoned（记录先被清掉）
+路径不会插入 chip。
+
+已知残留限制：armed retry 依赖光标仍在粘贴段末尾。粘贴后先移动光标再让 composer 空下来时，
+保底路径放弃（原文留在输入框）——此时草稿已被用户改过，折叠它比不折叠更糟。
+
+## 14. 对抗性评审后的加固（2026-09-28）
+
+独立评审（只读，带探查脚本）在这层里找出四条"平时用就会静默丢文本"的路径，全部修复并各配一条
+会失败的回归测试（把修复回退，测试即红）：
+
+| 路径 | 原来的错 | 现在的不变量 |
+| --- | --- | --- |
+| 转文件后的清理 | `removePastedText` 的候选是**剪贴板原文**，编辑器存的是 LF 版；找不到时 `return ""` 被 `setDraft` 写回 → 连带删掉用户自己打的字 | 先按编辑器可能的各种渲染定位（CRLF/LF、零宽、占位符）；**找不到就原样不动**；只在真的删掉东西时才写草稿 |
+| keyed 查找回退到无会话录制 | 任何会话的 `take`/`peek` 都能领走"最新一条无会话录制" → A 的粘贴被 B 建成附件（发送即串内容），并按上一条清掉 B 的草稿 | **无会话录制不可被任何带 key 的查找取用**；它只能经草稿 diff 参与折叠 |
+| 离开再进会话 | 新 shell 由**镜像草稿**重建，chip 在镜像里只是 label；ref 消失 → 旧代码 `releaseFoldText` → 原文消失、发送的是 label | 退出记录前把持有文本**写回 label 的位置**（span 写入）；安装 watcher 时先对账一次 |
+| 转文件所有权登记时机 | `spillInFlight.add` 在 `uploadPaste` 之后，而它用**当前**快照结算 → 已经 ready 的上传把会话永久标记为"有转文件在飞"，该会话保底重试永远只等 | 上传**之前**登记，结算即清，插件卸载时清空 |
+
+同时收紧的两点：粘贴段定位不再只依赖光标（"全文唯一出现"亦可，`armed.missing` 改为**连续**计数、
+忙时不计数）；armed 记账改为按 `pasteId`，并新增按身份的 `already-folded` 结束条件（不再靠 30 次
+定位失败自然终止）。
+
+**结论性不变量：** 判定"这次粘贴是否已经处理过"只能按**插入身份**（`pasteId`），永远不能按文本；
+"定位不到"永远不等于"草稿是空的"；一条记录被撤下之前，它持有的文本必须先回到编辑器里。
+
+### 14.1 真机复现：多枚节点共存时，清理不许重写草稿
+
+用户序列"先粘 6K（chip）→ 再粘 60K（转文件）"后输入框显示 `已折叠 5.9 KB`：转文件成功，但
+清理原文时用了 `shell.setDraft()`。`setDraft` 是整篇重写，草稿以纯文本回来，**同一 composer 里的
+chip 节点被一起抹掉**，只剩 footprint（label）。这是"chip 是它那段文本的唯一载体"这条不变量的
+直接推论：**任何会重建草稿的写入都是禁用手段**。
+
+- 清理改为 `actions.insertText("", span)`：`pastedRunSpan()` 定位粘贴段自己的 detect span（光标锚点，
+  或"全文唯一出现"），只写空这一段。
+- 应用路径**不存在**字符串回退：定位不到就保持原文（附件已持有内容），并记 `spillCleanupSkipped`；
+  `setDraft` 回退仅在没有 span 能力的裸测试壳中使用。
+- 回归测试：`folding 6K then spilling 60K keeps the chip, and the label never becomes the text`
+  （回退成 `setDraft` 即红）。

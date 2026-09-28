@@ -1,0 +1,12 @@
+# dsh-paste-spill bundle patch: ONE row for a dual-face package.
+#
+# The row `name` is this package itself, so the loader imports its host half
+# (`exports["."]`) AND the web-modules scanner discovers its browser half from the
+# `dsh.client` declaration + `exports["./client"]` in the same package.json. One row,
+# both halves -- the same shape as dsh-image-gen / dsh-message-rail.
+#
+# Semantics per dsh-app-boot applyEntryPatches: new rows use `insert:`; `id` is the
+# fiber/entry identifier.
+- insert:
+    - id: paste-spill
+      name: dsh-paste-spill

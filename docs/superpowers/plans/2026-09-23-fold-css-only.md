@@ -1,5 +1,15 @@
 # 折叠 chip:改为"只改外观、绝不改编辑器"
 
+> **已被取代（2026-09-28）**：这份计划的前提是"原文必须留在草稿里"。后来发现
+> `inputTriggers` 的 chip source 在提交时会用 `codec.serialize(ref)` 把 chip 换成原文
+> （stock 自己的图片/`@file` chip 就是这么工作的），所以**原文可以离开编辑器**、由插件按
+> `ref` 持有，turn 里依旧是纯文本。
+>
+> 现行实现（见 `README.md`）因此是：**每次粘贴把那一小段文本换成一枚 chip 节点**，多枚
+> 共存；展开/`×` 都只作用于点中的那一枚；chip rail 用实测高度给卡片留 padding-top，
+> 不遮输入框。stock 的 chip 隐藏改用 `[data-composer-chip="folded-text"]`（稳定属性，
+> 不是 CSS-module 哈希）。本文仅作历史记录。
+
 ## 已验证的事实(决定了方案)
 
 1. **图片 chip 的工作方式**:粘贴 → `intakeFiles` → attachment → 由

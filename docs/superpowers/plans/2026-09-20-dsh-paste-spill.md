@@ -1,5 +1,8 @@
 # dsh-paste-spill Implementation Plan
 
+> **已被现行实现取代（2026-09-28）**：本文写的是"两个独立包 + CSS 钳制"的旧方案。现在是一个包 `dsh-paste-spill`（宿主半 + 浏览器半，一行 patch）、chip 是编辑器里的真实节点、rail 实测高度预留、监听器由 rail 自己安装。以 `README.md` 和 `dsh-paste-spill/` 里的代码为准；本文仅作历史记录。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Pasting large text into the DSH composer folds it into a card at ≥4,000 bytes and converts it into a real file attachment at ≥50,000 bytes, whose turn-tail card opens in the right sidebar.
@@ -1878,3 +1881,61 @@ No "TBD", no "add appropriate error handling", no "similar to Task N". Every cod
 ### 未能在此环境完成的验证
 
 **真实 GUI 的 4 个端到端用例未执行**：GUI 需重启才能拾取新的 `dsh.profile.bundles`（`dsh-app-boot/lib/index.js:240` 的 `bundlePatches` 只在启动时算一次；`patchReload: "live"` 只热重载补丁文件，不重读 bundles 列表）。此项需用户重启后手动确认。
+
+### 2026-09-28 追加工作：会话相关性（"有的对话没有 chip"）
+
+- 修复 1：`tryInstall` 每次重新解析 shell，shell 被替换时停旧订新（原来 `watchers.has(id)` 短路 → 死 watcher）。
+- 修复 2：rail 始终挂载并把会话 id 写到 `[data-composer-card][data-dshps-session]`；粘贴 observer 据此
+  把录制归到正确会话；inbox 按会话存/取（`take(sessionId)`），`unmapped` 只作兜底。
+- 修复 3：`phase` 忙（`submitting`/`adjudicating`）时的插入拒绝 → 回滚且**重新武装**；
+  新增 per-session armed retry（200ms × 5 分钟，定位 + phase 双条件，展开/×/发送/卸载即停）。
+- 修复 4：折叠去重（`foldDeduped`），保证快路与保底路不会各折一次。
+- 诊断：新增 `bySession.<id>`（`shellSwaps`/`watchInstalls`/`pasteBytes`/`verdict`/`chipDeferred`/
+  `armed`/`armedPhase`/`armedTries`/`spillCleaned`/`sendCommitted`），读法见 README。
+- 测试：99 → 100（新增 shell 替换、忙会话延迟折叠、粘贴按会话归属、一次粘贴只折一次）。
+- 安装：`scripts/install-into-profile.sh` 重跑；profile 单一 bundle `dsh-paste-spill`，无 legacy 残留；
+  仓库与安装副本 sha256 一致。
+
+### 2026-09-28 回归（真机复现后修掉）
+
+用户按修复后的版本复测：第一次 6K 出 chip，**第二次粘贴同一段 6K 没有 chip**。
+诊断（`bySession.<id>`）直接指向原因：`verdict=fold`、`chipDeferred=inserted`、`foldDeduped=true`、
+`lastTickLen=6019`（= 11 字节 chip footprint + 6008 原文）——第二次粘贴被"同文本去重"吞掉了。
+
+- 根因：merged-2 引入的"折叠去重"用**文本**判断"这次粘贴是否已经折过"。
+- 修法：去重改为**按插入身份**（录制带 `pasteId`，`armRetry`/`spillAttemptedPastes` 全部按键身份；
+  删除文本比较）。同一段文本第二次粘贴会正常折出第二枚 chip。
+- 新增回归测试：`the SAME text pasted twice makes two chips`；
+  并把 `one paste folds exactly once with BOTH triggers armed` 改为真正同时驱动两条路。
+- 测试 101 → 102；BUILD_REV merged-3 → merged-4（随后 merged-5：把 spill 记账改成有上限的按 pasteId 列表）。
+
+### 2026-09-28 第二轮：独立评审 → 四条静默丢文本路径
+
+用户复测后（第一次有 chip、第二次没有）先修掉了"按文本去重"的回归，随后把这一层交给独立评审
+（只读、带 probe）复查。评审给出 3 CRITICAL + 2 HIGH，全部在真机前用探针复现，全部修复：
+
+- **C1** 转文件清理把"定位不到"当成空草稿 → CRLF 粘贴会删掉用户自己打的字（probe p3）。
+- **C2** 无会话录制可被任何会话领走 → A 的粘贴被 B 建成附件、B 的草稿被清（probe p5）。
+- **C3** 离开再进会话：镜像草稿里 chip 只剩 label，旧代码释放持有文本 → 原文丢失、发送 label（probe p8）。
+- **H1** 保底重试只认光标 → 粘完再打字就放弃折叠（probe p6，正是"有的对话没有 chip"的形态）。
+- **H2** `spillInFlight` 登记时机 → 已 ready 的上传把会话永久标记，之后不再折叠（probe p4b）。
+
+另修 M1（watcher 无上限、spill 记账不随插件卸载清空）与 M3（`normalizations()` 缺少编辑器的
+占位符剥离）；M2（"记录被撤销但 chip 已落地"）做了保守加固：写得掉就写掉并释放，写不掉就
+**保留持有文本**（宁可留一枚看不见的 chip，也不能让 serialize 退化成 label）。
+
+验证：`node --test` 107 个测试全绿；五条新回归测试**逐条做过"回退即红"验证**；
+评审的 probe p1/p3/p4b/p5/p6/p8/p9/p10 在最终构建上重跑全部通过。
+BUILD_REV merged-5 → merged-6。
+
+### 2026-09-28 第三轮：真机序列"6K → 60K"
+
+用户报"先粘贴6K，后粘贴60K，输入框会出现：已折叠 5.9 KB"。诊断（`bySession`）显示
+`chipCount=1 / chipDeferred=inserted / uploadStartBytes=60154 / spilledTextRemoved=true`：
+chip 插入过，60K 也真的转了文件，但清理原文用了 `setDraft` → 整篇重写抹掉 chip 节点。
+
+- 修法：`removePastedRunInPlace()` —— `pastedRunSpan()` 定位粘贴段，`actions.insertText("", span)`
+  就地写空；应用路径不再有 `setDraft` 回退；定位不到就保持原文（`spillCleanupSkipped`）。
+- 回归测试：`folding 6K then spilling 60K keeps the chip, and the label never becomes the text`
+  （把清理换回 `setDraft` 立即变红）。
+- 测试 107 → 108；BUILD_REV merged-6 → merged-7。

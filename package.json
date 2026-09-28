@@ -1,0 +1,74 @@
+{
+  "name": "dsh-paste-spill",
+  "version": "0.1.0",
+  "description": "Inbound large-paste handling for the DeepSeek Harness composer: each 4–50 KB paste folds into one chip you can expand or delete on its own, and a ≥50 KB paste becomes a real file attachment with a deliverable card. · DSH 入站大文本粘贴处理：每次 4–50 KB 粘贴折叠成一枚可单独展开/删除的 chip，≥50 KB 转成真附件并出交付卡。",
+  "license": "MIT",
+  "author": "winditer",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/winditer/dsh-paste-spill.git"
+  },
+  "bugs": {
+    "url": "https://github.com/winditer/dsh-paste-spill/issues"
+  },
+  "homepage": "https://github.com/winditer/dsh-paste-spill#readme",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "screenshots.json",
+    "assets",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-input-trigger"
+      ],
+      "immediately": true
+    }
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "dsh": ">=0.1.7-rc.2 <0.2.0-0"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "composer",
+    "paste",
+    "clipboard",
+    "attachment",
+    "input-trigger"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  }
+}
