@@ -14,7 +14,7 @@ DSH 输入框的**入站**大文本粘贴处理：**4–50 KB** 的粘贴折叠�
 
 两层相互独立，且都以**粘贴进来的那段文本**为基准（不是整篇草稿）：折叠层改的是输入框外观，转文件层改的是模型收到什么。小于折叠阈值的粘贴完全不做处理。
 
-两个阈值**可配置**：设置 → 插件 → **粘贴折叠**。值存在插件自己的配置里（持久化进当前 profile 的 cordis patch，重启不丢，也可以手改配置文件），改完对之后的粘贴立即生效——不用重载，输入框里已经折叠好的 chip 也不受影响。发送后的卡片跟折叠阈值走，所以同一段粘贴在发送前后行为一致。界面会拒绝"转文件阈值不高于折叠阈值"的组合，而不是偷偷改写它。
+两个阈值和 **始终粘贴为文本** 勾选项**都可配置**：设置 → 插件 → **粘贴折叠**。值存在插件自己的配置里（持久化进当前 profile 的 cordis patch，重启不丢，也可以手改配置文件），改完对之后的粘贴立即生效——不用重载，输入框里已经折叠好的 chip 也不受影响。发送后的卡片跟折叠阈值走，所以同一段粘贴在发送前后行为一致。界面会拒绝"转文件阈值不高于折叠阈值"的组合，而不是偷偷改写它。
 
 ## 折叠层（4,000 – 50,000 字节）
 
@@ -37,6 +37,14 @@ chip 是编辑器里的真实节点，不是装饰：它注册了一个 `inputTr
 ## 转文件层（≥ 50,000 字节）
 
 50,000 字节及以上的粘贴会被合成一个 `File`，走输入框**既有的附件上传链路**，文件名按内容嗅探（`pasted-text-<n>.json` / `.md` / `.py` / `.js` / `.html` / `.csv` / `.txt`）。结果是消息里一个合法的 `file` 块，模型通过 stock 附件处理拿到只读宿主路径——不改 session 格式，也不改模型侧。
+
+### 始终粘贴为文本
+
+嗅探是启发式，遇到机器输出就会失手：一份 macOS 崩溃报告因为栈帧里写着 `v8::Message::ErrorLevel() const`，被命名成了 `pasted-text-1.js`。勾选设置页里的 **始终粘贴为文本** 后，扩展名一律是 `.txt`，完全跳过内容嗅探（附加类型仍是 `text/plain`，它本来就不随扩展名变）。
+
+- 默认**不勾选**：对"粘贴一段代码"来说，嗅探仍是更好的默认。
+- 保存后立即生效，只影响之后的粘贴；已经在输入框里的附件不会被改名。
+- 只改文件名，不影响折叠阈值、chip、卡片、上传链路或发送后的行为。
 
 宿主半监听 `agent/inbox/inserted` 找出这些粘贴文件，从附件存储解析出宿主路径，并在 `agent/pre-step` 里发布 `deliverables/presented` 事件；stock 的交付 UI 因此在 turn 末尾渲染一张可点卡片，点击在右侧栏打开文件。随后原文从输入框中**就地**清除——只把粘贴那一段自己的 span 写成 `""`，绝不重写整篇草稿，所以其它 chip、手打的文字、光标和 undo 历史都不受影响。
 
@@ -70,10 +78,10 @@ dsh-market 会在插件卡与详情页展示这两张图；它们声明在 [`scr
 
 ## 安装
 
-在 DeepSeek Harness CLI 里装进 **web** profile——已发布到 npm：[`dsh-paste-spill`](https://www.npmjs.com/package/dsh-paste-spill)：
+在 DeepSeek Harness CLI 里装进 **web** profile——已发布到 npm：[`@code_tin/dsh-paste-spill`](https://www.npmjs.com/package/@code_tin/dsh-paste-spill)：
 
 ```sh
-dsh plugin --profile web add dsh-paste-spill
+dsh plugin --profile web add @code_tin/dsh-paste-spill
 ```
 
 想从源码装？同一个包也可以直接从 GitHub 安装：
@@ -97,7 +105,7 @@ dsh plugin --profile web add github:winditer/dsh-paste-spill
 ## 实现结构
 
 ```
-包 dsh-paste-spill —— 一行 loader，两半
+包 @code_tin/dsh-paste-spill —— 一行 loader，两半
   浏览器半  lib/client.js     (dsh.client, platform: web)
     草稿 watcher + 粘贴事件
       4000-50000 → 注册 chip source，把粘贴段换成 chip 节点，
@@ -109,9 +117,9 @@ dsh plugin --profile web add github:winditer/dsh-paste-spill
                            → stock 交付卡 → 右侧栏预览
 ```
 
-一个包一行：`cordis.patch.yml` 只声明一次 `dsh-paste-spill`；loader 通过 `exports["."]` 导入宿主半，web-modules 扫描器则从同一个 `package.json` 的 `dsh.client` + `exports["./client"]` 发现浏览器半。
+一个包一行：`cordis.patch.yml` 只声明一次 `@code_tin/dsh-paste-spill`；loader 通过 `exports["."]` 导入宿主半，web-modules 扫描器则从同一个 `package.json` 的 `dsh.client` + `exports["./client"]` 发现浏览器半。
 
-宿主半另外导出 schemastery `Config`，两个阈值都标了 `.volatile()`。这是本插件唯一的设置面：设置域只认插件**自己**的 schema，所以"声明字段"才是把表单（以及本插件这一页）放到界面上的动作。`volatile` 的含义是写入更新运行中的插件、而不是 remount——这对本插件很关键，因为 remount 会把输入框里正被持有的 fold 全部丢掉。
+宿主半另外导出 schemastery `Config`，两个阈值和 `alwaysText` 开关都标了 `.volatile()`。这是本插件唯一的设置面：设置域只认插件**自己**的 schema，所以"声明字段"才是把表单（以及本插件这一页）放到界面上的动作。`volatile` 的含义是写入更新运行中的插件、而不是 remount——这对本插件很关键，因为 remount 会把输入框里正被持有的 fold 全部丢掉。
 
 ## 开发
 

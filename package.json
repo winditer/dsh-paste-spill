@@ -1,17 +1,17 @@
 {
-  "name": "dsh-paste-spill",
-  "version": "0.4.0",
+  "name": "@code_tin/dsh-paste-spill",
+  "version": "0.4.1",
   "description": "Inbound large-paste handling for the DeepSeek Harness composer: each 4–50 KB paste folds into one chip you can expand or delete on its own, and a ≥50 KB paste becomes a real file attachment with a deliverable card. · DSH 入站大文本粘贴处理：每次 4–50 KB 粘贴折叠成一枚可单独展开/删除的 chip，≥50 KB 转成真附件并出交付卡。",
   "license": "MIT",
-  "author": "winditer",
+  "author": "code_tin",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/winditer/dsh-paste-spill.git"
+    "url": "git+https://github.com/codetin/dsh-paste-spill.git"
   },
   "bugs": {
-    "url": "https://github.com/winditer/dsh-paste-spill/issues"
+    "url": "https://github.com/codetin/dsh-paste-spill/issues"
   },
-  "homepage": "https://github.com/winditer/dsh-paste-spill#readme",
+  "homepage": "https://github.com/codetin/dsh-paste-spill#readme",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -76,9 +76,9 @@
     }
   },
   "devDependencies": {
-    "@deepseek-ai/schemastery": "3.18.5"
-  },
-  "devDependencies": {
     "@deepseek-ai/schemastery": "^3.18.5"
+  },
+    "publishConfig": {
+    "access": "public"
   }
 }

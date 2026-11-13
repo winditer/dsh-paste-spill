@@ -189,7 +189,7 @@ this.editor.update(...)                        // 只有这条会 oi = e
 ## 架构
 
 ```
-一个包 dsh-paste-spill（宿主半 exports["."] + 浏览器半 exports["./client"]，
+一个包 @code_tin/dsh-paste-spill（宿主半 exports["."] + 浏览器半 exports["./client"]，
 cordis.patch.yml 里只有一行；和已装的 dsh-image-gen / dsh-message-rail 同形）
 
 浏览器半  lib/client.js（dsh.client, platform: web）
@@ -204,7 +204,7 @@ cordis.patch.yml 里只有一行；和已装的 dsh-image-gen / dsh-message-rail
                  → 卡片按实测 rail 高度留出 padding-top，rail 不遮输入
                  │ 既有 remote 面 fileUploads.upload（仅 ≥50000 用）
                  ▼
-宿主半    dsh-paste-spill
+宿主半    @code_tin/dsh-paste-spill
   agent/inbox/inserted  → 记录本轮粘贴附件的宿主路径（不 append）
   agent/pre-step        → session.append("deliverables/presented", {turn, callId, files})
                  │
@@ -215,7 +215,7 @@ cordis.patch.yml 里只有一行；和已装的 dsh-image-gen / dsh-message-rail
 
 ### 为什么宿主半和浏览器半在同一个包里
 
-`cordis.patch.yml` 只插**一行**，这一行的包 `dsh-paste-spill` 同时声明了两半：
+`cordis.patch.yml` 只插**一行**，这一行的包 `@code_tin/dsh-paste-spill` 同时声明了两半：
 
 | 半 | 声明 | 加载方 |
 |---|---|---|
@@ -224,7 +224,7 @@ cordis.patch.yml 里只有一行；和已装的 dsh-image-gen / dsh-message-rail
 
 扫描器是**按加载器行**去找那个行包自己的 package.json（`dsh-client-modules/lib/index.js` 的 `resolveMeta(loaderName)`），所以一行就够；本机已装的 `dsh-image-gen` / `dsh-message-rail` / `dsh-prompt-optimizer` 全是这个形状。早先把浏览器半拆成独立包，只是沿用 DSH 自己的命名习惯（`@deepseek-ai/dsh-*` vs `@deepseek-ai/dsh-client-ui-*`），没有技术必要——代价是 profile 里多一个必须维护的名字，而那个名字在 9/28 的崩溃恢复里正好被抹掉了。
 
-浏览器半的模块 id 必须**等于包名**（`window.__ModuleLoader__.load({id:"dsh-paste-spill"})`）：浏览器加载器按被请求的名字注册模块，宿主也按行包的名字提供它。
+浏览器半的模块 id 必须**等于 entry id，不是包名**（`window.__ModuleLoader__.load({id:"dsh-paste-spill"})`；包改为 `@code_tin/dsh-paste-spill` 后这个 id 特意保持不变，见下）：浏览器加载器按被请求的名字注册模块，宿主也按行包的名字提供它。
 
 **关键收益**：≥50,000 走真实附件上传，消息里就是合法 `file` 块，`dsh-llm` 的 `fileHandleText` **自动**给模型只读宿主路径。**零模型侧改动、零 session 格式改动、零 stock 包改动。**
 
@@ -257,15 +257,16 @@ rm -rf /tmp/paste-probe && mkdir -p /tmp/paste-probe/profiles/probe/node_modules
 cd /tmp/paste-probe/profiles/probe
 cat > package.json <<'JSON'
 {"name":"probe","private":true,
- "dependencies":{"dsh-paste-spill":"link:<本仓库>/dsh-paste-spill"},
- "dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","dsh-paste-spill"],"patchReload":"live"}}}
+ "dependencies":{"@code_tin/dsh-paste-spill":"link:<本仓库>"},
+ "dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","@code_tin/dsh-paste-spill"],"patchReload":"live"}}}
 JSON
 printf '[]\n' > cordis.patch.yml
-ln -s <本仓库>/dsh-paste-spill node_modules/dsh-paste-spill
+mkdir -p node_modules/@code_tin   # 作用域包需要先有 scope 目录
+ln -s <本仓库> node_modules/@code_tin/dsh-paste-spill
 DSH_HOME=/tmp/paste-probe ds --profile probe --dump-config | grep -A 1 paste-spill
 ```
 
-预期输出**一行** `- id: paste-spill` / `name: dsh-paste-spill`（一个包两半，所以只有一行）。若名字在 bundles 里但包解析不出来，会打印 `dsh: skipping profile bundle "…"`：**不致命，但等于没装**。
+预期输出**一行** `- id: paste-spill` / `name: "@code_tin/dsh-paste-spill"`（一个包两半，所以只有一行）。若名字在 bundles 里但包解析不出来，会打印 `dsh: skipping profile bundle "…"`：**不致命，但等于没装**。
 
 三个容易踩的点：`DSH_HOME=/tmp` 时 profile 目录是 `/tmp/profiles/probe`（不是 `/tmp/probe`）；本版本只认 `DSH_HOME`，没有 `DSH_HOME_DIR`；`--profile desktop` 会被 CLI 直接拒绝（"managed exclusively by the Electron application"），桌面 profile 只能由应用内的插件管理器安装。
 
@@ -274,7 +275,7 @@ DSH_HOME=/tmp/paste-probe ds --profile probe --dump-config | grep -A 1 paste-spi
 ## 卸载
 
 ```bash
-rm ~/.dsh/profiles/desktop/node_modules/dsh-paste-spill
+rm ~/.dsh/profiles/desktop/node_modules/@code_tin/dsh-paste-spill
 # 再从 ~/.dsh/profiles/desktop/package.json 的 dsh.profile.bundles
 # 与 dependencies 里删掉这个名字（两处都要删，否则会被 reconcile 加回来）
 ```
@@ -333,10 +334,20 @@ node scripts/read-session.mjs ~/.dsh/sessions/<workspace>/session-<id> --users
 两个阈值现在是插件的配置，不是常量：
 
 - **声明在宿主半**（`lib/index.js` 的 `Config`）。理由只有一条：设置域按 **profile entry id** 找表单，schema 来自插件模块自己的 `Config` 导出（`dsh-settings` 的 `schema(entry)` 读 `entry.fiber.runtime.Config`）。浏览器半做判定，但它没有可被设置域读到的 schema。
-- **两个字段都标 `.volatile()`**。这是"写入不 remount"的标记（`dsh-settings` 的 `volatileForm` + `applies: "live"`）。不标的话，保存阈值会重启插件，`foldTextByRef` 里持有的 fold 全部丢失——输入框里的 chip 只剩一个引用节点，没有对应的文本。
+- **三个字段都标 `.volatile()`**（`foldBytes` / `spillBytes` / `alwaysText`）。这是"写入不 remount"的标记（`dsh-settings` 的 `volatileForm` + `applies: "live"`）。不标的话，保存阈值会重启插件，`foldTextByRef` 里持有的 fold 全部丢失——输入框里的 chip 只剩一个引用节点，没有对应的文本。
 - **浏览器半通过 `ctx.get("configForms")` 读**，不写进 `exports.inject`：没有设置域的宿主上只少一页设置，插件本体照常跑。命名空间用**容错匹配**（`paste-spill` / `*-paste-spill` / `*/paste-spill`），因为 dsh-market 安装时 entry id 可能被改写；判断"有没有被服务"只能靠 `describe()` 的命名空间列表——`configForms.get()` 对不存在的命名空间同样返回一个空 form。
 - **阈值一变就重新注册 userText 规则**。`UserTextDocument.prepare` 用 `this.rules !== rules` 判断要不要重算，规则对象不变、只改它闭包里的变量，已经求值过的消息会一直拿旧答案。所以 `setThresholds` 直接调用 `transcriptRuleRefresh`，dispose 旧规则再注册一个**新对象**；这段数组随之换新，缓存失活，而渲染器的 slot key 不变，视觉上无感。
 - **非法组合的处理分两层**：设置页在保存前拒绝（`spill <= fold` 禁用保存并提示），`normalizeThresholds` 只对手改配置兜底（`spill = fold + 1`）并写 `diag`。两层职责不同，别把 UI 该拦的事交给 clamp。
+
+#### 始终粘贴为文本（`alwaysText`，2026-11-12）
+
+扩展名来自 `pasteFileName` 的内容嗅探，而嗅探是启发式：一份 9.7 MB 的 macOS 崩溃报告因为栈帧写着 `v8::Message::ErrorLevel() const + 24944`，命中了 `js` 分支（`\bconst ` 匹配 C++ 的 `const`），落成 `pasted-text-1.js`。`alwaysText` 就是关掉这个猜测的开关。
+
+- **默认 `false`**：对"粘贴一段代码"来说嗅探是更好的默认，所以不能反着来。
+- **`pasteFileName(text, index, textOnly = alwaysText)`**：第三个参数的默认值是**活的 `alwaysText`**，不是 `false`。调用点忘了传参就会悄悄恢复嗅探——而这正是这个开关要关掉的东西，所以默认值必须跟着配置走。
+- **只改名字，不改 MIME**：`spillFile` 的 `type` 本来就是常量 `text/plain`，扩展名从来只是给读者的标签。
+- **宽松解析**：勾选框可能交出布尔、"on"、字符串或缺失。只有明确的真值才算开（`asFlag`），其余一律当关；这个字段判错的代价比阈值更大，因为它决定模型被告知"文件是什么"。
+- **立即生效，不追溯**：已经在输入框里的附件不会被改名，和阈值一样只影响之后的粘贴。
 
 设置页注册在 `settings.plugins.tab`（设置 → 插件 → 一张卡），由 `configForms` 的镜像订阅驱动；只有命名空间真的被服务时才注册，所以没配设置域的部署看不到任何痕迹。
 

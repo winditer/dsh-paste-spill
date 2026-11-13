@@ -551,7 +551,7 @@ test("the bundle registers under the package name and exports a plugin", () => {
   // it requested, and the host scanner serves this module under the row's package. A
   // mismatch would leave the plugin silently unloaded (two packages ago this file was
   // its own package, dsh-client-ui-paste-spill, hence the id it used to carry).
-  assert.equal(record.id, "dsh-paste-spill");
+  assert.equal(record.id, "@code_tin/dsh-paste-spill", "the module id must equal the package name");
   assert.equal(typeof exports.apply, "function");
   assert.deepEqual(exports.inject, ["slots", "conversation", "sessions", "locale", "inputTriggers"]);
 });
@@ -598,6 +598,48 @@ test("pasteFileName marks files with the host-recognized prefix", () => {
   assert.equal(pasteFileName("```js\nconst a = 1;\n```", 3), "pasted-text-3.md");
   assert.equal(pasteFileName('{"a":1}', 2), "pasted-text-2.json");
   assert.equal(pasteFileName("def main():\n    return 1", 4), "pasted-text-4.py");
+});
+
+/**
+ * "Always paste as text" must reach the ONE place an extension is decided.
+ *
+ * The regression this pins is real: a macOS crash report was pasted and shipped as
+ * `pasted-text-1.js`, because its stack frames read `v8::Message::ErrorLevel() const`.
+ * With the option on, every name is `.txt` regardless of what the text looks like, and
+ * with it off nothing changes -- so the option can never silently disable the sniffing
+ * for users who did not ask for it.
+ */
+test("always paste as text names every spill .txt and skips the sniffing", () => {
+  const bundle = loadBundle();
+  const { pasteFileName, spillFile, setThresholds, alwaysText } = bundle.exports.__internals;
+  // The crash-report shape: C++ `const` in a stack frame, which the sniffer reads as js.
+  const crashReport = [
+    "Date/Time:        2026-11-11 10:54:04.212 +0800",
+    "OS Version:       macOS 26.7.2",
+    "",
+    "            11  v8::Message::ErrorLevel() const + 24944 (Codex Framework) [0x11d481e24] 1-11",
+  ].join("\n");
+  assert.equal(pasteFileName(crashReport, 1), "pasted-text-1.js", "without the option the sniffer still misfires");
+
+  assert.equal(setThresholds({ foldBytes: 4000, spillBytes: 50000, alwaysText: true }), true);
+  assert.equal(alwaysText(), true);
+  assert.equal(pasteFileName(crashReport, 1), "pasted-text-1.txt");
+  // Every branch bypassed, not just the code one.
+  assert.equal(pasteFileName('{"a":1}', 2), "pasted-text-2.txt");
+  assert.equal(pasteFileName("def main():\n    return 1", 3), "pasted-text-3.txt");
+  assert.equal(pasteFileName("<div>x</div>", 4), "pasted-text-4.txt");
+
+  const file = spillFile(crashReport, 9);
+  assert.equal(file.name, "pasted-text-9.txt", "the File gets the same name");
+  assert.equal(file.type, "text/plain");
+
+  // An explicit third argument wins over the flag, so a caller can ask for either.
+  assert.equal(pasteFileName('{"a":1}', 5, false), "pasted-text-5.json");
+
+  // Turning it back off restores the sniffed names.
+  assert.equal(setThresholds({ foldBytes: 4000, spillBytes: 50000, alwaysText: false }), true);
+  assert.equal(alwaysText(), false);
+  assert.equal(pasteFileName(crashReport, 1), "pasted-text-1.js");
 });
 
 test("countLines counts newline-separated lines", () => {
@@ -3640,17 +3682,29 @@ function statefulRender(componentName, props) {
 
 test("normalizeThresholds repairs anything the form or a hand edit can hold", () => {
   const { normalizeThresholds } = loadBundle().exports.__internals;
-  assert.deepEqual(normalizeThresholds(undefined), { foldBytes: 4000, spillBytes: 50000, repaired: false });
+  assert.deepEqual(normalizeThresholds(undefined), {
+    foldBytes: 4000,
+    spillBytes: 50000,
+    alwaysText: false,
+    repaired: false,
+  });
   assert.deepEqual(normalizeThresholds({ foldBytes: "4500", spillBytes: "60000" }), {
     foldBytes: 4500,
     spillBytes: 60000,
+    alwaysText: false,
     repaired: false,
   });
-  assert.deepEqual(normalizeThresholds({ foldBytes: 4512.6 }), { foldBytes: 4513, spillBytes: 50000, repaired: false });
+  assert.deepEqual(normalizeThresholds({ foldBytes: 4512.6 }), {
+    foldBytes: 4513,
+    spillBytes: 50000,
+    alwaysText: false,
+    repaired: false,
+  });
   // Out-of-range values clamp to the schema bounds rather than disabling a layer.
   assert.deepEqual(normalizeThresholds({ foldBytes: 10, spillBytes: 12 }), {
     foldBytes: 1000,
     spillBytes: 2000,
+    alwaysText: false,
     repaired: false,
   });
   // A fold threshold above the default spill threshold drags spill up with it: the
@@ -3658,19 +3712,37 @@ test("normalizeThresholds repairs anything the form or a hand edit can hold", ()
   assert.deepEqual(normalizeThresholds({ foldBytes: 99999999 }), {
     foldBytes: 1000000,
     spillBytes: 1000001,
+    alwaysText: false,
     repaired: true,
   });
   // A config edited outside the UI cannot invert the two layers.
   assert.deepEqual(normalizeThresholds({ foldBytes: 9000, spillBytes: 5000 }), {
     foldBytes: 9000,
     spillBytes: 9001,
+    alwaysText: false,
     repaired: true,
   });
   assert.deepEqual(normalizeThresholds({ foldBytes: Number.NaN, spillBytes: Infinity }), {
     foldBytes: 4000,
     spillBytes: 50000,
+    alwaysText: false,
     repaired: false,
   });
+});
+
+test("normalizeThresholds reads alwaysText leniently, never as a guess", () => {
+  const { normalizeThresholds } = loadBundle().exports.__internals;
+  // A checkbox hands back a boolean, a string, or (when unchecked with no draft) nothing.
+  assert.equal(normalizeThresholds({ alwaysText: true }).alwaysText, true);
+  assert.equal(normalizeThresholds({ alwaysText: "true" }).alwaysText, true);
+  assert.equal(normalizeThresholds({ alwaysText: "on" }).alwaysText, true);
+  assert.equal(normalizeThresholds({ alwaysText: 1 }).alwaysText, true);
+  assert.equal(normalizeThresholds({ alwaysText: false }).alwaysText, false);
+  assert.equal(normalizeThresholds({ alwaysText: "false" }).alwaysText, false, "the string 'false' is not true");
+  assert.equal(normalizeThresholds({ alwaysText: "" }).alwaysText, false);
+  assert.equal(normalizeThresholds({ alwaysText: 0 }).alwaysText, false);
+  assert.equal(normalizeThresholds({}).alwaysText, false, "absent means the sniffing default, i.e. off");
+  assert.equal(normalizeThresholds(undefined).alwaysText, false);
 });
 
 test("setThresholds routes new pastes by the configured pair", () => {
@@ -3854,6 +3926,7 @@ test("saving writes both fields in ONE mutation and restoring defaults refills t
     [
       { op: "set", path: ["foldBytes"], value: 6000 },
       { op: "set", path: ["spillBytes"], value: 50000 },
+      { op: "set", path: ["alwaysText"], value: false },
     ],
   ], "one mutate, so both fields share one revision");
 
@@ -3861,4 +3934,88 @@ test("saving writes both fields in ONE mutation and restoring defaults refills t
   tree = render({ t, form });
   assert.equal(fold().props.value, "4");
   assert.equal(findNode(tree, (node) => node.props !== null && node.props["data-dshps-threshold"] === "spill").props.value, "50");
+});
+
+test("the settings page offers an always-text checkbox that saves with the thresholds", () => {
+  const { bundle, render } = statefulRender("PasteSpillSettings", { t: (key) => key, form: null });
+  const { setThresholds, alwaysText } = bundle.exports.__internals;
+  setThresholds({ foldBytes: 4000, spillBytes: 50000, alwaysText: false });
+  const calls = [];
+  const form = { mutate: (ops) => { calls.push(ops); return Promise.resolve(true); } };
+  const t = (key) => key;
+  let tree = render({ t, form });
+  const box = () => findNode(tree, (node) => node.props !== null && "data-dshps-always-text" in node.props);
+
+  assert.equal(box().type, "input");
+  assert.equal(box().props.type, "checkbox", "a checkbox, not a KB box");
+  assert.equal(box().props.checked, false, "off by default: sniffing stays the default");
+  // Label and explanation go through the locale, so a missing key cannot ship silently.
+  const copy = JSON.stringify(tree);
+  assert.ok(copy.includes("settingsAlwaysTextLabel"), "the checkbox has a localized label");
+  assert.ok(copy.includes("settingsAlwaysTextHint"), "the checkbox explains what it does");
+
+  box().props.onChange({ target: { checked: true } });
+  tree = render({ t, form });
+  assert.equal(box().props.checked, true, "the draft holds the new state until Save");
+  assert.equal(alwaysText(), false, "nothing is live until the form is written");
+
+  findNode(tree, (node) => node.props !== null && node.props["data-dshps-settings-save"] === "").props.onClick();
+  assert.deepEqual(calls, [
+    [
+      { op: "set", path: ["foldBytes"], value: 4000 },
+      { op: "set", path: ["spillBytes"], value: 50000 },
+      { op: "set", path: ["alwaysText"], value: true },
+    ],
+  ]);
+
+  // The host echo (a form write) flips the live flag and the box reflects it.
+  setThresholds({ foldBytes: 4000, spillBytes: 50000, alwaysText: true });
+  assert.equal(alwaysText(), true);
+  tree = render({ t, form });
+  assert.equal(box().props.checked, true);
+});
+
+test("restoring defaults unchecks always-text", () => {
+  const { bundle, render } = statefulRender("PasteSpillSettings", { t: (key) => key, form: null });
+  const { setThresholds } = bundle.exports.__internals;
+  setThresholds({ foldBytes: 4000, spillBytes: 50000, alwaysText: true });
+  const t = (key) => key;
+  let tree = render({ t, form: null });
+  const box = () => findNode(tree, (node) => node.props !== null && "data-dshps-always-text" in node.props);
+  assert.equal(box().props.checked, true, "an untouched box shows the live value");
+
+  findNode(tree, (node) => node.props !== null && node.props["data-dshps-settings-reset"] === "").props.onClick();
+  tree = render({ t, form: null });
+  assert.equal(box().props.checked, false, "defaults mean sniffing on");
+});
+
+test("a rejected save records WHY in the diag, so the failure is diagnosable", () => {
+  const { bundle, render } = statefulRender("PasteSpillSettings", { t: (key) => key, form: null });
+  const { setThresholds } = bundle.exports.__internals;
+  setThresholds({ foldBytes: 4000, spillBytes: 50000, alwaysText: false });
+  const t = (key) => key;
+  // A form that refuses the write the way ConfigForm does on a CAS conflict: resolve false.
+  const form = {
+    getSnapshot: () => ({ revision: 7, status: "ready", writable: true, value: { foldBytes: 4000, spillBytes: 50000 } }),
+    mutate: () => Promise.resolve(false),
+  };
+  let tree = render({ t, form });
+  findNode(tree, (node) => node.props !== null && node.props["data-dshps-settings-save"] === "").props.onClick();
+  return Promise.resolve().then(() => {
+    const rejected = bundle.diag().settingsSaveRejected;
+    assert.ok(rejected, "the rejection is recorded, not swallowed");
+    assert.equal(rejected.foldBytes, 4000);
+    assert.equal(rejected.spillBytes, 50000);
+    assert.equal(rejected.alwaysText, false);
+    assert.equal(rejected.snapshot.revision, 7, "the revision the write was based on");
+    assert.ok(Array.isArray(rejected.snapshot.keys));
+  });
+});
+
+test("a save with no bound form records the skip instead of failing silently", () => {
+  const { bundle, render } = statefulRender("PasteSpillSettings", { t: (key) => key, form: null });
+  const t = (key) => key;
+  const tree = render({ t, form: null });
+  findNode(tree, (node) => node.props !== null && node.props["data-dshps-settings-save"] === "").props.onClick();
+  assert.equal(bundle.diag().settingsSaveSkipped, "no-form");
 });

@@ -48,3 +48,16 @@ test("Config rejects non-numeric and out-of-range values", () => {
   assert.throws(() => Config({ foldBytes: 999 }));
   assert.throws(() => Config({ spillBytes: 10000001 }));
 });
+test("Config declares the always-text switch, off by default and live", () => {
+  // Off by default: content sniffing stays the default for a pasted code fragment.
+  assert.equal(field("alwaysText").meta.default, false);
+  // Volatile for the same reason as the thresholds -- a write must not remount the
+  // plugin, and it must take effect on the NEXT paste without a restart.
+  assert.equal(field("alwaysText").meta.volatile, true);
+  assert.equal(Config({}).alwaysText.get(), false);
+  assert.equal(Config({ alwaysText: true }).alwaysText.get(), true);
+});
+
+test("Config rejects a non-boolean alwaysText", () => {
+  assert.throws(() => Config({ alwaysText: "yes" }));
+});

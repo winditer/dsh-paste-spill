@@ -1,4 +1,4 @@
-# dsh-paste-spill bundle patch: ONE row for a dual-face package.
+# @code_tin/dsh-paste-spill bundle patch: ONE row for a dual-face package.
 #
 # The row `name` is this package itself, so the loader imports its host half
 # (`exports["."]`) AND the web-modules scanner discovers its browser half from the
@@ -9,4 +9,4 @@
 # fiber/entry identifier.
 - insert:
     - id: paste-spill
-      name: dsh-paste-spill
+      name: "@code_tin/dsh-paste-spill"

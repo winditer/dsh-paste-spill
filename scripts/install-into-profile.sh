@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Mount dsh-paste-spill into the desktop profile.
+# Mount @code_tin/dsh-paste-spill into the desktop profile.
 #
 # This must run OUTSIDE the agent's workspace-write sandbox: the profile lives at
 # ~/.dsh/profiles/desktop, which that sandbox cannot write.
 #
-# ONE package, both halves. `dsh-paste-spill` declares `dsh.bundle.patch` (host half via
+# ONE package, both halves. `@code_tin/dsh-paste-spill` declares `dsh.bundle.patch` (host half via
 # `exports["."]`) AND `dsh.client` + `exports["./client"]` (browser half), so a single
 # loader row in its patch covers both. That is the same shape as the installed
 # dsh-image-gen / dsh-message-rail / dsh-prompt-optimizer.
@@ -27,11 +27,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="${DSH_HOME:-$HOME/.dsh}/profiles/desktop"
 NODE_MODULES="$PROFILE/node_modules"
 
-PKG="dsh-paste-spill"
+PKG="@code_tin/dsh-paste-spill"
 # The browser half used to be its own package. Leaving either name behind in the profile
 # after the merge would be a dangling bundle/dependency that a later `pnpm add` would try
 # to resolve from the registry.
 LEGACY_PKG="dsh-client-ui-paste-spill"
+# The unscoped name this package shipped under before it was published to npm.
+LEGACY_UNSCOPED="dsh-paste-spill"
 
 if [ ! -d "$PROFILE" ]; then
   echo "error: desktop profile not found at $PROFILE" >&2
@@ -66,29 +68,37 @@ NODE_BIN="$(find_node)" || {
 }
 
 mkdir -p "$NODE_MODULES"
-rm -rf "$NODE_MODULES/$PKG" "$NODE_MODULES/$LEGACY_PKG"
+rm -rf "$NODE_MODULES/$PKG" "$NODE_MODULES/$LEGACY_PKG" "$NODE_MODULES/$LEGACY_UNSCOPED"
+# A scoped name lives one level down (`@scope/name`): its scope directory must exist
+# before the symlink can be created, or `ln` fails with "No such file or directory".
+mkdir -p "$(dirname "$NODE_MODULES/$PKG")"
 # The plugin package IS the repository root (market / awesome-list CI reads `dsh.bundle`
 # from the root package.json), so the link points at the repo, not at a subdirectory.
 ln -s "$REPO_ROOT" "$NODE_MODULES/$PKG"
 echo "linked: $NODE_MODULES/$PKG -> $REPO_ROOT"
 
-"$NODE_BIN" - "$PROFILE/package.json" "$REPO_ROOT" "$PKG" "$LEGACY_PKG" <<'NODE'
+"$NODE_BIN" - "$PROFILE/package.json" "$REPO_ROOT" "$PKG" "$LEGACY_PKG" "$LEGACY_UNSCOPED" <<'NODE'
 const fs = require("node:fs");
-const [file, repoRoot, pkg, legacyPkg] = process.argv.slice(2);
+const [file, repoRoot, pkg, legacyPkg, legacyUnscoped] = process.argv.slice(2);
 const manifest = JSON.parse(fs.readFileSync(file, "utf8"));
 manifest.dsh ??= {};
 manifest.dsh.profile ??= {};
 manifest.dsh.profile.bundles ??= [];
 manifest.dependencies ??= {};
-// Drop the pre-merge package name from BOTH lists before adding the merged package.
-manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter((name) => name !== legacyPkg);
-delete manifest.dependencies[legacyPkg];
+// Drop every previous name from BOTH lists before adding the current one: the
+// pre-merge client package AND the unscoped name (superseded by the scoped one).
+for (const stale of [legacyPkg, legacyUnscoped]) {
+  manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter((name) => name !== stale);
+  delete manifest.dependencies[stale];
+}
 if (!manifest.dsh.profile.bundles.includes(pkg)) manifest.dsh.profile.bundles.push(pkg);
 // Exactly the spec pnpm writes for a local directory: "link:<abs path>".
 manifest.dependencies[pkg] = `link:${repoRoot}`;
 fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
-if (legacyPkg in manifest.dependencies) throw new Error("legacy dependency survived");
-if (manifest.dsh.profile.bundles.includes(legacyPkg)) throw new Error("legacy bundle survived");
+for (const stale of [legacyPkg, legacyUnscoped]) {
+  if (stale in manifest.dependencies) throw new Error(`legacy dependency survived: ${stale}`);
+  if (manifest.dsh.profile.bundles.includes(stale)) throw new Error(`legacy bundle survived: ${stale}`);
+}
 console.log("bundles:", manifest.dsh.profile.bundles.join(", "));
 console.log("dependency:", `${pkg}=${manifest.dependencies[pkg]}`);
 NODE
@@ -96,7 +106,7 @@ NODE
 cat <<'NOTE'
 
 done.
-  - one package, one loader row: dsh-paste-spill carries both the host half and the
+  - one package, one loader row: @code_tin/dsh-paste-spill carries both the host half and the
     browser half (dsh.client + exports["./client"]).
   - dsh-desktop >= 0.1.7-rc.2 recomposes live when dsh.profile.bundles changes; the
     browser half may need a page refresh, and a full relaunch is the safe fallback.
